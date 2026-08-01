@@ -101,6 +101,26 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Confirm the upstreams that are meant to be on the internet actually are.
+    // On a network whose resolver carries a search domain over a wildcard, a
+    // lapsed domain does not fail: it answers with a LAN address, and the real
+    // API key would then be posted to whatever is listening there.
+    let mut fatal = 0;
+    for p in douane::guard::check_providers(&config).await {
+        if p.keyed {
+            fatal += 1;
+            tracing::error!("provider `{}`: {}", p.provider, p.detail);
+        } else {
+            tracing::warn!("provider `{}`: {}", p.provider, p.detail);
+        }
+    }
+    if fatal > 0 {
+        bail!(
+            "{fatal} provider(s) hold a credential and resolve onto this network. \
+             Refusing to start rather than hand a key to whatever answers there."
+        );
+    }
+
     // Built before the vault is boxed away, and holding the values it must
     // recognise for the life of the process. Nothing else in the program reads
     // the vault in bulk.
