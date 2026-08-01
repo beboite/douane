@@ -142,6 +142,42 @@ shapes = "vendor"
 # the LAN there, so there is nothing to protect it from.
 vault_hit = { low = "block", mid = "block", max = "allow" }
 
+# ------------------------------------------------------------------ egress --
+# The other half of the scrubber. Everything above only sees traffic that was
+# deliberately pointed at douane; an agent that calls an API itself walks past
+# it. This is the machine's outbound proxy, so what leaves gets looked at even
+# when nobody asked.
+#
+# Off unless `listen` is set, and it stays off until `douanectl ca init` has run
+# and the resulting certificate has been installed on the client by hand.
+# Trusting that authority means the machine believes douane about every TLS
+# session it opens, which is a decision to take on purpose.
+#
+# The default for an unlisted host is **tunnel**: bytes copied both ways,
+# unread. Intercepting everything by default would put douane inside a bank
+# session the first time someone forgot to write an exception.
+#
+# [egress]
+# listen = "127.0.0.1:8888"
+# ca_cert = "douane-ca.crt"
+# # Ports a CONNECT may open blindly. A proxy that opens any port on request is
+# # a way out of the network rather than a way of watching it.
+# tunnel_ports = [443]
+#
+# # A rule covers the host and everything under it: `anthropic.com` also covers
+# # `api.anthropic.com`, and does not cover `notanthropic.com`. The most
+# # specific rule wins whatever order they are written in.
+# [[egress.rules]]
+# host = "anthropic.com"
+# action = "intercept"
+# trust = "mid"
+# note = "the vendor with a contract"
+#
+# [[egress.rules]]
+# host = "pastebin.example"
+# action = "refuse"
+# note = "nothing an agent needs, and an obvious place to put a stolen file"
+
 # Something that merely looks like a credential. Warns, because blocking a
 # coding agent over a fixture is its own kind of damage. Move `low` to "block"
 # once the alert list has been quiet for a while.

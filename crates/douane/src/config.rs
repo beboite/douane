@@ -23,6 +23,11 @@ pub struct Config {
     pub clients: BTreeMap<String, Client>,
     #[serde(default)]
     pub scrub: ScrubConfig,
+    /// The outbound proxy. Off unless it names a port to listen on: it is only
+    /// useful once its authority is installed on the client, and nothing that
+    /// needs that should switch itself on.
+    #[serde(default)]
+    pub egress: crate::egress::EgressConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -329,6 +334,8 @@ pub enum ConfigError {
     UnknownRoute { client: String, route: String },
     #[error("route `{0}` falls back to itself")]
     SelfFallback(String),
+    #[error("{0}")]
+    Egress(String),
 }
 
 impl Config {
@@ -373,6 +380,13 @@ impl Config {
                     });
                 }
             }
+        }
+        // Reported all at once rather than one per run: a rule file is edited
+        // in batches, and finding the second mistake only after fixing the
+        // first is its own small punishment.
+        let egress = self.egress.validate();
+        if !egress.is_empty() {
+            return Err(ConfigError::Egress(egress.join("; ")));
         }
         Ok(())
     }

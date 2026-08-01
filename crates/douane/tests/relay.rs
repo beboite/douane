@@ -201,6 +201,7 @@ async fn broker_with(
         routes: BTreeMap::new(),
         clients: BTreeMap::new(),
         scrub,
+        egress: Default::default(),
     };
     config.server.admin_key = Some(SecretRef::parse("douane.admin").unwrap());
 

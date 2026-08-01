@@ -8,6 +8,7 @@
 pub mod audit;
 pub mod config;
 pub mod dash;
+pub mod egress;
 pub mod guard;
 pub mod proxy;
 pub mod scrub;
