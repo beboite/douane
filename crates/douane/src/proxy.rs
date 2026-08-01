@@ -89,6 +89,13 @@ impl AppState {
 /// `host` and the hop-by-hop set would be wrong for the new destination.
 /// `x-api-key` and `authorization` carry the *virtual* key, which upstream must
 /// never see: that is the whole point of the exercise.
+///
+/// `accept-encoding` goes for a different reason. A client that asks for gzip
+/// gets a gzipped answer, and douane then relays bytes it cannot read: the
+/// token counter sees compressed noise and records nothing, silently, on every
+/// call. A broker that cannot read what passes through it is not brokering. The
+/// cost is bandwidth on the hop douane pays for, which is not the scarce thing
+/// here.
 const STRIP: &[&str] = &[
     "host",
     "content-length",
@@ -99,6 +106,7 @@ const STRIP: &[&str] = &[
     "proxy-authorization",
     "x-api-key",
     "authorization",
+    "accept-encoding",
 ];
 
 fn trust_label(t: Trust) -> &'static str {

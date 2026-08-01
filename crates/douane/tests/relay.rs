@@ -68,6 +68,7 @@ impl SecretBackend for TestVault {
 struct Seen {
     api_key: Option<String>,
     authorization: Option<String>,
+    accept_encoding: Option<String>,
     body: serde_json::Value,
 }
 
@@ -128,6 +129,7 @@ async fn handle(
     up.seen.lock().unwrap().push(Seen {
         api_key: header("x-api-key"),
         authorization: header("authorization"),
+        accept_encoding: header("accept-encoding"),
         body: serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
     });
 
@@ -496,6 +498,43 @@ async fn a_buffered_answer_is_counted_and_priced() {
     let cost = calls[0].cost.unwrap();
     assert!((cost - (0.001 + 0.0025 + 0.000_004)).abs() < 1e-9, "{cost}");
     assert!(calls[0].bytes_down.unwrap() > 0);
+}
+
+#[tokio::test]
+async fn a_client_asking_for_gzip_does_not_blind_the_counter() {
+    // Found in production on the first day. Every HTTP client asks for gzip;
+    // the upstream obliges; douane then relays bytes it cannot read, and the
+    // token counter records nothing at all, silently, on every single call.
+    let (url, up) = Upstream::spawn(Behaviour::Json).await;
+    let b = broker(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", None, vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+    )
+    .await;
+
+    let res = reqwest::Client::new()
+        .post(format!("{}/v1/messages", b.url))
+        .header("x-api-key", "vk-the-virtual-one")
+        .header("accept-encoding", "gzip, deflate, br")
+        .json(&ask("haiku"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let _ = res.bytes().await;
+
+    assert_eq!(
+        up.last().accept_encoding,
+        None,
+        "the header must not reach upstream, or the answer comes back unreadable"
+    );
+
+    let calls = wait_for_finished(&b).await;
+    assert_eq!(calls[0].input_tokens, Some(1000));
+    assert_eq!(calls[0].output_tokens, Some(250));
 }
 
 #[tokio::test]
