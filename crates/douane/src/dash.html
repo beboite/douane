@@ -157,7 +157,6 @@
 
 const $ = (id) => document.getElementById(id);
 let TOKEN = sessionStorage.getItem("douane-admin") || "";
-let CURRENCY = "USD";
 let timer = null;
 
 async function api(path, opts = {}) {
@@ -178,12 +177,24 @@ async function api(path, opts = {}) {
 const nf = new Intl.NumberFormat();
 const num = (v) => (v === null || v === undefined ? "" : nf.format(v));
 
-function money(v) {
+// One amount in one named unit. A null unit prints the bare number: those rows
+// were written before douane recorded a currency, and picking one for them now
+// would be a guess dressed up as a fact.
+function amount(v, currency) {
   if (v === null || v === undefined) return "";
   // Sub-cent totals are the normal case for a single call, and rounding them
   // to two decimals would show every one of them as zero.
   const digits = Math.abs(v) > 0 && Math.abs(v) < 0.01 ? 5 : 2;
-  return v.toFixed(digits) + " " + CURRENCY;
+  return v.toFixed(digits) + (currency ? " " + currency : "");
+}
+
+// A cost as the server sends it: `{"USD": 0.42, "CNY": 3.1}`. Kept apart rather
+// than summed, because douane never converts and adding the two would produce a
+// number in no currency at all.
+function money(m) {
+  if (!m) return "";
+  const parts = Object.entries(m).map(([cur, v]) => amount(v, cur));
+  return parts.length ? parts.join(" + ") : "";
 }
 
 function bytes(v) {
@@ -251,7 +262,7 @@ function renderRoutes(cfg) {
   const options = cfg.providers.map((p) => p.name);
   table($("routes"),
     [{ label: "model asked for" }, { label: "goes to" }, { label: "sent as" },
-     { label: "trust" }, { label: "fallback" }, { label: "" }],
+     { label: "trust" }, { label: "in/out per Mtok" }, { label: "fallback" }, { label: "" }],
     cfg.routes,
     (r) => {
       const p = cfg.providers.find((x) => x.name === r.provider) || {};
@@ -265,6 +276,7 @@ function renderRoutes(cfg) {
         <td><select class="p">${sel}</select></td>
         <td><input class="m" size="18" value="${esc(r.model || "")}" placeholder="same name"></td>
         <td>${trust(p.trust || "?")}</td>
+        <td class="${r.price ? "" : "dim"}">${r.price ? esc(r.price) : "unpriced"}</td>
         <td class="dim">${esc((r.fallback || []).join(" ‣ "))}</td>
         <td>
           <button class="save">apply</button>
@@ -356,7 +368,7 @@ function renderCalls(rows, filtered) {
         <td class="n">${num(c.output_tokens)}</td>
         <td class="n">${num(c.cache_read_tokens)}</td>
         <td class="n">${esc(bytes(c.bytes_down))}</td>
-        <td class="n">${esc(money(c.cost))}</td>
+        <td class="n">${esc(amount(c.cost, c.currency))}</td>
       </tr>`;
     });
 
@@ -403,7 +415,6 @@ async function refresh() {
       api("/threads?hours=" + hours + "&limit=30"),
       api("/vault"),
     ]);
-    CURRENCY = sum.currency;
     renderTotals(sum.summary.totals);
     renderBuckets($("by-provider"), sum.summary.by_provider, "provider");
     renderBuckets($("by-client"), sum.summary.by_client, "client");

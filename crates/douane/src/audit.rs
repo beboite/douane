@@ -81,6 +81,9 @@ pub struct Finish {
     /// Priced with the rates in force at the time, and stored, so a later
     /// pricing edit does not silently rewrite history.
     pub cost: Option<f64>,
+    /// The unit `cost` is in, stored per call for the same reason. Two upstreams
+    /// bill in two currencies, so a bare number is not a cost.
+    pub currency: Option<String>,
     pub error: Option<String>,
 }
 
@@ -137,6 +140,7 @@ impl Audit {
                 cache_read_tokens  INTEGER,
                 cache_write_tokens INTEGER,
                 cost               REAL,
+                currency           TEXT,
                 error              TEXT
             );
             CREATE INDEX IF NOT EXISTS calls_at      ON calls(at);
@@ -168,7 +172,29 @@ impl Audit {
                 at       TEXT NOT NULL
             );
             "#,
-        )
+        )?;
+
+        // `calls` predates per-currency pricing. `CREATE TABLE IF NOT EXISTS`
+        // leaves an existing table exactly as it was, so a deployed database
+        // needs the column added rather than declared. Rows written before this
+        // keep a NULL currency and are reported as unpriced, which is what they
+        // were.
+        self.add_column_if_missing("calls", "currency", "TEXT")
+    }
+
+    /// `ALTER TABLE ADD COLUMN` is an error when the column is already there,
+    /// and SQLite has no `IF NOT EXISTS` for it. Asking first is the only way
+    /// that does not involve matching on an error string.
+    fn add_column_if_missing(&self, table: &str, column: &str, ty: &str) -> rusqlite::Result<()> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut present = stmt.query_map([], |r| r.get::<_, String>(1))?;
+        if present.any(|c| c.as_deref() == Ok(column)) {
+            return Ok(());
+        }
+        drop(present);
+        drop(stmt);
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty}"))
     }
 
     pub fn begin(&self, s: &Start) -> rusqlite::Result<i64> {
@@ -199,7 +225,7 @@ impl Audit {
             r#"UPDATE calls SET status=?2, duration_ms=?3, bytes_down=?4,
                                 input_tokens=?5, output_tokens=?6,
                                 cache_read_tokens=?7, cache_write_tokens=?8,
-                                cost=?9, error=?10
+                                cost=?9, currency=?10, error=?11
                WHERE id=?1"#,
             rusqlite::params![
                 id,
@@ -211,6 +237,9 @@ impl Audit {
                 f.usage.cache_read_tokens.map(|v| v as i64),
                 f.usage.cache_write_tokens.map(|v| v as i64),
                 f.cost,
+                // Only stored alongside a cost. A currency on a row with no
+                // price would claim the call was free in that currency.
+                f.cost.and(f.currency.as_deref()),
                 f.error,
             ],
         )?;
@@ -282,7 +311,7 @@ impl Audit {
             r#"SELECT id, at, client, route, provider, model_requested, model_sent, trust,
                       agent_fingerprint, thread_fingerprint, streamed, status, duration_ms,
                       bytes_up, bytes_down, input_tokens, output_tokens, cache_read_tokens,
-                      cache_write_tokens, cost, error
+                      cache_write_tokens, cost, currency, error
                FROM calls
                WHERE (?2 IS NULL OR client = ?2) AND (?3 IS NULL OR thread_fingerprint = ?3)
                ORDER BY id DESC LIMIT ?1"#,
@@ -309,7 +338,8 @@ impl Audit {
                 cache_read_tokens: r.get(17)?,
                 cache_write_tokens: r.get(18)?,
                 cost: r.get(19)?,
-                error: r.get(20)?,
+                currency: r.get(20)?,
+                error: r.get(21)?,
             })
         })?;
         rows.collect()
@@ -330,60 +360,123 @@ impl Audit {
     }
 
     fn totals(&self, since: &str) -> rusqlite::Result<Bucket> {
-        let conn = self.lock();
-        conn.query_row(
-            r#"SELECT 'all', COUNT(*),
-                      SUM(CASE WHEN status >= 400 OR error IS NOT NULL THEN 1 ELSE 0 END),
-                      COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-                      COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cost),0)
-               FROM calls WHERE at >= ?1"#,
-            [since],
-            bucket_from_row,
-        )
+        let mut all = self.grouped(since, "'all'")?;
+        // One group, or none at all when the window is empty.
+        Ok(all.pop().unwrap_or_else(|| Bucket {
+            key: "all".to_owned(),
+            ..Default::default()
+        }))
     }
 
     /// `by` is a column name or a SQL expression built from one, never anything
     /// a request can influence: every call site below passes a literal.
+    ///
+    /// Grouped by key *and* currency, then folded back in Rust. SQL can sum a
+    /// column but it cannot keep two units apart in one number, and a bucket
+    /// whose calls went to a reseller billing CNY and one billing USD has two
+    /// costs, not one.
     fn grouped(&self, since: &str, by: &str) -> rusqlite::Result<Vec<Bucket>> {
         let conn = self.lock();
         let sql = format!(
-            r#"SELECT {by} AS k, COUNT(*),
+            r#"SELECT {by} AS k, currency, COUNT(*),
                       SUM(CASE WHEN status >= 400 OR error IS NOT NULL THEN 1 ELSE 0 END),
                       COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
                       COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cost),0)
-               FROM calls WHERE at >= ?1 GROUP BY k ORDER BY COUNT(*) DESC"#
+               FROM calls WHERE at >= ?1 GROUP BY k, currency"#
         );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([since], bucket_from_row)?;
-        rows.collect()
+        let rows = stmt.query_map([since], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?,
+                r.get::<_, f64>(7)?,
+            ))
+        })?;
+
+        let mut out: BTreeMap<String, Bucket> = BTreeMap::new();
+        for row in rows {
+            let (key, currency, calls, errors, input, output, cache_read, cost) = row?;
+            let b = out.entry(key.clone()).or_insert_with(|| Bucket {
+                key,
+                ..Default::default()
+            });
+            b.calls += calls;
+            b.errors += errors;
+            b.input_tokens += input;
+            b.output_tokens += output;
+            b.cache_read_tokens += cache_read;
+            if let Some(c) = currency {
+                *b.cost.entry(c).or_default() += cost;
+            }
+        }
+
+        let mut buckets: Vec<Bucket> = out.into_values().collect();
+        buckets.sort_by_key(|b| std::cmp::Reverse(b.calls));
+        Ok(buckets)
     }
 
     /// Conversations, newest first. One row per thread fingerprint.
     pub fn threads(&self, since: &str, limit: u32) -> rusqlite::Result<Vec<Thread>> {
         let conn = self.lock();
+        // The cost comes from a second pass rather than a join: a thread that
+        // was rerouted mid-conversation spans two providers and therefore
+        // possibly two currencies, and there is no single SUM for that.
         let mut stmt = conn.prepare(
             r#"SELECT thread_fingerprint, MIN(at), MAX(at), COUNT(*),
                       GROUP_CONCAT(DISTINCT client), GROUP_CONCAT(DISTINCT provider),
-                      COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-                      COALESCE(SUM(cost),0)
+                      COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0)
                FROM calls
                WHERE at >= ?1 AND thread_fingerprint IS NOT NULL
                GROUP BY thread_fingerprint ORDER BY MAX(at) DESC LIMIT ?2"#,
         )?;
-        let rows = stmt.query_map(rusqlite::params![since, limit], |r| {
-            Ok(Thread {
-                fingerprint: r.get(0)?,
-                first_at: r.get(1)?,
-                last_at: r.get(2)?,
-                calls: r.get(3)?,
-                clients: r.get(4)?,
-                providers: r.get(5)?,
-                input_tokens: r.get(6)?,
-                output_tokens: r.get(7)?,
-                cost: r.get(8)?,
-            })
-        })?;
-        rows.collect()
+        let mut threads: Vec<Thread> = stmt
+            .query_map(rusqlite::params![since, limit], |r| {
+                Ok(Thread {
+                    fingerprint: r.get(0)?,
+                    first_at: r.get(1)?,
+                    last_at: r.get(2)?,
+                    calls: r.get(3)?,
+                    clients: r.get(4)?,
+                    providers: r.get(5)?,
+                    input_tokens: r.get(6)?,
+                    output_tokens: r.get(7)?,
+                    cost: Money::new(),
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+
+        let mut costs = conn.prepare(
+            r#"SELECT thread_fingerprint, currency, COALESCE(SUM(cost),0)
+               FROM calls
+               WHERE at >= ?1 AND thread_fingerprint IS NOT NULL AND currency IS NOT NULL
+               GROUP BY thread_fingerprint, currency"#,
+        )?;
+        let mut by_thread: BTreeMap<String, Money> = BTreeMap::new();
+        for row in costs.query_map([since], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, f64>(2)?,
+            ))
+        })? {
+            let (fingerprint, currency, cost) = row?;
+            *by_thread
+                .entry(fingerprint)
+                .or_default()
+                .entry(currency)
+                .or_default() += cost;
+        }
+        for t in &mut threads {
+            if let Some(m) = by_thread.remove(&t.fingerprint) {
+                t.cost = m;
+            }
+        }
+        Ok(threads)
     }
 
     pub fn alerts(&self, limit: u32) -> rusqlite::Result<Vec<Alert>> {
@@ -407,18 +500,6 @@ impl Audit {
         })?;
         rows.collect()
     }
-}
-
-fn bucket_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Bucket> {
-    Ok(Bucket {
-        key: r.get(0)?,
-        calls: r.get(1)?,
-        errors: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
-        input_tokens: r.get(3)?,
-        output_tokens: r.get(4)?,
-        cache_read_tokens: r.get(5)?,
-        cost: r.get(6)?,
-    })
 }
 
 fn now() -> String {
@@ -449,10 +530,20 @@ pub struct Call {
     pub cache_read_tokens: Option<i64>,
     pub cache_write_tokens: Option<i64>,
     pub cost: Option<f64>,
+    pub currency: Option<String>,
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// Costs held apart by unit.
+///
+/// Adding a price quoted in CNY to one quoted in USD produces a number that is
+/// not money in any currency. Since douane deliberately never converts, every
+/// total it reports is a small map rather than a scalar, and a reader sees
+/// `0.42 USD + 3.10 CNY` instead of a confident `3.52`. Empty means nothing in
+/// the window was priced.
+pub type Money = BTreeMap<String, f64>;
+
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Bucket {
     pub key: String,
     pub calls: i64,
@@ -460,7 +551,7 @@ pub struct Bucket {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
-    pub cost: f64,
+    pub cost: Money,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -482,7 +573,7 @@ pub struct Thread {
     pub providers: String,
     pub input_tokens: i64,
     pub output_tokens: i64,
-    pub cost: f64,
+    pub cost: Money,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -537,6 +628,7 @@ mod tests {
                 cache_write_tokens: None,
             },
             cost: Some(0.0042),
+            currency: Some("USD".into()),
             error: None,
         }
     }
@@ -608,7 +700,102 @@ mod tests {
         assert_eq!(s.by_provider[0].key, "deepseek");
         assert_eq!(s.by_provider[0].calls, 3);
         assert_eq!(s.by_agent.len(), 2);
-        assert!((s.totals.cost - 0.0168).abs() < 1e-9);
+        assert!((s.totals.cost["USD"] - 0.0168).abs() < 1e-9);
+    }
+
+    #[test]
+    fn two_currencies_are_reported_apart_and_never_added() {
+        // The case this exists for: one reseller quotes CNY, another quotes
+        // USD. A single total would be a number in no currency at all.
+        let a = Audit::in_memory().unwrap();
+        let id = a.begin(&a_start()).unwrap();
+        a.finish(id, &a_finish()).unwrap();
+
+        let mut cny = a_start();
+        cny.provider = "example-reseller".into();
+        let id = a.begin(&cny).unwrap();
+        a.finish(
+            id,
+            &Finish {
+                cost: Some(1.5),
+                currency: Some("CNY".into()),
+                ..a_finish()
+            },
+        )
+        .unwrap();
+
+        let s = a.summary("1970-01-01T00:00:00Z").unwrap();
+        assert_eq!(s.totals.calls, 2, "both calls counted once");
+        assert_eq!(s.totals.cost.len(), 2, "two units, two entries");
+        assert!((s.totals.cost["USD"] - 0.0042).abs() < 1e-9);
+        assert!((s.totals.cost["CNY"] - 1.5).abs() < 1e-9);
+
+        // And each provider keeps only its own unit.
+        let xcode = s
+            .by_provider
+            .iter()
+            .find(|b| b.key == "example-reseller")
+            .expect("the CNY provider is in the breakdown");
+        assert_eq!(xcode.cost.keys().collect::<Vec<_>>(), ["CNY"]);
+    }
+
+    #[test]
+    fn an_unpriced_call_adds_no_currency_at_all() {
+        // A provider with no price list must not turn into a zero: a zero in
+        // the dashboard reads as "this one is free".
+        let a = Audit::in_memory().unwrap();
+        let id = a.begin(&a_start()).unwrap();
+        a.finish(
+            id,
+            &Finish {
+                cost: None,
+                currency: Some("USD".into()),
+                ..a_finish()
+            },
+        )
+        .unwrap();
+
+        let s = a.summary("1970-01-01T00:00:00Z").unwrap();
+        assert_eq!(s.totals.calls, 1);
+        assert!(s.totals.cost.is_empty(), "no cost, so no currency either");
+        assert_eq!(a.recent(1, None, None).unwrap()[0].currency, None);
+    }
+
+    #[test]
+    fn a_database_written_before_currency_existed_still_opens() {
+        // What a deployed instance looks like: the table already exists without
+        // the column, and `CREATE TABLE IF NOT EXISTS` will not add it.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"CREATE TABLE calls (
+                   id INTEGER PRIMARY KEY, at TEXT NOT NULL, client TEXT NOT NULL,
+                   route TEXT NOT NULL, provider TEXT NOT NULL,
+                   model_requested TEXT NOT NULL, model_sent TEXT NOT NULL,
+                   trust TEXT NOT NULL, agent_fingerprint TEXT, thread_fingerprint TEXT,
+                   streamed INTEGER NOT NULL, bytes_up INTEGER NOT NULL, status INTEGER,
+                   duration_ms INTEGER, bytes_down INTEGER, input_tokens INTEGER,
+                   output_tokens INTEGER, cache_read_tokens INTEGER,
+                   cache_write_tokens INTEGER, cost REAL, error TEXT);
+               INSERT INTO calls (at, client, route, provider, model_requested, model_sent,
+                                  trust, streamed, bytes_up, status, cost)
+               VALUES ('2026-01-01T00:00:00Z','old','haiku','deepseek','haiku',
+                       'deepseek-chat','low',0,10,200,0.5);"#,
+        )
+        .unwrap();
+
+        let a = Audit {
+            conn: Mutex::new(conn),
+        };
+        a.migrate().expect("the column is added, not redeclared");
+        // Twice, because a restart runs the migration again.
+        a.migrate().expect("adding it a second time is a no-op");
+
+        let old = &a.recent(10, None, None).unwrap()[0];
+        assert_eq!(old.cost, Some(0.5));
+        assert_eq!(old.currency, None, "an old row claims no unit");
+        let s = a.summary("1970-01-01T00:00:00Z").unwrap();
+        assert_eq!(s.totals.calls, 1);
+        assert!(s.totals.cost.is_empty(), "a cost with no unit is not money");
     }
 
     #[test]

@@ -251,6 +251,7 @@ mod tests {
             output_per_mtok: 15.0,
             cache_read_per_mtok: 0.3,
             cache_write_per_mtok: 3.75,
+            currency: None,
         };
         assert_eq!(Usage::default().cost(&p), None);
 

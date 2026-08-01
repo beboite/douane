@@ -37,8 +37,9 @@ pub struct Server {
     /// all, rather than served openly.
     #[serde(default)]
     pub admin_key: Option<SecretRef>,
-    /// What the numbers in `pricing` are denominated in. Never converted, only
-    /// displayed, so it must match whatever the price list was copied from.
+    /// Default unit for any `pricing` block that does not name its own. Never
+    /// converted, only displayed, so it must match whatever the price list was
+    /// copied from.
     #[serde(default = "default_currency")]
     pub currency: String,
 }
@@ -102,19 +103,21 @@ pub struct Provider {
     /// once the first byte has arrived.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
-    /// What this upstream charges. Absent means douane reports tokens but no
-    /// cost for it, which is the honest answer: a made-up zero would read as a
-    /// free provider in the dashboard.
+    /// What this upstream charges, when one price covers everything it serves.
+    /// A provider whose models are priced apart puts the rates on the routes
+    /// instead. Absent in both places means douane reports tokens but no cost,
+    /// which is the honest answer: a made-up zero would read as a free provider
+    /// in the dashboard.
     #[serde(default)]
     pub pricing: Option<Pricing>,
 }
 
-/// Per million tokens, in `server.currency`.
+/// Per million tokens.
 ///
 /// This is what makes an invoice checkable. A reseller quotes a price and bills
 /// a total, and without a local count of the tokens actually sent there is
 /// nothing to hold the total against.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Pricing {
     #[serde(default)]
     pub input_per_mtok: f64,
@@ -124,6 +127,15 @@ pub struct Pricing {
     pub cache_read_per_mtok: f64,
     #[serde(default)]
     pub cache_write_per_mtok: f64,
+    /// What these numbers are denominated in, when it is not `server.currency`.
+    /// Resellers do not agree on one: a Chinese reseller quotes CNY next to a
+    /// American one quoting USD, and reading one price list in the other's unit
+    /// is off by a factor of seven.
+    ///
+    /// Never converted, only carried. A hard-coded exchange rate goes stale
+    /// without saying so, and a wrong cost is worse than an unconverted one.
+    #[serde(default)]
+    pub currency: Option<String>,
 }
 
 fn default_auth_header() -> String {
@@ -159,6 +171,14 @@ pub struct Route {
     /// Tried in order if the primary fails. Each entry names another route.
     #[serde(default)]
     pub fallback: Vec<String>,
+    /// What this particular model costs on that provider, when the provider
+    /// does not charge one flat rate. Wins over `Provider::pricing`.
+    ///
+    /// A reseller's price list is per model, not per account: on one upstream
+    /// the cheap model and the expensive one differ by a factor of twenty.
+    /// Pricing only the provider would report one of those numbers for both.
+    #[serde(default)]
+    pub pricing: Option<Pricing>,
 }
 
 /// A change to one route, made from the dashboard and stored in the database.

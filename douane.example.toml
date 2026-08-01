@@ -36,9 +36,10 @@ base_url = "https://api.anthropic.com"
 key = { namespace = "anthropic", key = "api_key" }
 trust = "mid"
 
-# Per million tokens, in `server.currency`. Optional: a provider with no price
-# list reports tokens and no cost, which is honest. An invented zero would show
-# up in the dashboard as a free provider.
+# Per million tokens. Optional: a provider with no price list reports tokens and
+# no cost, which is honest. An invented zero would show up in the dashboard as a
+# free provider. Denominated in `server.currency` unless the block says
+# otherwise, and never converted between the two.
 [providers.anthropic.pricing]
 input_per_mtok = 15.0
 output_per_mtok = 75.0
@@ -81,6 +82,22 @@ fallback = ["sonnet"]
 
 [routes.qwopus]
 provider = "local"
+
+# A route may carry its own rates, and they win over the provider's. This is not
+# an edge case: a reseller prices per model, and on one account the cheap model
+# and the dear one differ by a factor of twenty. Pricing only the provider would
+# report one of those numbers for both.
+#
+# `currency` is per price list because resellers do not agree on one. Douane
+# carries the unit and never converts it: a hard-coded exchange rate goes stale
+# without saying so, and the dashboard would rather show `0.42 USD + 3.10 CNY`
+# than a confident wrong total.
+#
+# [routes.sonnet.pricing]
+# input_per_mtok = 0.4
+# output_per_mtok = 2.0
+# cache_read_per_mtok = 0.04
+# currency = "CNY"
 
 # ------------------------------------------------------------------ clients --
 # One virtual key per machine, per project or per agent profile. Revoke and

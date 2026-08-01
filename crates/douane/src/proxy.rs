@@ -300,6 +300,10 @@ pub async fn messages(
         match forward(
             &state,
             provider,
+            // The route's own rates win. A reseller charges per model, not per
+            // account, so pricing the provider alone would report one model's
+            // rate for every model it serves.
+            Price::resolve(route.pricing.as_ref(), provider, &config.server.currency),
             &body,
             &headers,
             &model_sent,
@@ -351,6 +355,7 @@ pub async fn messages(
 async fn forward(
     state: &Arc<AppState>,
     provider: &Provider,
+    price: Price,
     body: &[u8],
     headers: &HeaderMap,
     model_sent: &str,
@@ -429,7 +434,7 @@ async fn forward(
             call_id,
             started,
             status: status.as_u16(),
-            pricing: provider.pricing,
+            price,
             tap: Tap::new(if sse { Mode::Sse } else { Mode::Json }),
         },
     );
@@ -447,15 +452,39 @@ struct Ledger {
     call_id: i64,
     started: Instant,
     status: u16,
-    pricing: Option<Pricing>,
+    price: Price,
     tap: Tap,
+}
+
+/// A rate card and the unit it is quoted in, resolved once per call.
+///
+/// The currency travels with the rates rather than being looked up at display
+/// time, because both can be edited later and a row priced in CNY must not
+/// start reading as USD when the config changes under it.
+#[derive(Debug, Clone, Default)]
+pub struct Price {
+    pub pricing: Option<Pricing>,
+    pub currency: String,
+}
+
+impl Price {
+    /// Route rates first, then the provider's, then nothing at all. The unit
+    /// comes from whichever block won, falling back to the server default.
+    pub fn resolve(route: Option<&Pricing>, provider: &Provider, default_currency: &str) -> Self {
+        let pricing = route.or(provider.pricing.as_ref()).cloned();
+        let currency = pricing
+            .as_ref()
+            .and_then(|p| p.currency.clone())
+            .unwrap_or_else(|| default_currency.to_owned());
+        Self { pricing, currency }
+    }
 }
 
 impl Drop for Ledger {
     fn drop(&mut self) {
         self.tap.finish();
         let usage = self.tap.usage();
-        let cost = self.pricing.as_ref().and_then(|p| usage.cost(p));
+        let cost = self.price.pricing.as_ref().and_then(|p| usage.cost(p));
         let _ = self.state.audit.finish(
             self.call_id,
             &Finish {
@@ -464,6 +493,7 @@ impl Drop for Ledger {
                 bytes_down: self.tap.bytes,
                 usage,
                 cost,
+                currency: Some(self.price.currency.clone()),
                 error: None,
             },
         );
@@ -521,6 +551,67 @@ pub async fn health() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn priced(input: f64, currency: Option<&str>) -> Pricing {
+        Pricing {
+            input_per_mtok: input,
+            output_per_mtok: input * 5.0,
+            cache_read_per_mtok: 0.0,
+            cache_write_per_mtok: 0.0,
+            currency: currency.map(str::to_owned),
+        }
+    }
+
+    fn a_provider(pricing: Option<Pricing>) -> Provider {
+        Provider {
+            base_url: "https://example.invalid".into(),
+            key: None,
+            auth_header: "x-api-key".into(),
+            bearer: false,
+            trust: Trust::Low,
+            timeout_secs: 10,
+            pricing,
+        }
+    }
+
+    #[test]
+    fn a_routes_own_rate_beats_the_providers() {
+        // The case: one reseller, several models, twenty times between the
+        // cheapest and the dearest. Pricing the provider alone would report the
+        // same number for all of them.
+        let p = a_provider(Some(priced(1.0, None)));
+        let resolved = Price::resolve(Some(&priced(20.0, None)), &p, "USD");
+        assert_eq!(resolved.pricing.unwrap().input_per_mtok, 20.0);
+    }
+
+    #[test]
+    fn the_provider_still_covers_a_route_that_names_no_rate() {
+        let p = a_provider(Some(priced(1.0, None)));
+        let resolved = Price::resolve(None, &p, "USD");
+        assert_eq!(resolved.pricing.unwrap().input_per_mtok, 1.0);
+        assert_eq!(resolved.currency, "USD", "falls back to the server default");
+    }
+
+    #[test]
+    fn the_unit_travels_with_whichever_rate_won() {
+        // A Chinese reseller quoting CNY next to an American one quoting USD is
+        // the whole reason this field exists. Reading one in the other's unit
+        // is off by a factor of seven.
+        let p = a_provider(Some(priced(1.0, Some("USD"))));
+        let resolved = Price::resolve(Some(&priced(2.0, Some("CNY"))), &p, "USD");
+        assert_eq!(resolved.currency, "CNY");
+
+        // And the loser's unit does not leak through when the route is silent.
+        let resolved = Price::resolve(None, &p, "EUR");
+        assert_eq!(resolved.currency, "USD");
+    }
+
+    #[test]
+    fn an_unpriced_route_on_an_unpriced_provider_stays_unpriced() {
+        // Never a zero: a zero in the dashboard reads as a free provider.
+        let resolved = Price::resolve(None, &a_provider(None), "USD");
+        assert!(resolved.pricing.is_none());
+    }
 
     #[test]
     fn peek_reads_only_what_routing_needs() {
