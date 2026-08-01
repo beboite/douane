@@ -35,6 +35,21 @@ use crate::config::{Action, ScrubConfig, Shapes, Trust};
 /// the key name, because a short API key is still an API key.
 const MIN_VALUE_LEN: usize = 12;
 
+/// Key names whose value is documentation, not a credential.
+///
+/// A vault imported from a real notes-carrying file holds long prose under keys
+/// like `notes` and file paths under `*_path`. Watching those means an agent
+/// that quotes its own documentation gets its request blocked, which teaches
+/// everyone to turn the scrubber off. Matched on the key name only: the value
+/// is never inspected to decide whether it is a secret.
+const NOT_CREDENTIALS: &[&str] = &["notes", "_path", "_url", "_public_key", "username"];
+
+fn is_documentation(r: &SecretRef) -> bool {
+    NOT_CREDENTIALS
+        .iter()
+        .any(|s| r.key == *s || r.key.ends_with(s))
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Hit {
     /// `vault` or `shape`.
@@ -60,7 +75,7 @@ impl Scrubber {
             // The one bulk read of the vault in the whole program. It happens
             // once, at startup, and the values never leave this struct.
             vault.for_each_value(&mut |r, secret| {
-                if secret.len() >= MIN_VALUE_LEN {
+                if secret.len() >= MIN_VALUE_LEN && !is_documentation(r) {
                     known.push((r.clone(), secret.expose().to_owned()));
                 }
             });
@@ -238,6 +253,38 @@ mod tests {
             (SecretRef::new("nas", "user"), Secret::new("operator")),
         ]);
         Scrubber::build(&vault, ScrubConfig::default())
+    }
+
+    #[test]
+    fn documentation_keys_are_not_watched() {
+        let vault = Fake(vec![
+            (
+                SecretRef::new("launcher", "notes"),
+                Secret::new("the minisign key lives next to the binary, see the repo docs"),
+            ),
+            (
+                SecretRef::new("boite", "tauri_signing_key_path"),
+                Secret::new("~/.tauri/boite.key"),
+            ),
+            (
+                SecretRef::new("boite", "tauri_signing_password"),
+                Secret::new("an-actual-secret-value"),
+            ),
+        ]);
+        let s = Scrubber::build(&vault, ScrubConfig::default());
+        assert_eq!(s.watching(), 1);
+
+        // Quoting one's own documentation must not get a request refused: that
+        // is how a scrubber ends up switched off.
+        let (hits, _) = s.inspect(
+            b"the minisign key lives next to the binary, see the repo docs",
+            Trust::Low,
+        );
+        assert!(hits.is_empty());
+
+        let (hits, action) = s.inspect(b"an-actual-secret-value", Trust::Low);
+        assert_eq!(action, Action::Block);
+        assert_eq!(hits[0].label, "boite.tauri_signing_password");
     }
 
     #[test]
