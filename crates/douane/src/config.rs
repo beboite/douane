@@ -1,0 +1,328 @@
+//! The broker's configuration.
+//!
+//! Nothing in here is a secret. Every credential is a [`SecretRef`] pointing
+//! into the vault, so the file is safe to read, diff, and commit to a private
+//! repo. That property is load-bearing: the moment a real key can appear in
+//! this file, someone will paste one in.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use douane_vault::SecretRef;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Config {
+    #[serde(default)]
+    pub server: Server,
+    /// Upstreams douane can forward to, by name.
+    pub providers: BTreeMap<String, Provider>,
+    /// What a requested model name resolves to.
+    pub routes: BTreeMap<String, Route>,
+    /// Who may call, and what they are allowed to reach.
+    pub clients: BTreeMap<String, Client>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Server {
+    #[serde(default = "default_listen")]
+    pub listen: String,
+    /// Where the request log goes. One SQLite file, append-mostly.
+    #[serde(default = "default_db")]
+    pub database: String,
+}
+
+impl Default for Server {
+    fn default() -> Self {
+        Self {
+            listen: default_listen(),
+            database: default_db(),
+        }
+    }
+}
+
+fn default_listen() -> String {
+    // Loopback by default. Exposing the broker on a LAN interface is a decision
+    // that must be typed out, not inherited from a default.
+    "127.0.0.1:8787".to_owned()
+}
+
+fn default_db() -> String {
+    "douane.sqlite".to_owned()
+}
+
+/// How much a given upstream is trusted with.
+///
+/// This is the axis the whole project turns on. It is not about how good the
+/// model is, it is about who reads the conversation afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Trust {
+    /// Runs on hardware the user owns. Nothing leaves the LAN.
+    Max,
+    /// A vendor with a contract and a reputation to lose.
+    Mid,
+    /// A reseller. Assume every byte sent is stored and read.
+    Low,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Provider {
+    /// Base URL, no trailing slash. `https://api.deepseek.com/anthropic`.
+    pub base_url: String,
+    /// Which vault entry holds this provider's real key.
+    #[serde(default)]
+    pub key: Option<SecretRef>,
+    /// Header the key goes into. Anthropic-compatible upstreams want
+    /// `x-api-key`; OpenAI-compatible ones want `authorization` with a
+    /// `Bearer ` prefix, which [`Provider::header_value`] adds.
+    #[serde(default = "default_auth_header")]
+    pub auth_header: String,
+    #[serde(default)]
+    pub bearer: bool,
+    pub trust: Trust,
+    /// Seconds before giving up on the upstream. Streaming responses are exempt
+    /// once the first byte has arrived.
+    #[serde(default = "default_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_auth_header() -> String {
+    "x-api-key".to_owned()
+}
+
+fn default_timeout() -> u64 {
+    120
+}
+
+impl Provider {
+    pub fn header_value(&self, key: &str) -> String {
+        if self.bearer {
+            format!("Bearer {key}")
+        } else {
+            key.to_owned()
+        }
+    }
+}
+
+/// What happens when a client asks for a given model name.
+///
+/// The indirection is the feature: an agent asks for `haiku`, and what answers
+/// is whatever the routing table says today. Claude Code only ever emits three
+/// model tiers, so this is how a cheap upstream gets to serve subagents without
+/// the agent knowing or caring.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Route {
+    pub provider: String,
+    /// The model name to send upstream. Defaults to the one that was requested.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Tried in order if the primary fails. Each entry names another route.
+    #[serde(default)]
+    pub fallback: Vec<String>,
+}
+
+/// A caller. One per machine, per project, or per agent profile.
+///
+/// The virtual key lives in the vault like everything else, so this file can be
+/// read by anyone without handing them access.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Client {
+    pub key: SecretRef,
+    /// Route names this client may use. Empty means all of them.
+    #[serde(default)]
+    pub routes: Vec<String>,
+    /// Refuse anything above this trust level. A client pinned to `max` cannot
+    /// reach a reseller even if a route would have allowed it.
+    #[serde(default)]
+    pub max_trust: Option<Trust>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("cannot read {0}: {1}")]
+    Io(std::path::PathBuf, std::io::Error),
+    #[error("{0} is not valid TOML: {1}")]
+    Parse(std::path::PathBuf, toml::de::Error),
+    #[error("route `{route}` names provider `{provider}`, which is not defined")]
+    UnknownProvider { route: String, provider: String },
+    #[error("route `{route}` falls back to `{fallback}`, which is not a route")]
+    UnknownFallback { route: String, fallback: String },
+    #[error("client `{client}` is allowed route `{route}`, which is not defined")]
+    UnknownRoute { client: String, route: String },
+    #[error("route `{0}` falls back to itself")]
+    SelfFallback(String),
+}
+
+impl Config {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        let path = path.as_ref();
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| ConfigError::Io(path.to_path_buf(), e))?;
+        let config: Config =
+            toml::from_str(&raw).map_err(|e| ConfigError::Parse(path.to_path_buf(), e))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Catch the dangling names now rather than at three in the morning on the
+    /// first request that happens to take a fallback nobody ever exercised.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        for (name, route) in &self.routes {
+            if !self.providers.contains_key(&route.provider) {
+                return Err(ConfigError::UnknownProvider {
+                    route: name.clone(),
+                    provider: route.provider.clone(),
+                });
+            }
+            for fb in &route.fallback {
+                if fb == name {
+                    return Err(ConfigError::SelfFallback(name.clone()));
+                }
+                if !self.routes.contains_key(fb) {
+                    return Err(ConfigError::UnknownFallback {
+                        route: name.clone(),
+                        fallback: fb.clone(),
+                    });
+                }
+            }
+        }
+        for (name, client) in &self.clients {
+            for r in &client.routes {
+                if !self.routes.contains_key(r) {
+                    return Err(ConfigError::UnknownRoute {
+                        client: name.clone(),
+                        route: r.clone(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve a requested model to the chain of routes to try, primary first.
+    ///
+    /// Returns an empty vector for a model with no route, which the caller
+    /// turns into a 404 rather than silently forwarding somewhere.
+    pub fn chain(&self, model: &str) -> Vec<&str> {
+        let Some((name, route)) = self.routes.get_key_value(model) else {
+            return Vec::new();
+        };
+        let mut out = vec![name.as_str()];
+        for fb in &route.fallback {
+            if let Some((n, _)) = self.routes.get_key_value(fb) {
+                out.push(n.as_str());
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE: &str = r#"
+[server]
+listen = "127.0.0.1:8787"
+
+[providers.anthropic]
+base_url = "https://api.anthropic.com"
+key = { namespace = "anthropic", key = "api_key" }
+trust = "mid"
+
+[providers.deepseek]
+base_url = "https://api.deepseek.com/anthropic"
+key = { namespace = "deepseek", key = "api_key" }
+trust = "low"
+
+[providers.local]
+base_url = "http://10.0.0.10:11434"
+trust = "max"
+
+[routes.opus]
+provider = "anthropic"
+
+[routes.haiku]
+provider = "deepseek"
+model = "deepseek-chat"
+fallback = ["opus"]
+
+[routes.qwopus]
+provider = "local"
+
+[clients.workstation]
+key = { namespace = "douane", key = "vk_workstation" }
+
+[clients.paranoid]
+key = { namespace = "douane", key = "vk_paranoid" }
+routes = ["qwopus"]
+max_trust = "max"
+"#;
+
+    fn sample() -> Config {
+        toml::from_str(SAMPLE).unwrap()
+    }
+
+    #[test]
+    fn the_sample_is_coherent() {
+        let c = sample();
+        c.validate().unwrap();
+        assert_eq!(c.providers.len(), 3);
+        assert_eq!(c.providers["deepseek"].trust, Trust::Low);
+        assert_eq!(c.routes["haiku"].model.as_deref(), Some("deepseek-chat"));
+    }
+
+    #[test]
+    fn a_provider_with_no_key_is_allowed() {
+        // The local model needs no credential, and requiring a dummy one would
+        // put a fake secret in the vault for no reason.
+        let c = sample();
+        assert!(c.providers["local"].key.is_none());
+    }
+
+    #[test]
+    fn chains_start_with_the_primary() {
+        let c = sample();
+        assert_eq!(c.chain("haiku"), vec!["haiku", "opus"]);
+        assert_eq!(c.chain("opus"), vec!["opus"]);
+        assert!(c.chain("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn dangling_names_are_caught_at_load() {
+        let mut c = sample();
+        c.routes.get_mut("haiku").unwrap().provider = "ghost".into();
+        assert!(matches!(
+            c.validate(),
+            Err(ConfigError::UnknownProvider { .. })
+        ));
+
+        let mut c = sample();
+        c.routes.get_mut("haiku").unwrap().fallback = vec!["haiku".into()];
+        assert!(matches!(c.validate(), Err(ConfigError::SelfFallback(_))));
+
+        let mut c = sample();
+        c.clients.get_mut("paranoid").unwrap().routes = vec!["ghost".into()];
+        assert!(matches!(c.validate(), Err(ConfigError::UnknownRoute { .. })));
+    }
+
+    #[test]
+    fn trust_orders_from_max_down() {
+        // Ordering is what lets a client cap itself: `max_trust = "mid"` must
+        // reject `low`, and the derive gives that for free only if the variants
+        // stay in this order.
+        assert!(Trust::Max < Trust::Mid);
+        assert!(Trust::Mid < Trust::Low);
+    }
+
+    #[test]
+    fn bearer_providers_get_the_prefix() {
+        let mut p = sample().providers["deepseek"].clone();
+        assert_eq!(p.header_value("k"), "k");
+        p.bearer = true;
+        assert_eq!(p.header_value("k"), "Bearer k");
+    }
+}
