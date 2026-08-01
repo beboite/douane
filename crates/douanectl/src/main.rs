@@ -21,6 +21,10 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use douane_vault::{Entry, FileBackend, Secret, SecretBackend, SecretRef};
 
+/// Where the egress broker's signing key lives. One name, used by the tool that
+/// mints it and by the broker that loads it, so the two cannot disagree.
+const CA_KEY: &str = "douane.ca_key";
+
 #[derive(Parser)]
 #[command(name = "douanectl", version, about, long_about = None)]
 struct Cli {
@@ -69,6 +73,34 @@ enum Command {
         #[arg(long)]
         overwrite: bool,
     },
+
+    /// The egress broker's certificate authority.
+    #[command(subcommand)]
+    Ca(CaCommand),
+}
+
+#[derive(Subcommand)]
+enum CaCommand {
+    /// Mint a new authority. The private key goes into the vault, the
+    /// certificate is written where `--cert` says.
+    ///
+    /// The certificate is public and has to be, since it is the thing a machine
+    /// is asked to trust. The key is a credential like any other and is treated
+    /// like one. Refuses to overwrite an existing authority: replacing it
+    /// silently would invalidate every trust store that already has the old one
+    /// while looking like nothing happened.
+    Init {
+        /// Where to write the public certificate.
+        #[arg(long, default_value = "douane-ca.crt")]
+        cert: PathBuf,
+        /// What the authority calls itself, as it will appear in a trust store.
+        #[arg(long, default_value = "douane egress broker")]
+        name: String,
+        /// Replace an existing key. Every machine trusting the old certificate
+        /// stops trusting this instance until it is given the new one.
+        #[arg(long)]
+        rotate: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -115,6 +147,46 @@ fn main() -> Result<()> {
             // nothing about the value.
             eprintln!("stored {r}  fingerprint {fingerprint}");
             eprintln!("placeholder: {}", r.placeholder());
+        }
+        Command::Ca(CaCommand::Init { cert, name, rotate }) => {
+            let key_ref = SecretRef::parse(CA_KEY).map_err(anyhow::Error::from)?;
+            let passphrase = read_passphrase()?;
+            let mut vault = FileBackend::open(&path, &passphrase)?;
+
+            if vault.get(&key_ref).is_some() && !rotate {
+                bail!(
+                    "{key_ref} already exists. Minting another would leave every machine \
+                     that trusts the current certificate unable to reach this broker. \
+                     Pass --rotate if that is what you want."
+                );
+            }
+            if cert.exists() && !rotate {
+                bail!("{} already exists", cert.display());
+            }
+
+            let authority = douane_ca::Authority::generate(&name)?;
+            // The certificate lands on disk first. A key in the vault whose
+            // certificate was never written is an authority nobody can verify,
+            // and there is deliberately no way to read the key back out to
+            // rebuild one.
+            std::fs::write(&cert, &authority.cert_pem)
+                .with_context(|| format!("writing {}", cert.display()))?;
+
+            let entry = Entry::new(Secret::new(authority.key_pem)).with_note(
+                "egress broker signing key. Never leaves the vault, never reaches a client.",
+            );
+            let fingerprint = entry.value.fingerprint();
+            vault.put(&key_ref, entry);
+            vault.persist()?;
+
+            eprintln!("authority minted, key stored as {key_ref}  fingerprint {fingerprint}");
+            eprintln!("certificate written to {}", cert.display());
+            eprintln!();
+            eprintln!(
+                "Nothing trusts it yet, and nothing here will install it for you. Adding a\n\
+                 certificate authority to a machine means that machine will believe douane\n\
+                 about every TLS connection it opens, which is a decision to take on purpose."
+            );
         }
         Command::List { json } => {
             let passphrase = read_passphrase()?;

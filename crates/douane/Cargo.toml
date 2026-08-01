@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 douane-vault.workspace = true
+douane-ca.workspace = true
 
 anyhow.workspace = true
 thiserror.workspace = true

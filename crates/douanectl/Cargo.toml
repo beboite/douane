@@ -9,6 +9,10 @@ repository.workspace = true
 
 [dependencies]
 douane-vault.workspace = true
+# For `ca init`. Its own crate rather than the broker's, so minting a
+# certificate does not drag axum, rusqlite and reqwest into this binary, while
+# both still agree on what a valid authority is.
+douane-ca.workspace = true
 
 anyhow.workspace = true
 clap.workspace = true

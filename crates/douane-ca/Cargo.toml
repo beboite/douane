@@ -1,0 +1,14 @@
+[package]
+name = "douane-ca"
+description = "The certificate authority the douane egress broker signs with. Kept apart so the CLI that mints it does not have to pull in the broker."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+rcgen.workspace = true
+x509-parser.workspace = true
+time.workspace = true

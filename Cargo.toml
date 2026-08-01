@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/douane-vault", "crates/douane", "crates/douanectl"]
+members = ["crates/douane-vault", "crates/douane-ca", "crates/douane", "crates/douanectl"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,6 +11,7 @@ repository = "https://github.com/beboite/douane"
 
 [workspace.dependencies]
 douane-vault = { path = "crates/douane-vault", version = "0.1.0" }
+douane-ca = { path = "crates/douane-ca", version = "0.1.0" }
 
 anyhow = "1"
 thiserror = "2"
@@ -36,6 +37,12 @@ sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
 regex = "1"
+# The egress broker's own certificate authority. Nothing here talks TLS yet:
+# this mints the certificates that the intercepting proxy will present.
+rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
+# rcgen's own CA loader documents that it does not check `BasicConstraints`, so
+# douane checks it.
+x509-parser = "0.18"
 
 [profile.release]
 lto = "thin"
