@@ -379,6 +379,18 @@ mod tests {
     }
 
     #[test]
+    fn hidden_actually_hides() {
+        // Four elements are shown and hidden with the `hidden` attribute, and
+        // two of them carry an author `display` rule that beats the user agent
+        // sheet. Without this one line the token prompt stays painted over the
+        // unlocked dashboard: the DOM says hidden, the screen says otherwise.
+        assert!(
+            PAGE.contains("[hidden] { display: none !important; }"),
+            "the page must force `hidden` to win over its own display rules"
+        );
+    }
+
+    #[test]
     fn the_page_carries_no_third_party_reference() {
         // A page about credentials that phones home to a CDN would hand a third
         // party the timing of every visit, and a compromised CDN the contents.

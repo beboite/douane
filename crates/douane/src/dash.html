@@ -19,6 +19,11 @@
     }
   }
   * { box-sizing: border-box; }
+  /* The `hidden` attribute is only `display: none` in the user agent sheet, so
+     any author `display` rule beats it. `#gate` is a grid and `header` is a
+     flex box, which means without this line the token prompt stays on top of
+     the dashboard after unlocking and the page is unusable. */
+  [hidden] { display: none !important; }
   body {
     margin: 0; background: var(--bg); color: var(--ink);
     font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
