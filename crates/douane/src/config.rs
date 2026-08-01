@@ -21,6 +21,8 @@ pub struct Config {
     pub routes: BTreeMap<String, Route>,
     /// Who may call, and what they are allowed to reach.
     pub clients: BTreeMap<String, Client>,
+    #[serde(default)]
+    pub scrub: ScrubConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -30,6 +32,15 @@ pub struct Server {
     /// Where the request log goes. One SQLite file, append-mostly.
     #[serde(default = "default_db")]
     pub database: String,
+    /// Vault entry holding the dashboard's token. Absent means no dashboard:
+    /// an admin surface with no credential to guard it does not get served at
+    /// all, rather than served openly.
+    #[serde(default)]
+    pub admin_key: Option<SecretRef>,
+    /// What the numbers in `pricing` are denominated in. Never converted, only
+    /// displayed, so it must match whatever the price list was copied from.
+    #[serde(default = "default_currency")]
+    pub currency: String,
 }
 
 impl Default for Server {
@@ -37,8 +48,14 @@ impl Default for Server {
         Self {
             listen: default_listen(),
             database: default_db(),
+            admin_key: None,
+            currency: default_currency(),
         }
     }
+}
+
+fn default_currency() -> String {
+    "USD".to_owned()
 }
 
 fn default_listen() -> String {
@@ -85,6 +102,28 @@ pub struct Provider {
     /// once the first byte has arrived.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    /// What this upstream charges. Absent means douane reports tokens but no
+    /// cost for it, which is the honest answer: a made-up zero would read as a
+    /// free provider in the dashboard.
+    #[serde(default)]
+    pub pricing: Option<Pricing>,
+}
+
+/// Per million tokens, in `server.currency`.
+///
+/// This is what makes an invoice checkable. A reseller quotes a price and bills
+/// a total, and without a local count of the tokens actually sent there is
+/// nothing to hold the total against.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct Pricing {
+    #[serde(default)]
+    pub input_per_mtok: f64,
+    #[serde(default)]
+    pub output_per_mtok: f64,
+    #[serde(default)]
+    pub cache_read_per_mtok: f64,
+    #[serde(default)]
+    pub cache_write_per_mtok: f64,
 }
 
 fn default_auth_header() -> String {
@@ -122,6 +161,22 @@ pub struct Route {
     pub fallback: Vec<String>,
 }
 
+/// A change to one route, made from the dashboard and stored in the database.
+///
+/// This is the whole point of routing by model name: an agent asks for `haiku`
+/// for the length of a session, and what answers can change under it between
+/// two turns without the session knowing.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct RouteOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// `Some(None)` is not expressible here, so clearing a model back to "send
+    /// whatever was requested" is done by deleting the override, not by setting
+    /// this to null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
 /// A caller. One per machine, per project, or per agent profile.
 ///
 /// The virtual key lives in the vault like everything else, so this file can be
@@ -138,6 +193,106 @@ pub struct Client {
     pub max_trust: Option<Trust>,
     #[serde(default)]
     pub note: Option<String>,
+}
+
+/// What to do about something found on its way out.
+///
+/// Ordered so that the strongest verdict among several hits is `max()`, which
+/// is the only combining rule that is ever right here: one blocking hit in a
+/// body full of warnings still blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Action {
+    Allow,
+    /// Let it through, record an alert. The dashboard is where it surfaces.
+    Warn,
+    /// Refuse the request. The agent gets a 403 naming what was found, never
+    /// the text that was found.
+    Block,
+}
+
+/// Which patterns count as credential-shaped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Shapes {
+    Off,
+    /// Vendor prefixes only: `sk-ant-`, `ghp_`, `AKIA`, a PEM header. A match is
+    /// strong evidence, and ordinary source code does not produce one.
+    Vendor,
+    /// Adds JWTs and `password = "..."` assignments. Real recall, real noise:
+    /// an agent reading test fixtures trips these constantly.
+    Aggressive,
+}
+
+/// One action per trust level.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct ByTrust {
+    pub low: Action,
+    pub mid: Action,
+    pub max: Action,
+}
+
+impl ByTrust {
+    pub fn at(&self, trust: Trust) -> Action {
+        match trust {
+            Trust::Low => self.low,
+            Trust::Mid => self.mid,
+            Trust::Max => self.max,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct ScrubConfig {
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    #[serde(default = "default_shapes")]
+    pub shapes: Shapes,
+    /// A value that is verbatim in the vault. No false positive is possible, so
+    /// the default blocks anywhere it would leave the house.
+    #[serde(default = "default_vault_hit")]
+    pub vault_hit: ByTrust,
+    /// Something that merely looks like a credential. Warns by default, because
+    /// blocking a coding agent over a fixture is its own kind of damage.
+    #[serde(default = "default_shape_hit")]
+    pub shape_hit: ByTrust,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn default_shapes() -> Shapes {
+    Shapes::Vendor
+}
+
+fn default_vault_hit() -> ByTrust {
+    ByTrust {
+        low: Action::Block,
+        mid: Action::Block,
+        // The local model is on hardware the user owns, so there is nothing to
+        // protect the credential from and every scan would be pure latency.
+        max: Action::Allow,
+    }
+}
+
+fn default_shape_hit() -> ByTrust {
+    ByTrust {
+        low: Action::Warn,
+        mid: Action::Allow,
+        max: Action::Allow,
+    }
+}
+
+impl Default for ScrubConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            shapes: default_shapes(),
+            vault_hit: default_vault_hit(),
+            shape_hit: default_shape_hit(),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -159,8 +314,8 @@ pub enum ConfigError {
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| ConfigError::Io(path.to_path_buf(), e))?;
+        let raw =
+            std::fs::read_to_string(path).map_err(|e| ConfigError::Io(path.to_path_buf(), e))?;
         let config: Config =
             toml::from_str(&raw).map_err(|e| ConfigError::Parse(path.to_path_buf(), e))?;
         config.validate()?;
@@ -200,6 +355,29 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// A copy of this config with the dashboard's routing changes applied.
+    ///
+    /// Overrides live in the request log rather than being written back into
+    /// the TOML. Serialising the config back would strip every comment out of a
+    /// file whose comments are most of its value, and it would also mean the
+    /// admin surface could rewrite the parts of the file it has no business
+    /// touching. The file stays the base, the database holds the diff.
+    pub fn with_overrides(&self, overrides: &BTreeMap<String, RouteOverride>) -> Self {
+        let mut out = self.clone();
+        for (name, o) in overrides {
+            let Some(route) = out.routes.get_mut(name) else {
+                continue;
+            };
+            if let Some(p) = &o.provider {
+                route.provider = p.clone();
+            }
+            if o.model.is_some() {
+                route.model = o.model.clone();
+            }
+        }
+        out
     }
 
     /// Resolve a requested model to the chain of routes to try, primary first.
@@ -306,7 +484,10 @@ max_trust = "max"
 
         let mut c = sample();
         c.clients.get_mut("paranoid").unwrap().routes = vec!["ghost".into()];
-        assert!(matches!(c.validate(), Err(ConfigError::UnknownRoute { .. })));
+        assert!(matches!(
+            c.validate(),
+            Err(ConfigError::UnknownRoute { .. })
+        ));
     }
 
     #[test]
@@ -316,6 +497,59 @@ max_trust = "max"
         // stay in this order.
         assert!(Trust::Max < Trust::Mid);
         assert!(Trust::Mid < Trust::Low);
+    }
+
+    #[test]
+    fn an_override_repoints_a_route_without_touching_the_file() {
+        let c = sample();
+        let mut overrides = BTreeMap::new();
+        overrides.insert(
+            "haiku".to_owned(),
+            RouteOverride {
+                provider: Some("anthropic".into()),
+                model: Some("claude-haiku-4-5".into()),
+            },
+        );
+        let live = c.with_overrides(&overrides);
+        assert_eq!(live.routes["haiku"].provider, "anthropic");
+        assert_eq!(
+            live.routes["haiku"].model.as_deref(),
+            Some("claude-haiku-4-5")
+        );
+        live.validate().unwrap();
+
+        // The base is untouched, so restarting reverts to the file and the
+        // override is a live decision rather than a silent rewrite.
+        assert_eq!(c.routes["haiku"].provider, "deepseek");
+    }
+
+    #[test]
+    fn an_override_naming_a_route_that_is_gone_is_ignored() {
+        let c = sample();
+        let mut overrides = BTreeMap::new();
+        overrides.insert(
+            "deleted".to_owned(),
+            RouteOverride {
+                provider: Some("anthropic".into()),
+                model: None,
+            },
+        );
+        let live = c.with_overrides(&overrides);
+        assert!(!live.routes.contains_key("deleted"));
+        live.validate().unwrap();
+    }
+
+    #[test]
+    fn the_scrub_defaults_protect_the_reseller_path() {
+        let c = sample();
+        assert!(c.scrub.enabled);
+        assert_eq!(c.scrub.vault_hit.at(Trust::Low), Action::Block);
+        assert_eq!(c.scrub.vault_hit.at(Trust::Max), Action::Allow);
+        assert_eq!(c.scrub.shape_hit.at(Trust::Low), Action::Warn);
+        assert_eq!(c.scrub.shapes, Shapes::Vendor);
+        // Combining verdicts takes the strongest.
+        assert_eq!(Action::Warn.max(Action::Block), Action::Block);
+        assert_eq!(Action::Allow.max(Action::Warn), Action::Warn);
     }
 
     #[test]

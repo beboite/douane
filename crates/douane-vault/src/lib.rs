@@ -142,6 +142,16 @@ pub trait SecretBackend: Send + Sync {
     fn list(&self) -> Vec<EntryInfo>;
     /// Flush to durable storage. A backend with no local state may no-op.
     fn persist(&self) -> Result<(), VaultError>;
+
+    /// Show every stored value to `f`, one at a time.
+    ///
+    /// This is the second door, alongside [`Secret::expose`], and it exists for
+    /// exactly one caller: the outbound scrubber, which cannot recognise a value
+    /// leaving for a reseller unless it has been shown that value first. It is a
+    /// callback rather than a getter so no caller can hold the values, collect
+    /// them, or serialise them, and so `grep for_each_value` still counts the
+    /// places a bulk read happens on one hand.
+    fn for_each_value(&self, f: &mut dyn FnMut(&SecretRef, &Secret));
 }
 
 #[derive(Debug, thiserror::Error)]

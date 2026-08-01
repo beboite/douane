@@ -153,7 +153,10 @@ fn main() -> Result<()> {
             vault.persist()?;
             eprintln!("removed {r}");
         }
-        Command::Import { path: src, overwrite } => {
+        Command::Import {
+            path: src,
+            overwrite,
+        } => {
             let passphrase = read_passphrase()?;
             let mut vault = FileBackend::open(&path, &passphrase)?;
             let (added, skipped) = import(&mut vault, &src, overwrite)?;
@@ -184,7 +187,9 @@ fn import(vault: &mut FileBackend, src: &PathBuf, overwrite: bool) -> Result<(us
     let mut skipped = 0usize;
 
     for (namespace, body) in obj {
-        let Some(keys) = body.as_object() else { continue };
+        let Some(keys) = body.as_object() else {
+            continue;
+        };
         for (key, value) in flatten(keys) {
             let r = SecretRef::new(namespace.clone(), key);
             if vault.get(&r).is_some() && !overwrite {
@@ -231,7 +236,11 @@ fn vault_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
         std::env::var("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .ok()
-            .or_else(|| std::env::var("HOME").map(|h| PathBuf::from(h).join(".config")).ok())
+            .or_else(|| {
+                std::env::var("HOME")
+                    .map(|h| PathBuf::from(h).join(".config"))
+                    .ok()
+            })
     };
     let base = base.context("cannot determine a config directory, pass --vault")?;
     Ok(base.join("douane").join("vault.json"))

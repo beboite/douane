@@ -9,22 +9,16 @@
 //! variable is cleared straight after, so a later `/proc/self/environ` read by
 //! anything that manages to run in this process finds nothing.
 
-mod audit;
-mod config;
-mod proxy;
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use axum::Router;
-use axum::routing::{get, post};
 use clap::Parser;
+use douane::audit::Audit;
+use douane::config::Config;
+use douane::proxy::AppState;
+use douane::scrub::Scrubber;
 use douane_vault::{FileBackend, SecretBackend};
-
-use crate::audit::Audit;
-use crate::config::Config;
-use crate::proxy::AppState;
 
 #[derive(Parser)]
 #[command(name = "douane", version, about, long_about = None)]
@@ -54,16 +48,15 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let config = Config::load(&cli.config)
-        .with_context(|| format!("loading {}", cli.config.display()))?;
+    let config =
+        Config::load(&cli.config).with_context(|| format!("loading {}", cli.config.display()))?;
 
     let vault_path = cli
         .vault
         .or_else(|| std::env::var("DOUANE_VAULT").ok().map(PathBuf::from))
         .context("no vault path: pass --vault or set DOUANE_VAULT")?;
 
-    let passphrase =
-        std::env::var("DOUANE_PASSPHRASE").context("DOUANE_PASSPHRASE is not set")?;
+    let passphrase = std::env::var("DOUANE_PASSPHRASE").context("DOUANE_PASSPHRASE is not set")?;
     // SAFETY: single-threaded at this point, nothing else can be reading the
     // environment. Clearing it shrinks the window in which the passphrase is
     // readable from outside the process to the startup path alone.
@@ -88,6 +81,11 @@ async fn main() -> Result<()> {
             missing.push(format!("client `{name}` needs {}", client.key));
         }
     }
+    if let Some(r) = &config.server.admin_key
+        && vault.get(r).is_none()
+    {
+        missing.push(format!("the dashboard needs {r}"));
+    }
     if !missing.is_empty() {
         for m in &missing {
             tracing::error!("{m}");
@@ -95,15 +93,31 @@ async fn main() -> Result<()> {
         bail!(
             "{} vault entr{} missing, store them with `douanectl put`",
             missing.len(),
-            if missing.len() == 1 { "y is" } else { "ies are" }
+            if missing.len() == 1 {
+                "y is"
+            } else {
+                "ies are"
+            }
         );
     }
+
+    // Built before the vault is boxed away, and holding the values it must
+    // recognise for the life of the process. Nothing else in the program reads
+    // the vault in bulk.
+    let scrubber = Scrubber::build(&vault, config.scrub);
+    let admin_token = config
+        .server
+        .admin_key
+        .as_ref()
+        .and_then(|r| vault.get(r).cloned());
 
     tracing::info!(
         providers = config.providers.len(),
         routes = config.routes.len(),
         clients = config.clients.len(),
         secrets = vault.len(),
+        scrub_watching = scrubber.watching(),
+        dashboard = admin_token.is_some(),
         "configuration and vault agree"
     );
 
@@ -116,25 +130,27 @@ async fn main() -> Result<()> {
     let audit = Audit::open(&config.server.database)
         .with_context(|| format!("opening {}", config.server.database))?;
 
-    let state = Arc::new(AppState {
+    let state = Arc::new(AppState::new(
         config,
-        vault: Box::new(vault),
+        Box::new(vault),
+        scrubber,
         // No proxy is inherited from the environment: an agent that manages to
         // set `HTTPS_PROXY` in the broker's environment must not get to redirect
         // upstream traffic through something it controls.
-        http: reqwest::Client::builder()
+        //
+        // `read_timeout` rather than a total one: it fires on an upstream that
+        // has gone silent, and leaves a long generation alone.
+        reqwest::Client::builder()
             .no_proxy()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .read_timeout(std::time::Duration::from_secs(180))
             .user_agent(concat!("douane/", env!("CARGO_PKG_VERSION")))
             .build()?,
         audit,
-    });
+        admin_token,
+    )?);
 
-    let app = Router::new()
-        .route("/v1/messages", post(proxy::messages))
-        .route("/health", get(proxy::health))
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024 * 1024))
-        .layer(tower_http::trace::TraceLayer::new_for_http())
-        .with_state(state);
+    let app = douane::router(state);
 
     let listener = tokio::net::TcpListener::bind(&listen)
         .await

@@ -35,6 +35,7 @@ rand = "0.9"
 sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
+regex = "1"
 
 [profile.release]
 lto = "thin"

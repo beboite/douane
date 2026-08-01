@@ -14,6 +14,12 @@
 # never one to inherit.
 listen = "127.0.0.1:8787"
 database = "douane.sqlite"
+# The dashboard's token. Comment this out and no admin surface is served at all,
+# which is the right setting for an instance nobody is watching.
+admin_key = { namespace = "douane", key = "admin_token" }
+# What the `pricing` numbers below are denominated in. Displayed, never
+# converted, so it has to match wherever the price list was copied from.
+currency = "USD"
 
 # ---------------------------------------------------------------- providers --
 # `trust` is not about model quality. It is about who reads the conversation
@@ -30,6 +36,15 @@ base_url = "https://api.anthropic.com"
 key = { namespace = "anthropic", key = "api_key" }
 trust = "mid"
 
+# Per million tokens, in `server.currency`. Optional: a provider with no price
+# list reports tokens and no cost, which is honest. An invented zero would show
+# up in the dashboard as a free provider.
+[providers.anthropic.pricing]
+input_per_mtok = 15.0
+output_per_mtok = 75.0
+cache_read_per_mtok = 1.5
+cache_write_per_mtok = 18.75
+
 # A reseller. Assume every byte sent is stored and read. DeepSeek ships an
 # Anthropic-compatible endpoint, so no protocol translation is needed, but the
 # compatibility shim ignores cache_control: expect no cache discount and count
@@ -38,6 +53,12 @@ trust = "mid"
 base_url = "https://api.deepseek.com/anthropic"
 key = { namespace = "deepseek", key = "api_key" }
 trust = "low"
+
+[providers.deepseek.pricing]
+input_per_mtok = 0.28
+output_per_mtok = 0.42
+cache_read_per_mtok = 0.028
+cache_write_per_mtok = 0.0
 
 # ------------------------------------------------------------------- routes --
 # The indirection is the feature. Claude Code only ever emits three model tiers,
@@ -80,3 +101,31 @@ note = "local model only, no exception"
 key = { namespace = "douane", key = "vk_autonomous" }
 routes = ["haiku", "sonnet"]
 note = "unattended agents, cheap tiers only"
+
+# ------------------------------------------------------------------- scrub --
+# Looks at what is about to leave, for the destination it is about to leave to.
+# The leak this exists for is mundane: an agent reads a `.env`, pastes it into
+# its own context to reason about it, and the whole conversation goes to a
+# reseller on the next turn. Brokering keys does not help there, because the
+# secret is in the body and not in the header.
+
+[scrub]
+enabled = true
+
+# Which patterns count as credential-shaped.
+#   "vendor"     sk-ant-, ghp_, AKIA, a PEM header. A match is strong evidence
+#                and ordinary source code does not produce one.
+#   "aggressive" adds JWTs and `password = "..."`. Real recall, real noise: an
+#                agent reading test fixtures trips these all day.
+#   "off"        vault values only.
+shapes = "vendor"
+
+# A value that is verbatim in the vault. No false positive is possible, so this
+# blocks anywhere it would leave the house. `max` allows because nothing leaves
+# the LAN there, so there is nothing to protect it from.
+vault_hit = { low = "block", mid = "block", max = "allow" }
+
+# Something that merely looks like a credential. Warns, because blocking a
+# coding agent over a fixture is its own kind of damage. Move `low` to "block"
+# once the alert list has been quiet for a while.
+shape_hit = { low = "warn", mid = "allow", max = "allow" }

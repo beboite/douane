@@ -203,7 +203,9 @@ impl FileBackend {
 
         let key = MasterKey::derive(passphrase, &envelope.kdf)?;
 
-        let nonce = B64.decode(&envelope.nonce).map_err(|_| VaultError::Decrypt)?;
+        let nonce = B64
+            .decode(&envelope.nonce)
+            .map_err(|_| VaultError::Decrypt)?;
         let ciphertext = B64
             .decode(&envelope.ciphertext)
             .map_err(|_| VaultError::Decrypt)?;
@@ -290,6 +292,17 @@ impl SecretBackend for FileBackend {
                 })
             })
             .collect()
+    }
+
+    fn for_each_value(&self, f: &mut dyn FnMut(&SecretRef, &crate::Secret)) {
+        for (namespace, keys) in &self.store {
+            for (key, entry) in keys {
+                f(
+                    &SecretRef::new(namespace.clone(), key.clone()),
+                    &entry.value,
+                );
+            }
+        }
     }
 
     /// Encrypt and write, atomically.
@@ -396,7 +409,9 @@ mod tests {
         b.persist().unwrap();
 
         let reopened = FileBackend::open(&path, "correct horse").unwrap();
-        let got = reopened.get(&SecretRef::new("proxy", "password")).unwrap();
+        let got = reopened
+            .get(&SecretRef::new("proxy", "password"))
+            .unwrap();
         assert_eq!(got.expose(), "hunter2");
     }
 

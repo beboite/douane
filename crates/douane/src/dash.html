@@ -1,0 +1,467 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>douane</title>
+<style>
+  :root {
+    --bg: #0d0f12; --panel: #14181d; --line: #232a32; --ink: #d7dee7;
+    --dim: #7d8996; --accent: #6ea8fe; --ok: #4ec9a5; --warn: #e0b33c;
+    --bad: #e5636c; --max: #4ec9a5; --mid: #6ea8fe; --low: #e0b33c;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f7f9; --panel: #fff; --line: #dfe3e8; --ink: #1b2027;
+      --dim: #66707c; --accent: #2563c9; --ok: #157f5f; --warn: #96690a;
+      --bad: #c0333c; --max: #157f5f; --mid: #2563c9; --low: #96690a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+    padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel);
+    position: sticky; top: 0; z-index: 5;
+  }
+  h1 { margin: 0; font-size: 15px; letter-spacing: .14em; text-transform: uppercase; }
+  h1 span { color: var(--dim); letter-spacing: 0; text-transform: none; font-weight: 400; margin-left: 10px; }
+  main { padding: 20px; max-width: 1400px; margin: 0 auto; }
+  section { margin-bottom: 28px; }
+  h2 {
+    font-size: 11px; letter-spacing: .16em; text-transform: uppercase;
+    color: var(--dim); margin: 0 0 10px; font-weight: 600;
+  }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+  .scroll { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; white-space: nowrap; }
+  th, td { text-align: left; padding: 7px 12px; border-bottom: 1px solid var(--line); }
+  th { color: var(--dim); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+  tr:last-child td { border-bottom: 0; }
+  td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 12px 14px; }
+  .card b { display: block; font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .card small { color: var(--dim); text-transform: uppercase; letter-spacing: .1em; font-size: 10px; }
+  .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+  .tag { padding: 1px 7px; border-radius: 3px; border: 1px solid currentColor; font-size: 11px; }
+  .t-max { color: var(--max); } .t-mid { color: var(--mid); } .t-low { color: var(--low); }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+  .dim { color: var(--dim); }
+  button, select, input {
+    font: inherit; color: var(--ink); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 4px; padding: 4px 8px;
+  }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--bg); }
+  #gate {
+    position: fixed; inset: 0; background: var(--bg); display: grid; place-items: center; z-index: 20;
+  }
+  #gate form { display: grid; gap: 12px; width: min(340px, 88vw); text-align: center; }
+  #gate p { color: var(--dim); margin: 0; }
+  #err { color: var(--bad); min-height: 1.4em; }
+  .muted-row td { opacity: .55; }
+  footer { color: var(--dim); padding: 0 20px 30px; max-width: 1400px; margin: 0 auto; }
+</style>
+</head>
+<body>
+
+<div id="gate">
+  <form id="gate-form">
+    <h1>douane</h1>
+    <p>admin token</p>
+    <input id="token" type="password" autocomplete="off" autofocus>
+    <button class="primary" type="submit">unlock</button>
+    <div id="err"></div>
+  </form>
+</div>
+
+<header hidden id="chrome">
+  <h1>douane <span id="watching"></span></h1>
+  <label class="dim">window
+    <select id="hours">
+      <option value="1">1 h</option>
+      <option value="24" selected>24 h</option>
+      <option value="168">7 d</option>
+      <option value="720">30 d</option>
+    </select>
+  </label>
+  <label class="dim"><input type="checkbox" id="auto" checked> auto-refresh</label>
+  <button id="refresh">refresh</button>
+  <span id="stamp" class="dim"></span>
+</header>
+
+<main hidden id="body">
+  <section>
+    <h2>totals</h2>
+    <div class="cards" id="totals"></div>
+  </section>
+
+  <section>
+    <h2>routing &mdash; a change here takes effect on the next request</h2>
+    <div class="panel scroll"><table id="routes"></table></div>
+  </section>
+
+  <section class="cols">
+    <div>
+      <h2>by provider</h2>
+      <div class="panel scroll"><table id="by-provider"></table></div>
+    </div>
+    <div>
+      <h2>by client</h2>
+      <div class="panel scroll"><table id="by-client"></table></div>
+    </div>
+    <div>
+      <h2>by agent fingerprint</h2>
+      <div class="panel scroll"><table id="by-agent"></table></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>alerts &mdash; credential material caught on its way out</h2>
+    <div class="panel scroll"><table id="alerts"></table></div>
+  </section>
+
+  <section>
+    <h2>conversations</h2>
+    <div class="panel scroll"><table id="threads"></table></div>
+  </section>
+
+  <section>
+    <h2>calls</h2>
+    <div class="panel scroll"><table id="calls"></table></div>
+  </section>
+
+  <section>
+    <h2>vault &mdash; names only, no surface here can return a value</h2>
+    <div class="panel scroll"><table id="vault"></table></div>
+  </section>
+</main>
+
+<footer id="foot" hidden></footer>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+let TOKEN = sessionStorage.getItem("douane-admin") || "";
+let CURRENCY = "USD";
+let timer = null;
+
+async function api(path, opts = {}) {
+  const res = await fetch("/admin/api" + path, {
+    ...opts,
+    headers: { "x-douane-admin": TOKEN, "content-type": "application/json", ...(opts.headers || {}) },
+  });
+  if (res.status === 401) throw new Error("unauthorised");
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error((body.error && body.error.message) || res.status);
+  }
+  return res.json();
+}
+
+// ------------------------------------------------------------------ format --
+
+const nf = new Intl.NumberFormat();
+const num = (v) => (v === null || v === undefined ? "" : nf.format(v));
+
+function money(v) {
+  if (v === null || v === undefined) return "";
+  // Sub-cent totals are the normal case for a single call, and rounding them
+  // to two decimals would show every one of them as zero.
+  const digits = Math.abs(v) > 0 && Math.abs(v) < 0.01 ? 5 : 2;
+  return v.toFixed(digits) + " " + CURRENCY;
+}
+
+function bytes(v) {
+  if (v === null || v === undefined) return "";
+  const u = ["B", "K", "M", "G"];
+  let i = 0;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (i === 0 ? v : v.toFixed(1)) + u[i];
+}
+
+function ago(iso) {
+  const s = Math.round((Date.now() - Date.parse(iso)) / 1000);
+  if (!isFinite(s)) return "";
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.round(s / 60) + "m";
+  if (s < 86400) return Math.round(s / 3600) + "h";
+  return Math.round(s / 86400) + "d";
+}
+
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+const trust = (t) => `<span class="tag t-${esc(t)}">${esc(t)}</span>`;
+
+function table(el, cols, rows, render) {
+  const head = "<thead><tr>" + cols.map((c) =>
+    `<th class="${c.n ? "n" : ""}">${esc(c.label)}</th>`).join("") + "</tr></thead>";
+  const body = rows.length
+    ? rows.map(render).join("")
+    : `<tr><td class="dim" colspan="${cols.length}">nothing yet</td></tr>`;
+  el.innerHTML = head + "<tbody>" + body + "</tbody>";
+}
+
+// ------------------------------------------------------------------- views --
+
+function renderTotals(t) {
+  const errClass = t.errors > 0 ? "bad" : "dim";
+  $("totals").innerHTML = [
+    ["calls", num(t.calls), ""],
+    ["errors", num(t.errors), errClass],
+    ["input tokens", num(t.input_tokens), ""],
+    ["output tokens", num(t.output_tokens), ""],
+    ["cache reads", num(t.cache_read_tokens), ""],
+    ["cost", money(t.cost), ""],
+  ].map(([label, value, cls]) =>
+    `<div class="card"><b class="${cls}">${esc(value)}</b><small>${esc(label)}</small></div>`).join("");
+}
+
+function renderBuckets(el, buckets, keyLabel) {
+  table(el,
+    [{ label: keyLabel }, { label: "calls", n: true }, { label: "err", n: true },
+     { label: "in", n: true }, { label: "out", n: true }, { label: "cost", n: true }],
+    buckets,
+    (b) => `<tr>
+      <td>${esc(b.key)}</td>
+      <td class="n">${num(b.calls)}</td>
+      <td class="n ${b.errors ? "bad" : "dim"}">${num(b.errors)}</td>
+      <td class="n">${num(b.input_tokens)}</td>
+      <td class="n">${num(b.output_tokens)}</td>
+      <td class="n">${esc(money(b.cost))}</td>
+    </tr>`);
+}
+
+function renderRoutes(cfg) {
+  const options = cfg.providers.map((p) => p.name);
+  table($("routes"),
+    [{ label: "model asked for" }, { label: "goes to" }, { label: "sent as" },
+     { label: "trust" }, { label: "fallback" }, { label: "" }],
+    cfg.routes,
+    (r) => {
+      const p = cfg.providers.find((x) => x.name === r.provider) || {};
+      const sel = options.map((o) =>
+        `<option ${o === r.provider ? "selected" : ""}>${esc(o)}</option>`).join("");
+      const base = r.overridden
+        ? `<span class="dim">was ${esc(r.base_provider)}${r.base_model ? " / " + esc(r.base_model) : ""}</span>`
+        : "";
+      return `<tr data-route="${esc(r.name)}">
+        <td><b>${esc(r.name)}</b></td>
+        <td><select class="p">${sel}</select></td>
+        <td><input class="m" size="18" value="${esc(r.model || "")}" placeholder="same name"></td>
+        <td>${trust(p.trust || "?")}</td>
+        <td class="dim">${esc((r.fallback || []).join(" ‣ "))}</td>
+        <td>
+          <button class="save">apply</button>
+          ${r.overridden ? '<button class="revert">revert</button> ' + base : ""}
+        </td>
+      </tr>`;
+    });
+
+  $("routes").querySelectorAll("button.save").forEach((b) =>
+    b.onclick = async () => {
+      const tr = b.closest("tr");
+      const model = tr.querySelector(".m").value.trim();
+      await api("/routes/" + encodeURIComponent(tr.dataset.route), {
+        method: "PUT",
+        body: JSON.stringify({
+          provider: tr.querySelector(".p").value,
+          ...(model ? { model } : {}),
+        }),
+      });
+      refresh();
+    });
+
+  $("routes").querySelectorAll("button.revert").forEach((b) =>
+    b.onclick = async () => {
+      const tr = b.closest("tr");
+      await api("/routes/" + encodeURIComponent(tr.dataset.route), { method: "DELETE" });
+      refresh();
+    });
+}
+
+function renderAlerts(rows) {
+  table($("alerts"),
+    [{ label: "when" }, { label: "action" }, { label: "what" }, { label: "kind" },
+     { label: "client" }, { label: "heading for" }],
+    rows,
+    (a) => `<tr>
+      <td class="dim">${esc(ago(a.at))} ago</td>
+      <td class="${a.action === "block" ? "bad" : "warn"}">${esc(a.action)}</td>
+      <td><b>${esc(a.label)}</b></td>
+      <td class="dim">${esc(a.kind)}</td>
+      <td>${esc(a.client)}</td>
+      <td>${esc(a.provider)} ${trust(a.trust)}</td>
+    </tr>`);
+}
+
+function renderThreads(rows) {
+  table($("threads"),
+    [{ label: "thread" }, { label: "last" }, { label: "turns", n: true },
+     { label: "clients" }, { label: "providers" },
+     { label: "in", n: true }, { label: "out", n: true }, { label: "cost", n: true }],
+    rows,
+    (t) => `<tr>
+      <td><a href="#" data-thread="${esc(t.fingerprint)}">${esc(t.fingerprint)}</a></td>
+      <td class="dim">${esc(ago(t.last_at))} ago</td>
+      <td class="n">${num(t.calls)}</td>
+      <td>${esc(t.clients)}</td>
+      <td>${esc(t.providers)}</td>
+      <td class="n">${num(t.input_tokens)}</td>
+      <td class="n">${num(t.output_tokens)}</td>
+      <td class="n">${esc(money(t.cost))}</td>
+    </tr>`);
+
+  $("threads").querySelectorAll("a[data-thread]").forEach((a) =>
+    a.onclick = (e) => { e.preventDefault(); loadCalls(a.dataset.thread); });
+}
+
+function renderCalls(rows, filtered) {
+  table($("calls"),
+    [{ label: "when" }, { label: "client" }, { label: "agent" }, { label: "asked" },
+     { label: "sent" }, { label: "trust" }, { label: "status" }, { label: "ms", n: true },
+     { label: "in", n: true }, { label: "out", n: true }, { label: "cache", n: true },
+     { label: "down", n: true }, { label: "cost", n: true }],
+    rows,
+    (c) => {
+      // No status means the row was opened and never closed: the stream is
+      // still running, or it died with the process.
+      const inflight = c.status === null || c.status === undefined;
+      const cls = inflight ? "dim" : c.status >= 400 ? "bad" : "ok";
+      return `<tr class="${inflight ? "muted-row" : ""}" title="${esc(c.error || "")}">
+        <td class="dim">${esc(ago(c.at))} ago</td>
+        <td>${esc(c.client)}</td>
+        <td class="dim">${esc(c.agent_fingerprint || "")}</td>
+        <td>${esc(c.model_requested)}</td>
+        <td>${esc(c.model_sent)}${c.streamed ? ' <span class="dim">stream</span>' : ""}</td>
+        <td>${trust(c.trust)}</td>
+        <td class="${cls}">${inflight ? "in flight" : c.status}</td>
+        <td class="n">${num(c.duration_ms)}</td>
+        <td class="n">${num(c.input_tokens)}</td>
+        <td class="n">${num(c.output_tokens)}</td>
+        <td class="n">${num(c.cache_read_tokens)}</td>
+        <td class="n">${esc(bytes(c.bytes_down))}</td>
+        <td class="n">${esc(money(c.cost))}</td>
+      </tr>`;
+    });
+
+  const h = document.querySelector('h2[data-calls]') || $("calls").closest("section").querySelector("h2");
+  h.setAttribute("data-calls", "1");
+  h.innerHTML = filtered
+    ? `calls &mdash; thread ${esc(filtered)} <button id="unfilter">show all</button>`
+    : "calls";
+  const un = $("unfilter");
+  if (un) un.onclick = () => loadCalls(null);
+}
+
+function renderVault(rows) {
+  table($("vault"),
+    [{ label: "reference" }, { label: "placeholder" }, { label: "fingerprint" },
+     { label: "bytes", n: true }, { label: "updated" }],
+    rows,
+    (v) => `<tr>
+      <td>${esc(v.namespace)}.${esc(v.key)}</td>
+      <td class="dim">${esc(v.placeholder)}</td>
+      <td class="dim">${esc(v.fingerprint)}</td>
+      <td class="n">${num(v.bytes)}</td>
+      <td class="dim">${esc(ago(v.updated_at))} ago</td>
+    </tr>`);
+}
+
+// ------------------------------------------------------------------ driver --
+
+let threadFilter = null;
+
+async function loadCalls(thread) {
+  threadFilter = thread;
+  const q = thread ? "?thread=" + encodeURIComponent(thread) : "";
+  renderCalls(await api("/calls" + q), thread);
+}
+
+async function refresh() {
+  const hours = $("hours").value;
+  try {
+    const [sum, cfg, alerts, threads, vault] = await Promise.all([
+      api("/summary?hours=" + hours),
+      api("/config"),
+      api("/alerts?limit=50"),
+      api("/threads?hours=" + hours + "&limit=30"),
+      api("/vault"),
+    ]);
+    CURRENCY = sum.currency;
+    renderTotals(sum.summary.totals);
+    renderBuckets($("by-provider"), sum.summary.by_provider, "provider");
+    renderBuckets($("by-client"), sum.summary.by_client, "client");
+    renderBuckets($("by-agent"), sum.summary.by_agent, "system prompt hash");
+    renderRoutes(cfg);
+    renderAlerts(alerts);
+    renderThreads(threads);
+    renderVault(vault);
+    await loadCalls(threadFilter);
+
+    $("watching").textContent =
+      `scrubber ${cfg.scrub.enabled ? "on" : "off"}, watching ${cfg.watching} vault values, shapes: ${cfg.scrub.shapes}`;
+    $("foot").textContent =
+      "The routing table above lives in the database, not in douane.toml. A restart reverts every override to the file.";
+    $("stamp").textContent = "updated " + new Date().toLocaleTimeString();
+  } catch (e) {
+    if (String(e.message) === "unauthorised") return lock();
+    $("stamp").innerHTML = `<span class="bad">${esc(e.message)}</span>`;
+  }
+}
+
+function lock() {
+  sessionStorage.removeItem("douane-admin");
+  TOKEN = "";
+  clearInterval(timer);
+  $("gate").hidden = false;
+  $("chrome").hidden = true;
+  $("body").hidden = true;
+  $("foot").hidden = true;
+}
+
+function unlock() {
+  $("gate").hidden = true;
+  $("chrome").hidden = false;
+  $("body").hidden = false;
+  $("foot").hidden = false;
+  refresh();
+  schedule();
+}
+
+function schedule() {
+  clearInterval(timer);
+  if ($("auto").checked) timer = setInterval(refresh, 5000);
+}
+
+$("gate-form").onsubmit = async (e) => {
+  e.preventDefault();
+  TOKEN = $("token").value;
+  try {
+    await api("/config");
+    sessionStorage.setItem("douane-admin", TOKEN);
+    $("err").textContent = "";
+    unlock();
+  } catch (err) {
+    $("err").textContent = err.message;
+  }
+};
+
+$("refresh").onclick = refresh;
+$("hours").onchange = refresh;
+$("auto").onchange = schedule;
+
+if (TOKEN) {
+  api("/config").then(unlock).catch(lock);
+}
+</script>
+</body>
+</html>
