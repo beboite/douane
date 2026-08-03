@@ -1,11 +1,11 @@
 //! Where a provider is allowed to actually be.
 //!
 //! A provider is named by hostname, and a hostname is a promise the DNS makes
-//! and can stop keeping. On this network it stops keeping it in the worst
-//! possible way: the resolver carries a search domain, the local DNS answers a
-//! wildcard under it, and so **a name that fails to resolve comes back as a LAN
-//! address** rather than as an error. `nimportequoi.github.com` answers
-//! `10.0.0.20`, which is a reverse proxy.
+//! and can stop keeping. A resolver carrying a search domain over a wildcard
+//! stops keeping it in the worst possible way: **a name that fails to resolve
+//! comes back as a LAN address** rather than as an error. Anything at all under
+//! such a resolver answers with whatever sits behind the wildcard, typically a
+//! reverse proxy. The addresses below are the example range, not a real one.
 //!
 //! Put a reseller's domain into that and the consequence is not a broken
 //! request, it is a credential leak: douane would open a connection to the
