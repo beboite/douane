@@ -328,17 +328,41 @@ pub async fn messages(
     // 3. Try the chain in order. A route the client is not allowed to use is
     //    skipped rather than refused outright, so a fallback still works for a
     //    client whose primary happens to be off limits.
+    //
+    //    Why a route was skipped is carried rather than dropped. A skip that a
+    //    fallback then covers is a routing decision and worth nothing, but a
+    //    request where *every* route was skipped ends in a 403 the client
+    //    cannot act on and that used to leave no trace anywhere: no `calls`
+    //    row, since nothing was forwarded, and no alert, since the scrubber
+    //    never ran. The broker refusing to spend money is exactly the kind of
+    //    thing an audit log exists for.
+    let mut skipped: Vec<(&str, &'static str, String)> = Vec::new();
     let mut last: Option<Response> = None;
     for route_name in chain {
         let route = &config.routes[route_name];
         let provider = &config.providers[&route.provider];
 
         if !client.routes.is_empty() && !client.routes.iter().any(|r| r == route_name) {
+            skipped.push((
+                route_name,
+                "route",
+                format!("`{client_name}` is not allowed on this route"),
+            ));
             continue;
         }
         if let Some(cap) = client.max_trust
             && provider.trust > cap
         {
+            skipped.push((
+                route_name,
+                "trust",
+                format!(
+                    "`{}` is trusted `{}`, above `{client_name}`'s cap of `{}`",
+                    route.provider,
+                    trust_label(provider.trust),
+                    trust_label(cap)
+                ),
+            ));
             continue;
         }
 
@@ -446,10 +470,39 @@ pub async fn messages(
     }
 
     last.unwrap_or_else(|| {
+        // Nothing was forwarded and nothing failed upstream, so every route in
+        // the chain was skipped. One alert per skipped route, because "which
+        // cap stopped this" is the whole of the answer and a single line saying
+        // "refused" would send the reader back to the config to guess.
+        for (route, kind, _) in &skipped {
+            let _ = state.audit.alert(&NewAlert {
+                call_id: None,
+                client: client_name,
+                provider: &config.routes[*route].provider,
+                trust: trust_label(config.providers[&config.routes[*route].provider].trust),
+                kind,
+                label: route,
+                action: "block",
+            });
+            tracing::warn!(
+                client = client_name,
+                route = route,
+                reason = kind,
+                "refused to route, nothing was sent"
+            );
+        }
+        let why = skipped
+            .iter()
+            .map(|(route, _, why)| format!("`{route}`: {why}"))
+            .collect::<Vec<_>>()
+            .join("; ");
         json_error(
             StatusCode::FORBIDDEN,
             "permission_error",
-            "no route this client is allowed to use can serve that model",
+            &format!(
+                "no route this client is allowed to use can serve `{}`. {why}",
+                peeked.model
+            ),
         )
     })
 }

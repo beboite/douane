@@ -29,7 +29,17 @@
 	let measure = $state<'calls' | 'tokens'>('calls');
 
 	const totals = $derived(summary?.totals);
-	const blocked = $derived(alerts.filter((a) => a.action === 'block').length);
+
+	/* The headline counts leaks only. A routing refusal is douane declining to
+	   spend money at a provider the client is not allowed to reach, which is
+	   worth seeing but is not a credential getting out, and folding the two into
+	   one figure would turn a config rule into an alarm. */
+	const blocked = $derived(
+		alerts.filter((a) => a.action === 'block' && (a.kind === 'vault' || a.kind === 'shape')).length
+	);
+	const refused = $derived(
+		alerts.filter((a) => a.action === 'block' && (a.kind === 'trust' || a.kind === 'route')).length
+	);
 	const series = $derived(summary?.series ?? []);
 
 	const window = $derived(
@@ -80,7 +90,9 @@
 				format={count}
 				icon={ShieldAlert}
 				tone={blocked > 0 ? 'warn' : 'quiet'}
-				hint="{count(alerts.length)} alertes au total"
+				hint={refused > 0
+					? `${count(refused)} refus de routage en plus`
+					: `${count(alerts.length)} alertes au total`}
 			/>
 		</div>
 

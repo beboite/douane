@@ -505,6 +505,100 @@ async fn a_client_capped_at_max_cannot_reach_a_reseller() {
     let res = call(&b, "vk-the-virtual-one", ask("haiku")).await;
     assert_eq!(res.status(), 403);
     assert_eq!(up.calls(), 0);
+
+    // The refusal has to be findable afterwards. Nothing was forwarded, so
+    // there is no `calls` row and there never should be one: that table exists
+    // to check a provider's invoice against what actually left. The alert log
+    // is where douane records having decided something.
+    let alerts = b.state.audit.alerts(10).unwrap();
+    assert_eq!(alerts.len(), 1, "the refusal is recorded once");
+    assert_eq!(alerts[0].kind, "trust");
+    assert_eq!(alerts[0].action, "block");
+    assert_eq!(alerts[0].label, "haiku", "the route that was refused");
+    assert!(
+        b.state.audit.recent(10, None, None).unwrap().is_empty(),
+        "and no call row, because no call was made"
+    );
+
+    // And the client is told which cap stopped it, rather than being left to
+    // guess against a config it cannot read.
+    let body = res.text().await.unwrap();
+    assert!(body.contains("cap of `max`"), "{body}");
+    assert!(body.contains("trusted `low`"), "{body}");
+}
+
+#[tokio::test]
+async fn a_route_a_client_is_not_listed_for_says_so_when_nothing_else_serves() {
+    let (url, up) = Upstream::spawn(Behaviour::Json).await;
+    let b = broker_with(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", None, vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+        |c| {
+            // Allowed on a route that does not serve what was asked for, which
+            // is the ordinary way a client ends up with an empty chain.
+            c.clients.get_mut("test").unwrap().routes = vec!["sonnet".to_owned()];
+            c.routes.insert(
+                "sonnet".to_owned(),
+                douane::config::Route {
+                    provider: "primary".to_owned(),
+                    model: None,
+                    fallback: Vec::new(),
+                    pricing: None,
+                },
+            );
+        },
+    )
+    .await;
+
+    let res = call(&b, "vk-the-virtual-one", ask("haiku")).await;
+    assert_eq!(res.status(), 403);
+    assert_eq!(up.calls(), 0);
+
+    let alerts = b.state.audit.alerts(10).unwrap();
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].kind, "route");
+    assert_eq!(alerts[0].label, "haiku");
+
+    let body = res.text().await.unwrap();
+    assert!(body.contains("not allowed on this route"), "{body}");
+}
+
+#[tokio::test]
+async fn a_skip_a_fallback_covers_is_not_worth_an_alert() {
+    // The other half of the rule. A primary the client cannot use, followed by
+    // a backup it can, is a routing decision and not a refusal: recording it
+    // would fill the alert log with events nobody needs to act on, and bury the
+    // ones they do.
+    let (blocked_url, blocked) = Upstream::spawn(Behaviour::Json).await;
+    let (ok_url, ok) = Upstream::spawn(Behaviour::Json).await;
+    let b = broker(
+        vec![
+            ("primary", &blocked_url, Trust::Low),
+            ("backup", &ok_url, Trust::Mid),
+        ],
+        vec![
+            ("haiku", "primary", None, vec!["sonnet"]),
+            ("sonnet", "backup", None, vec![]),
+        ],
+        &secrets(),
+        ScrubConfig::default(),
+        Some(Trust::Mid),
+    )
+    .await;
+
+    let res = call(&b, "vk-the-virtual-one", ask("haiku")).await;
+    assert_eq!(res.status(), 200);
+    let _ = res.bytes().await.unwrap();
+
+    assert_eq!(blocked.calls(), 0, "the reseller was above the cap");
+    assert_eq!(ok.calls(), 1, "the fallback served it");
+    assert!(
+        b.state.audit.alerts(10).unwrap().is_empty(),
+        "and nothing was refused, so nothing is reported"
+    );
 }
 
 #[tokio::test]
