@@ -17,7 +17,6 @@ use clap::Parser;
 use douane::audit::Audit;
 use douane::config::Config;
 use douane::proxy::AppState;
-use douane::scrub::Scrubber;
 use douane_vault::{FileBackend, SecretBackend};
 
 #[derive(Parser)]
@@ -121,23 +120,12 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Built before the vault is boxed away, and holding the values it must
-    // recognise for the life of the process. Nothing else in the program reads
-    // the vault in bulk.
-    let scrubber = Scrubber::build(&vault, config.scrub);
-    let admin_token = config
-        .server
-        .admin_key
-        .as_ref()
-        .and_then(|r| vault.get(r).cloned());
-
     tracing::info!(
         providers = config.providers.len(),
         routes = config.routes.len(),
         clients = config.clients.len(),
         secrets = vault.len(),
-        scrub_watching = scrubber.watching(),
-        dashboard = admin_token.is_some(),
+        dashboard = config.server.admin_key.is_some(),
         "configuration and vault agree"
     );
 
@@ -153,7 +141,6 @@ async fn main() -> Result<()> {
     let state = Arc::new(AppState::new(
         config,
         Box::new(vault),
-        scrubber,
         // No proxy is inherited from the environment: an agent that manages to
         // set `HTTPS_PROXY` in the broker's environment must not get to redirect
         // upstream traffic through something it controls.
@@ -167,8 +154,12 @@ async fn main() -> Result<()> {
             .user_agent(concat!("douane/", env!("CARGO_PKG_VERSION")))
             .build()?,
         audit,
-        admin_token,
     )?);
+
+    tracing::info!(
+        scrub_watching = state.scrubber().watching(),
+        "the outbound scrubber knows what to look for"
+    );
 
     let app = douane::router(state);
 

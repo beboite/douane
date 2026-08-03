@@ -32,11 +32,21 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health", get(proxy::health))
         .route("/admin", get(dash::page))
         .route("/admin/", get(dash::page))
+        // The compiled bundle. Every asset SvelteKit emits lives under `_app`,
+        // so one wildcard covers them and nothing else is reachable: a static
+        // file server rooted at the whole bundle would be a wider door than
+        // this page needs.
+        .route("/admin/_app/{*path}", get(dash::asset))
         .route("/admin/api/summary", get(dash::summary))
         .route("/admin/api/calls", get(dash::calls))
         .route("/admin/api/threads", get(dash::threads))
         .route("/admin/api/alerts", get(dash::alerts))
         .route("/admin/api/vault", get(dash::vault))
+        .route("/admin/api/vault/{namespace}/{key}", put(dash::put_secret))
+        .route(
+            "/admin/api/vault/{namespace}/{key}",
+            delete(dash::delete_secret),
+        )
         .route("/admin/api/config", get(dash::config))
         .route("/admin/api/routes/{name}", put(dash::set_route))
         .route("/admin/api/routes/{name}", delete(dash::clear_route))

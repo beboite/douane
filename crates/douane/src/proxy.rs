@@ -40,32 +40,35 @@ pub struct AppState {
     /// a request either sees the old table or the new one and never a half-way
     /// state.
     live: RwLock<Arc<Config>>,
-    pub vault: Box<dyn SecretBackend>,
-    pub scrubber: Scrubber,
+    /// Behind a lock because the dashboard can deposit and withdraw entries
+    /// while the broker serves. Private: the two accessors below are the only
+    /// way in, which keeps the places a value can be reached countable.
+    vault: RwLock<Box<dyn SecretBackend>>,
+    /// Rebuilt from the vault on every write, never edited in place. The
+    /// scrubber cannot recognise a value leaving unless it has been shown that
+    /// value, so a credential deposited through the dashboard would travel
+    /// unwatched until the next restart if this were built once at startup.
+    scrubber: RwLock<Arc<Scrubber>>,
     pub http: reqwest::Client,
     pub audit: Audit,
-    /// Guards the dashboard. Absent means the dashboard is not served at all.
-    pub admin_token: Option<Secret>,
 }
 
 impl AppState {
     pub fn new(
         base: Config,
         vault: Box<dyn SecretBackend>,
-        scrubber: Scrubber,
         http: reqwest::Client,
         audit: Audit,
-        admin_token: Option<Secret>,
     ) -> anyhow::Result<Self> {
         let live = RwLock::new(Arc::new(base.with_overrides(&audit.overrides()?)));
+        let scrubber = RwLock::new(Arc::new(Scrubber::build(vault.as_ref(), base.scrub)));
         Ok(Self {
             base,
             live,
-            vault,
+            vault: RwLock::new(vault),
             scrubber,
             http,
             audit,
-            admin_token,
         })
     }
 
@@ -81,6 +84,111 @@ impl AppState {
         let next = Arc::new(self.base.with_overrides(&self.audit.overrides()?));
         *self.live.write().unwrap_or_else(|e| e.into_inner()) = next;
         Ok(())
+    }
+
+    /// A snapshot of the outbound scrubber. Taken per request for the same
+    /// reason the config is: a lock held across an upstream call would stall
+    /// every writer for as long as a model takes to answer.
+    pub fn scrubber(&self) -> Arc<Scrubber> {
+        self.scrubber
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// One credential, copied out of the vault.
+    ///
+    /// A copy rather than a borrow because the guard must not be held across an
+    /// `await`, and because a borrow would have to outlive the lock to be
+    /// useful. This and [`Self::authenticate`] are the only two ways a value
+    /// leaves the vault at runtime, which is what makes them worth grepping.
+    pub fn secret(&self, r: &douane_vault::SecretRef) -> Option<Secret> {
+        self.vault
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(r)
+            .cloned()
+    }
+
+    /// Which client presented this key, if any.
+    ///
+    /// The comparison is constant time and happens under the read lock, so no
+    /// copy of a virtual key is made to answer the question.
+    pub fn authenticate<'a>(
+        &self,
+        config: &'a Config,
+        presented: &str,
+    ) -> Option<(&'a String, &'a crate::config::Client)> {
+        let vault = self.vault.read().unwrap_or_else(|e| e.into_inner());
+        config.clients.iter().find(|(_, c)| {
+            vault
+                .get(&c.key)
+                .is_some_and(|stored| stored.ct_eq(presented))
+        })
+    }
+
+    /// The vault as names. [`douane_vault::EntryInfo`] has no field a value
+    /// could be put in, so this cannot leak one however it is called.
+    pub fn vault_list(&self) -> Vec<douane_vault::EntryInfo> {
+        self.vault.read().unwrap_or_else(|e| e.into_inner()).list()
+    }
+
+    /// Store an entry, flush the file, and re-teach the scrubber.
+    ///
+    /// The three happen under one write lock so no request can observe a vault
+    /// that holds a value the scrubber has not been shown.
+    pub fn vault_put(
+        &self,
+        r: &douane_vault::SecretRef,
+        entry: douane_vault::Entry,
+    ) -> Result<(), douane_vault::VaultError> {
+        let mut vault = self.vault.write().unwrap_or_else(|e| e.into_inner());
+        vault.put(r, entry);
+        vault.persist()?;
+        *self.scrubber.write().unwrap_or_else(|e| e.into_inner()) =
+            Arc::new(Scrubber::build(vault.as_ref(), self.base.scrub));
+        Ok(())
+    }
+
+    /// Read one entry back out to rewrite it with a new note. The value never
+    /// leaves this function.
+    pub fn vault_renote(
+        &self,
+        r: &douane_vault::SecretRef,
+        note: Option<String>,
+    ) -> Result<bool, douane_vault::VaultError> {
+        let mut vault = self.vault.write().unwrap_or_else(|e| e.into_inner());
+        let Some(value) = vault.get(r).cloned() else {
+            return Ok(false);
+        };
+        let mut entry = douane_vault::Entry::new(value);
+        entry.note = note;
+        vault.put(r, entry);
+        vault.persist()?;
+        Ok(true)
+    }
+
+    pub fn vault_delete(
+        &self,
+        r: &douane_vault::SecretRef,
+    ) -> Result<bool, douane_vault::VaultError> {
+        let mut vault = self.vault.write().unwrap_or_else(|e| e.into_inner());
+        if !vault.delete(r) {
+            return Ok(false);
+        }
+        vault.persist()?;
+        *self.scrubber.write().unwrap_or_else(|e| e.into_inner()) =
+            Arc::new(Scrubber::build(vault.as_ref(), self.base.scrub));
+        Ok(true)
+    }
+
+    /// The token that guards the dashboard, read fresh from the vault.
+    ///
+    /// Fresh rather than cached at startup so that rotating it through the
+    /// dashboard takes effect on the next request. Absent means no dashboard is
+    /// served at all, rather than one served openly.
+    pub fn admin_token(&self) -> Option<Secret> {
+        self.secret(self.base.server.admin_key.as_ref()?)
     }
 }
 
@@ -191,12 +299,7 @@ pub async fn messages(
             "no virtual key presented",
         );
     };
-    let Some((client_name, client)) = config.clients.iter().find(|(_, c)| {
-        state
-            .vault
-            .get(&c.key)
-            .is_some_and(|stored| stored.ct_eq(&presented))
-    }) else {
+    let Some((client_name, client)) = state.authenticate(&config, &presented) else {
         return json_error(
             StatusCode::UNAUTHORIZED,
             "authentication_error",
@@ -240,7 +343,7 @@ pub async fn messages(
         }
 
         // 4. Look at what is about to leave, for this destination's trust level.
-        let (hits, verdict) = state.scrubber.inspect(&body, provider.trust);
+        let (hits, verdict) = state.scrubber().inspect(&body, provider.trust);
         for h in &hits {
             let _ = state.audit.alert(&NewAlert {
                 call_id: None,
@@ -393,8 +496,7 @@ async fn forward(
 
     if let Some(key_ref) = &provider.key {
         let key = state
-            .vault
-            .get(key_ref)
+            .secret(key_ref)
             .ok_or_else(|| anyhow::anyhow!("vault has no {key_ref}"))?;
         req = req.header(
             HeaderName::from_bytes(provider.auth_header.as_bytes())?,

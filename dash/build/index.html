@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="fr" class="dark">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<meta name="text-scale" content="scale" />
+		<meta name="robots" content="noindex, nofollow" />
+		<title>douane</title>
+		<link href="/admin/_app/immutable/entry/start.TSCW1pkd.js" rel="modulepreload">
+		<link href="/admin/_app/immutable/chunks/Cqu_8qFR.js" rel="modulepreload">
+		<link href="/admin/_app/immutable/chunks/4eZT0cwK.js" rel="modulepreload">
+		<link href="/admin/_app/immutable/entry/app.DbLY_16M.js" rel="modulepreload">
+		<link href="/admin/_app/immutable/chunks/xihTtKlq.js" rel="modulepreload">
+		<link href="/admin/_app/immutable/nodes/0.DhrqEuuy.js" rel="modulepreload">
+		
+		<link href="/admin/_app/immutable/assets/0.CmbCv7nn.css" rel="stylesheet">
+		<script>
+			// Before the first paint, so an unlocked dashboard never flashes the
+			// wrong theme at whoever opens it in a dark room at three in the
+			// morning. `dark` is on the element already, so this only ever
+			// removes it.
+			try {
+				const saved = localStorage.getItem('douane-theme');
+				const dark = saved ? saved === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+				document.documentElement.classList.toggle('dark', dark);
+			} catch {
+				/* storage refused: the default stands */
+			}
+		</script>
+	</head>
+	<body data-sveltekit-preload-data="hover">
+		<div style="display: contents">
+			<script>
+				{
+					__sveltekit_wiadne = {
+						base: "/admin",
+						assets: "/admin"
+					};
+
+					const element = document.currentScript.parentElement;
+
+					Promise.all([
+						import("/admin/_app/immutable/entry/start.TSCW1pkd.js"),
+						import("/admin/_app/immutable/entry/app.DbLY_16M.js")
+					]).then(([kit, app]) => {
+						kit.start(app, element);
+					});
+				}
+			</script>
+		</div>
+	</body>
+</html>

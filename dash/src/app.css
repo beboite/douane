@@ -1,0 +1,165 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+/* Self-hosted, bundled into the build. A page about credentials asks a third
+   party for nothing, fonts included: a font request tells whoever serves it the
+   time of every visit and the address it came from. */
+@import "@fontsource-variable/geist";
+@import "@fontsource-variable/geist-mono";
+
+@custom-variant dark (&:is(.dark *));
+
+/* A cool grey with a trace of blue in it, and one accent. Everything else on
+   this page is a status, so red, amber and green have to stay free to mean
+   something: an accent that borrowed one of them would make a routing button
+   look like an alarm. */
+:root {
+	--radius: 0.625rem;
+
+	--background: oklch(0.995 0.002 220);
+	--foreground: oklch(0.205 0.014 220);
+	--card: oklch(1 0 0);
+	--card-foreground: oklch(0.205 0.014 220);
+	--popover: oklch(1 0 0);
+	--popover-foreground: oklch(0.205 0.014 220);
+	--primary: oklch(0.55 0.115 218);
+	--primary-foreground: oklch(0.985 0.003 220);
+	--secondary: oklch(0.962 0.006 220);
+	--secondary-foreground: oklch(0.27 0.016 220);
+	--muted: oklch(0.962 0.006 220);
+	--muted-foreground: oklch(0.508 0.018 220);
+	--accent: oklch(0.945 0.012 218);
+	--accent-foreground: oklch(0.3 0.05 218);
+	--destructive: oklch(0.577 0.245 27.3);
+	--destructive-foreground: oklch(0.985 0.003 220);
+	--border: oklch(0.915 0.008 220);
+	--input: oklch(0.915 0.008 220);
+	--ring: oklch(0.55 0.115 218);
+
+	--chart-1: oklch(0.6 0.13 218);
+	--chart-2: oklch(0.64 0.12 165);
+	--chart-3: oklch(0.72 0.14 85);
+	--chart-4: oklch(0.58 0.17 300);
+	--chart-5: oklch(0.63 0.17 15);
+
+	/* Trust is the axis the whole project turns on, so it gets its own three
+	   colours and they never move. Green is a machine the user owns, amber a
+	   vendor with a contract, red a reseller that reads everything. */
+	--trust-max: oklch(0.58 0.13 155);
+	--trust-mid: oklch(0.66 0.15 75);
+	--trust-low: oklch(0.6 0.2 25);
+
+	--sidebar: oklch(0.985 0.003 220);
+	--sidebar-foreground: oklch(0.205 0.014 220);
+	--sidebar-primary: oklch(0.55 0.115 218);
+	--sidebar-primary-foreground: oklch(0.985 0.003 220);
+	--sidebar-accent: oklch(0.962 0.006 220);
+	--sidebar-accent-foreground: oklch(0.27 0.016 220);
+	--sidebar-border: oklch(0.915 0.008 220);
+	--sidebar-ring: oklch(0.55 0.115 218);
+}
+
+.dark {
+	--background: oklch(0.165 0.014 224);
+	--foreground: oklch(0.955 0.004 220);
+	--card: oklch(0.212 0.015 224);
+	--card-foreground: oklch(0.955 0.004 220);
+	--popover: oklch(0.235 0.016 224);
+	--popover-foreground: oklch(0.955 0.004 220);
+	--primary: oklch(0.78 0.125 205);
+	--primary-foreground: oklch(0.19 0.03 220);
+	--secondary: oklch(0.272 0.016 224);
+	--secondary-foreground: oklch(0.955 0.004 220);
+	--muted: oklch(0.272 0.016 224);
+	--muted-foreground: oklch(0.715 0.017 220);
+	--accent: oklch(0.3 0.03 214);
+	--accent-foreground: oklch(0.93 0.02 210);
+	--destructive: oklch(0.704 0.191 22.2);
+	--destructive-foreground: oklch(0.19 0.03 220);
+	--border: oklch(1 0 0 / 12%);
+	--input: oklch(1 0 0 / 15%);
+	--ring: oklch(0.78 0.125 205);
+
+	--chart-1: oklch(0.72 0.13 215);
+	--chart-2: oklch(0.72 0.12 165);
+	--chart-3: oklch(0.8 0.14 85);
+	--chart-4: oklch(0.68 0.17 300);
+	--chart-5: oklch(0.72 0.17 15);
+
+	--trust-max: oklch(0.72 0.15 155);
+	--trust-mid: oklch(0.78 0.15 78);
+	--trust-low: oklch(0.7 0.19 25);
+
+	--sidebar: oklch(0.212 0.015 224);
+	--sidebar-foreground: oklch(0.955 0.004 220);
+	--sidebar-primary: oklch(0.78 0.125 205);
+	--sidebar-primary-foreground: oklch(0.19 0.03 220);
+	--sidebar-accent: oklch(0.272 0.016 224);
+	--sidebar-accent-foreground: oklch(0.955 0.004 220);
+	--sidebar-border: oklch(1 0 0 / 12%);
+	--sidebar-ring: oklch(0.78 0.125 205);
+}
+
+@theme inline {
+	--font-sans: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+	--font-mono: "Geist Mono Variable", ui-monospace, monospace;
+
+	--radius-sm: calc(var(--radius) - 4px);
+	--radius-md: calc(var(--radius) - 2px);
+	--radius-lg: var(--radius);
+	--radius-xl: calc(var(--radius) + 4px);
+
+	--color-background: var(--background);
+	--color-foreground: var(--foreground);
+	--color-card: var(--card);
+	--color-card-foreground: var(--card-foreground);
+	--color-popover: var(--popover);
+	--color-popover-foreground: var(--popover-foreground);
+	--color-primary: var(--primary);
+	--color-primary-foreground: var(--primary-foreground);
+	--color-secondary: var(--secondary);
+	--color-secondary-foreground: var(--secondary-foreground);
+	--color-muted: var(--muted);
+	--color-muted-foreground: var(--muted-foreground);
+	--color-accent: var(--accent);
+	--color-accent-foreground: var(--accent-foreground);
+	--color-destructive: var(--destructive);
+	--color-destructive-foreground: var(--destructive-foreground);
+	--color-border: var(--border);
+	--color-input: var(--input);
+	--color-ring: var(--ring);
+
+	--color-chart-1: var(--chart-1);
+	--color-chart-2: var(--chart-2);
+	--color-chart-3: var(--chart-3);
+	--color-chart-4: var(--chart-4);
+	--color-chart-5: var(--chart-5);
+
+	--color-trust-max: var(--trust-max);
+	--color-trust-mid: var(--trust-mid);
+	--color-trust-low: var(--trust-low);
+
+	--color-sidebar: var(--sidebar);
+	--color-sidebar-foreground: var(--sidebar-foreground);
+	--color-sidebar-primary: var(--sidebar-primary);
+	--color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+	--color-sidebar-accent: var(--sidebar-accent);
+	--color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+	--color-sidebar-border: var(--sidebar-border);
+	--color-sidebar-ring: var(--sidebar-ring);
+}
+
+@layer base {
+	* {
+		@apply border-border outline-ring/50;
+	}
+	body {
+		@apply bg-background text-foreground;
+		font-feature-settings: "cv11", "ss01";
+	}
+	/* Every number in this dashboard is compared against the one above it, so
+	   digits keep the same width whatever they are. */
+	.tabular {
+		font-variant-numeric: tabular-nums;
+	}
+}

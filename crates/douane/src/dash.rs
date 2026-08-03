@@ -1,36 +1,139 @@
-//! The dashboard: what went where, and where it goes next.
+//! The dashboard: what went where, where it goes next, and what is in the safe.
 //!
-//! Two jobs. It answers "which agent spent what, talking to whom", which is the
-//! question the request log exists for, and it repoints a route while the
+//! Three jobs. It answers "which agent spent what, talking to whom", which is
+//! the question the request log exists for. It repoints a route while the
 //! broker runs, which is what makes routing by model name useful rather than
-//! merely indirect. An agent asks for `haiku` for a whole session; what answers
-//! can change between two turns without that session knowing.
+//! merely indirect: an agent asks for `haiku` for a whole session, and what
+//! answers can change between two turns without that session knowing. And it
+//! deposits a credential, so storing one no longer means an ssh session and a
+//! CLI on the machine that holds the vault.
 //!
-//! Everything is served from the binary. No build step, no npm, no second
-//! process to keep alive, and nothing fetched from a CDN at page load: a page
-//! about credentials has no business making third-party requests.
+//! **Deposits only.** Every read surface here returns [`douane_vault::EntryInfo`],
+//! which has no field a value could be put in, and there is no endpoint that
+//! hands one back. A dashboard that could show a secret would be a nicer way to
+//! steal one than the thing this project was built to stop.
 //!
-//! The token guards `/admin/api/*` and not the page itself. The page is static
-//! markup and reveals nothing; it asks for the token and sends it as a header.
-//! A token in the URL would land in the access log of everything it passed
-//! through, which is the same mistake this project exists to avoid.
+//! Everything is served from the binary: the page is a compiled single-page app
+//! embedded at build time, so there is no second process to keep alive and
+//! nothing is fetched from a CDN at page load. A page about credentials has no
+//! business making third-party requests, fonts included.
+//!
+//! The token guards `/admin/api/*` and not the page itself. The page is a
+//! static bundle and reveals nothing; it asks for the token and sends it as a
+//! header. A token in the URL would land in the access log of everything it
+//! passed through, which is the same mistake this project exists to avoid.
 
 use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::{Html, IntoResponse, Response};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use douane_vault::{Entry, Secret, SecretRef};
+use include_dir::{Dir, include_dir};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::config::RouteOverride;
 use crate::proxy::{AppState, json_error};
 
-const PAGE: &str = include_str!("dash.html");
+/// The compiled dashboard, as built by `pnpm build` in `dash/`.
+///
+/// Committed rather than built by `build.rs`: the machine that compiles this
+/// binary has a Rust toolchain and no node, and making a broker's build depend
+/// on npm resolving would be a strange thing to do to a security tool.
+static ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../dash/build");
 
-pub async fn page() -> Html<&'static str> {
-    Html(PAGE)
+const INDEX: &str = "index.html";
+
+fn mime_for(path: &str) -> &'static str {
+    match path.rsplit_once('.').map(|(_, ext)| ext) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("json") => "application/json",
+        Some("svg") => "image/svg+xml",
+        Some("woff2") => "font/woff2",
+        Some("png") => "image/png",
+        Some("ico") => "image/x-icon",
+        Some("txt") => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+/// What the page is allowed to talk to: itself, and nothing else.
+///
+/// This is the guarantee, not the bundle's contents. Auditing a minified bundle
+/// for addresses does not work, because a framework legitimately carries the
+/// XHTML namespace and links to its own documentation in warning messages, and
+/// none of those are requests. `connect-src` and `font-src` are what actually
+/// stop a dependency from fetching or exfiltrating anything, whatever strings it
+/// happens to hold.
+///
+/// `unsafe-inline` for scripts is the price of SvelteKit's bootstrap, which is
+/// inlined into the shell and whose hash changes with every build. It costs
+/// nothing against the threat being defended here: no origin but this one can be
+/// reached, so injected script has nowhere to send what it reads.
+const CSP: &str = "default-src 'none'; \
+     script-src 'self' 'unsafe-inline'; \
+     style-src 'self' 'unsafe-inline'; \
+     img-src 'self' data:; \
+     font-src 'self'; \
+     connect-src 'self'; \
+     base-uri 'none'; \
+     form-action 'none'; \
+     frame-ancestors 'none'";
+
+fn serve(path: &str) -> Response {
+    let Some(file) = ASSETS.get_file(path) else {
+        return json_error(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            "no such dashboard asset",
+        );
+    };
+    // Everything under `immutable` carries a content hash in its name, so it can
+    // be cached forever and a new build simply asks for a different name. The
+    // page itself must not be, or a deploy would leave a browser pointing at
+    // assets that no longer exist.
+    let cache = if path.contains("immutable/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
+    (
+        [
+            (header::CONTENT_TYPE, mime_for(path)),
+            (header::CACHE_CONTROL, cache),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        file.contents(),
+    )
+        .into_response()
+}
+
+pub async fn page() -> Response {
+    let mut response = serve(INDEX);
+    let h = response.headers_mut();
+    h.insert(header::CONTENT_SECURITY_POLICY, CSP.parse().unwrap());
+    // The dashboard is reached through a hostname that says what it is. Nothing
+    // downstream of a click needs to be told where the click came from.
+    h.insert(header::REFERRER_POLICY, "no-referrer".parse().unwrap());
+    response
+}
+
+pub async fn asset(Path(path): Path<String>) -> Response {
+    // `include_dir` resolves through the embedded tree and has no notion of a
+    // parent directory, so `..` finds nothing rather than escaping. Rejecting it
+    // anyway keeps the intent readable to whoever changes the backing store.
+    if path.contains("..") {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "no such dashboard asset",
+        );
+    }
+    serve(&format!("_app/{path}"))
 }
 
 /// The response to send back, or `None` when the caller may proceed.
@@ -39,7 +142,7 @@ pub async fn page() -> Html<&'static str> {
 /// keys take: a token guarding the routing table deserves no less care than one
 /// guarding a model call.
 fn denied(state: &AppState, headers: &HeaderMap) -> Option<Response> {
-    let Some(expected) = &state.admin_token else {
+    let Some(expected) = state.admin_token() else {
         return Some(json_error(
             StatusCode::NOT_FOUND,
             "not_found_error",
@@ -166,7 +269,174 @@ pub async fn vault(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Re
     if let Some(r) = denied(&state, &headers) {
         return r;
     }
-    Json(state.vault.list()).into_response()
+    Json(serde_json::json!({
+        "entries": state.vault_list(),
+        "in_use": in_use(&state),
+        "watching": state.scrubber().watching(),
+    }))
+    .into_response()
+}
+
+/// Every reference the running configuration depends on.
+///
+/// Deleting one of these would break the broker on its next request, and
+/// replacing one is a deliberate act rather than a slip, so the dashboard marks
+/// them and the delete handler refuses them outright.
+fn in_use(state: &AppState) -> Vec<String> {
+    let live = state.config();
+    let mut refs: Vec<String> = live
+        .providers
+        .values()
+        .filter_map(|p| p.key.as_ref())
+        .chain(live.clients.values().map(|c| &c.key))
+        .chain(state.base.server.admin_key.iter())
+        .map(|r| r.to_string())
+        .collect();
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+/// What the dashboard may send about a secret.
+///
+/// `value` absent means "leave the value alone and edit the note", which is the
+/// only way to annotate an entry without the browser having to hold a
+/// credential it does not need.
+#[derive(Debug, Deserialize)]
+pub struct Deposit {
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// A credential is a line of text. Anything larger is a mistake on the way in,
+/// and storing it would only make the vault file and every scrubber pass bigger.
+const MAX_SECRET_BYTES: usize = 8 * 1024;
+
+fn vault_error(e: douane_vault::VaultError) -> Response {
+    tracing::error!("vault write failed: {e}");
+    json_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "api_error",
+        "the vault could not be written",
+    )
+}
+
+/// Store or replace a credential, or rewrite its note.
+///
+/// The value arrives in the body and never in the path: a URL is written to
+/// every access log between the browser and here, which is the one place a
+/// secret must never be.
+pub async fn put_secret(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((namespace, key)): Path<(String, String)>,
+    Json(d): Json<Deposit>,
+) -> Response {
+    if let Some(r) = denied(&state, &headers) {
+        return r;
+    }
+    // A namespace holding a dot could never be read back: `SecretRef::parse`
+    // splits on the first one, so `a.b.c` would resolve to namespace `a`.
+    if namespace.is_empty() || key.is_empty() || namespace.contains('.') {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "a reference is `namespace.key`, and the namespace may not contain a dot",
+        );
+    }
+    let r = SecretRef::new(&namespace, &key);
+
+    let Some(value) = d.value else {
+        // Note only. An entry that does not exist yet has no note to change.
+        return match state.vault_renote(&r, d.note) {
+            Ok(true) => stored(&state, &r),
+            Ok(false) => json_error(
+                StatusCode::NOT_FOUND,
+                "not_found_error",
+                &format!("no secret at `{r}` to annotate"),
+            ),
+            Err(e) => vault_error(e),
+        };
+    };
+
+    if value.is_empty() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "an empty value is a deletion, not a deposit",
+        );
+    }
+    if value.len() > MAX_SECRET_BYTES {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "that is too large to be a credential",
+        );
+    }
+
+    let mut entry = Entry::new(Secret::new(value));
+    entry.note = d.note;
+    match state.vault_put(&r, entry) {
+        // The reference alone, never the value, and never the fingerprint of
+        // what was just sent: the log of a broker is not a place to leave a
+        // trail back to a credential.
+        Ok(()) => {
+            tracing::info!(secret = %r, "a credential was deposited through the dashboard");
+            stored(&state, &r)
+        }
+        Err(e) => vault_error(e),
+    }
+}
+
+pub async fn delete_secret(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((namespace, key)): Path<(String, String)>,
+) -> Response {
+    if let Some(r) = denied(&state, &headers) {
+        return r;
+    }
+    let r = SecretRef::new(&namespace, &key);
+    if in_use(&state).contains(&r.to_string()) {
+        return json_error(
+            StatusCode::CONFLICT,
+            "invalid_request_error",
+            &format!("`{r}` is what the running configuration authenticates with"),
+        );
+    }
+    match state.vault_delete(&r) {
+        Ok(true) => {
+            tracing::info!(secret = %r, "a credential was removed through the dashboard");
+            Json(serde_json::json!({
+                "deleted": r.to_string(),
+                "watching": state.scrubber().watching(),
+            }))
+            .into_response()
+        }
+        Ok(false) => json_error(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            &format!("no secret at `{r}`"),
+        ),
+        Err(e) => vault_error(e),
+    }
+}
+
+/// What a write answers with: the entry as a listing sees it, plus how many
+/// values the scrubber now holds, so the page can say the deposit is being
+/// watched rather than merely stored.
+fn stored(state: &AppState, r: &SecretRef) -> Response {
+    let info = state
+        .vault_list()
+        .into_iter()
+        .find(|e| e.namespace == r.namespace && e.key == r.key);
+    Json(serde_json::json!({
+        "entry": info,
+        "watching": state.scrubber().watching(),
+    }))
+    .into_response()
 }
 
 #[derive(Debug, Serialize)]
@@ -280,7 +550,11 @@ pub async fn config(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
         "clients": clients,
         "currency": state.base.server.currency,
         "scrub": state.base.scrub,
-        "watching": state.scrubber.watching(),
+        "watching": state.scrubber().watching(),
+        "egress": {
+            "listening": state.base.egress.listen.is_some(),
+            "rules": state.base.egress.rules.len(),
+        },
     }))
     .into_response()
 }
@@ -398,26 +672,88 @@ mod tests {
     }
 
     #[test]
-    fn hidden_actually_hides() {
-        // Four elements are shown and hidden with the `hidden` attribute, and
-        // two of them carry an author `display` rule that beats the user agent
-        // sheet. Without this one line the token prompt stays painted over the
-        // unlocked dashboard: the DOM says hidden, the screen says otherwise.
+    fn the_compiled_dashboard_is_actually_embedded() {
+        // A `dash/build` that was never built embeds as an empty directory and
+        // the binary then serves a 404 where the dashboard should be, which
+        // looks at deploy time exactly like a routing mistake.
         assert!(
-            PAGE.contains("[hidden] { display: none !important; }"),
-            "the page must force `hidden` to win over its own display rules"
+            ASSETS.get_file(INDEX).is_some(),
+            "no {INDEX} in the embedded bundle: run `pnpm build` in dash/"
+        );
+        assert!(
+            ASSETS.get_dir("_app/immutable").is_some(),
+            "the embedded bundle carries no hashed assets"
         );
     }
 
     #[test]
-    fn the_page_carries_no_third_party_reference() {
-        // A page about credentials that phones home to a CDN would hand a third
-        // party the timing of every visit, and a compromised CDN the contents.
+    fn the_markup_and_the_styles_fetch_nothing_off_origin() {
+        // The two files that can pull in a third party without any script
+        // running: a `<link>` or `<script src>` in the shell, and a `url()` or
+        // `@import` in the stylesheet. Fonts are the usual way this slips back
+        // in, which is why they are bundled rather than linked.
+        //
+        // The compiled JavaScript is deliberately not audited this way. A
+        // framework carries the XHTML namespace and links to its own docs inside
+        // warning strings, so a substring search there reports addresses that
+        // are never requested. What actually holds for the bundle is the policy
+        // in `CSP`, checked below.
+        let index = ASSETS.get_file(INDEX).unwrap().contents_utf8().unwrap();
+        let mut styles = 0;
+        for file in ASSETS
+            .get_dir("_app/immutable/assets")
+            .into_iter()
+            .flat_map(|d| d.files())
+            .filter(|f| f.path().extension().is_some_and(|e| e == "css"))
+        {
+            let css = file.contents_utf8().unwrap();
+            styles += 1;
+            for needle in ["url(http", "url('http", "url(\"http", "@import \"http"] {
+                assert!(
+                    !css.contains(needle),
+                    "{} fetches {needle}",
+                    file.path().display()
+                );
+            }
+        }
+        assert!(
+            styles > 0,
+            "no stylesheet was checked, so nothing was proved"
+        );
+
         for needle in ["http://", "https://", "//cdn", "integrity="] {
             assert!(
-                !PAGE.contains(needle),
-                "the dashboard page must not reference {needle}"
+                !index.contains(needle),
+                "the page shell references {needle}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn the_page_forbids_reaching_any_other_origin() {
+        // The bundle is allowed to hold whatever strings its dependencies ship
+        // with, because this is what decides whether a request can leave.
+        let response = page().await;
+        let csp = response
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .expect("the dashboard shell must carry a content security policy")
+            .to_str()
+            .unwrap();
+        for directive in [
+            "default-src 'none'",
+            "connect-src 'self'",
+            "font-src 'self'",
+            "frame-ancestors 'none'",
+        ] {
+            assert!(csp.contains(directive), "the policy is missing {directive}");
+        }
+    }
+
+    #[test]
+    fn assets_are_typed() {
+        assert_eq!(mime_for("app.js"), "text/javascript; charset=utf-8");
+        assert_eq!(mime_for("geist.woff2"), "font/woff2");
+        assert_eq!(mime_for("no-extension"), "application/octet-stream");
     }
 }

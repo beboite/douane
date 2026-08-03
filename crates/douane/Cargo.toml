@@ -40,6 +40,7 @@ sha2.workspace = true
 hex.workspace = true
 rand.workspace = true
 regex.workspace = true
+include_dir.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

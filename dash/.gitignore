@@ -1,0 +1,28 @@
+node_modules
+
+# Output
+.output
+.vercel
+.netlify
+.wrangler
+/.svelte-kit
+
+# `/build` is deliberately absent from this list. The broker embeds it with
+# `include_dir!` at compile time, and the machine that compiles the broker has a
+# Rust toolchain and no node. Ignoring the output would make every release build
+# serve a 404 where the dashboard should be. Run `pnpm build` and commit what it
+# writes whenever anything under `src/` changes.
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.*
+!.env.example
+!.env.test
+
+# Vite
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*

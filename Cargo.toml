@@ -37,6 +37,10 @@ sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
 regex = "1"
+# The compiled dashboard, embedded in the binary. The build machine has a Rust
+# toolchain and no node, so `dash/build` is committed and this reads it at
+# compile time rather than a `build.rs` shelling out to npm.
+include_dir = "0.7"
 # The egress broker's own certificate authority. Nothing here talks TLS yet:
 # this mints the certificates that the intercepting proxy will present.
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }

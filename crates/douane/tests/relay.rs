@@ -16,21 +16,20 @@ use axum::response::{IntoResponse, Response};
 use douane::audit::Audit;
 use douane::config::{Config, Provider, Route, ScrubConfig, Trust};
 use douane::proxy::AppState;
-use douane::scrub::Scrubber;
 use douane_vault::{Entry, EntryInfo, Secret, SecretBackend, SecretRef, VaultError};
 
 // ------------------------------------------------------------ a fake vault --
 
 /// Real vaults cost 64 MiB of Argon2 per open, which is right for a passphrase
 /// and wrong for a test that opens one per case.
-struct TestVault(BTreeMap<String, Secret>);
+struct TestVault(BTreeMap<String, Entry>);
 
 impl TestVault {
     fn new(pairs: &[(&str, &str)]) -> Self {
         Self(
             pairs
                 .iter()
-                .map(|(k, v)| ((*k).to_owned(), Secret::new(*v)))
+                .map(|(k, v)| ((*k).to_owned(), Entry::new(Secret::new(*v))))
                 .collect(),
         )
     }
@@ -38,26 +37,49 @@ impl TestVault {
 
 impl SecretBackend for TestVault {
     fn get(&self, r: &SecretRef) -> Option<&Secret> {
-        self.0.get(&r.to_string())
+        self.0.get(&r.to_string()).map(|e| &e.value)
     }
     fn put(&mut self, r: &SecretRef, e: Entry) {
-        self.0.insert(r.to_string(), e.value);
+        self.0.insert(r.to_string(), e);
     }
     fn delete(&mut self, r: &SecretRef) -> bool {
         self.0.remove(&r.to_string()).is_some()
     }
     fn namespaces(&self) -> Vec<String> {
-        Vec::new()
+        let mut n: Vec<_> = self
+            .0
+            .keys()
+            .filter_map(|k| SecretRef::parse(k).ok())
+            .map(|r| r.namespace)
+            .collect();
+        n.dedup();
+        n
     }
+    /// Real, unlike a stub returning nothing, because what the dashboard's
+    /// listing does and does not carry is one of the things worth proving here.
     fn list(&self) -> Vec<EntryInfo> {
-        Vec::new()
+        self.0
+            .iter()
+            .filter_map(|(k, e)| {
+                let r = SecretRef::parse(k).ok()?;
+                Some(EntryInfo {
+                    placeholder: r.placeholder(),
+                    namespace: r.namespace,
+                    key: r.key,
+                    fingerprint: e.value.fingerprint(),
+                    bytes: e.value.len(),
+                    updated_at: e.updated_at,
+                    note: e.note.clone(),
+                })
+            })
+            .collect()
     }
     fn persist(&self) -> Result<(), VaultError> {
         Ok(())
     }
     fn for_each_value(&self, f: &mut dyn FnMut(&SecretRef, &Secret)) {
-        for (k, v) in &self.0 {
-            f(&SecretRef::parse(k).unwrap(), v);
+        for (k, e) in &self.0 {
+            f(&SecretRef::parse(k).unwrap(), &e.value);
         }
     }
 }
@@ -249,10 +271,6 @@ async fn broker_with(
     config.validate().unwrap();
 
     let vault = TestVault::new(vault_pairs);
-    let scrubber = Scrubber::build(&vault, config.scrub);
-    let admin = vault
-        .get(&SecretRef::parse("douane.admin").unwrap())
-        .cloned();
 
     let dir = tempfile::tempdir().unwrap();
     let audit = Audit::open(dir.path().join("log.sqlite")).unwrap();
@@ -261,10 +279,8 @@ async fn broker_with(
         AppState::new(
             config,
             Box::new(vault),
-            scrubber,
             reqwest::Client::builder().no_proxy().build().unwrap(),
             audit,
-            admin,
         )
         .unwrap(),
     );
@@ -732,6 +748,223 @@ async fn the_dashboard_is_shut_without_its_token_and_repoints_a_route_with_it() 
     call(&b, "vk-the-virtual-one", ask("haiku")).await;
     assert_eq!(a_up.calls(), 2);
     assert_eq!(a_up.last().body["model"], "cheap");
+}
+
+/// The point of letting the dashboard write to the vault, and the thing that
+/// would make it a bad idea if it did not hold.
+///
+/// A scrubber built once at startup cannot recognise a value deposited after
+/// it, so the credential would travel to a reseller unwatched until the next
+/// restart: the deposit would create exactly the leak the deposit was meant to
+/// prevent. This proves the same body is let through before and refused after.
+#[tokio::test]
+async fn a_credential_deposited_through_the_dashboard_is_watched_on_the_way_out() {
+    let (url, up) = Upstream::spawn(Behaviour::Json).await;
+    let b = broker(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", None, vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+    )
+    .await;
+
+    let leaked = "hunter2-the-brand-new-one";
+    let mut body = ask("haiku");
+    body["messages"][0]["content"] = format!("the token is {leaked}").into();
+
+    // Nothing knows this string yet, so it goes out like any other text.
+    assert_eq!(
+        call(&b, "vk-the-virtual-one", body.clone()).await.status(),
+        200
+    );
+    assert_eq!(up.calls(), 1);
+
+    let res = reqwest::Client::new()
+        .put(format!("{}/admin/api/vault/scraper/token", b.url))
+        .header("x-douane-admin", "admin-token-for-the-dashboard")
+        .json(&serde_json::json!({"value": leaked, "note": "deposited by hand"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let stored: serde_json::Value = res.json().await.unwrap();
+    // The answer describes the entry and does not repeat what was just sent.
+    assert_eq!(stored["entry"]["placeholder"], "__DOUANE_SCRAPER_TOKEN__");
+    assert!(!stored.to_string().contains(leaked));
+
+    // Same body, same reseller, and now it does not leave at all.
+    let res = call(&b, "vk-the-virtual-one", body).await;
+    assert_eq!(res.status(), 403);
+    assert_eq!(up.calls(), 1, "the deposited value must not have been sent");
+
+    let text = res.text().await.unwrap();
+    assert!(text.contains("scraper.token"), "{text}");
+    assert!(!text.contains(leaked), "{text}");
+}
+
+#[tokio::test]
+async fn no_vault_surface_hands_a_value_back() {
+    let (url, _up) = Upstream::spawn(Behaviour::Json).await;
+    let b = broker(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", None, vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+    )
+    .await;
+
+    let http = reqwest::Client::new();
+    let admin = |path: &str| format!("{}/admin/api{path}", b.url);
+    let with_token = |req: reqwest::RequestBuilder| {
+        req.header("x-douane-admin", "admin-token-for-the-dashboard")
+    };
+
+    let listing: serde_json::Value = with_token(http.get(admin("/vault")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // Every value the vault holds, and none of them anywhere in the answer.
+    let text = listing.to_string();
+    for (_, value) in secrets() {
+        assert!(!text.contains(value), "the listing carried {value}");
+    }
+    assert_eq!(
+        listing["entries"].as_array().unwrap().len(),
+        secrets().len()
+    );
+
+    // The references the running configuration authenticates with are marked,
+    // because the delete handler refuses those and a button that cannot work is
+    // worse than no button.
+    let in_use: Vec<&str> = listing["in_use"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(in_use.contains(&"douane.vk_test"));
+    assert!(in_use.contains(&"douane.admin"));
+    assert!(in_use.contains(&"primary.api_key"));
+    assert!(!in_use.contains(&"proxy.password"));
+
+    // And one of them cannot be deleted from here, whatever the caller intends.
+    let res = with_token(http.delete(admin("/vault/douane/vk_test")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 409);
+    // Still authenticating, so nothing was half-deleted on the way to refusing.
+    assert_eq!(
+        call(&b, "vk-the-virtual-one", ask("haiku")).await.status(),
+        200
+    );
+}
+
+#[tokio::test]
+async fn a_deposit_is_refused_when_it_could_never_be_read_back() {
+    let (url, _up) = Upstream::spawn(Behaviour::Json).await;
+    let b = broker(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", None, vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+    )
+    .await;
+
+    let http = reqwest::Client::new();
+    let put = |path: &str, body: serde_json::Value| {
+        http.put(format!("{}/admin/api/vault/{path}", b.url))
+            .header("x-douane-admin", "admin-token-for-the-dashboard")
+            .json(&body)
+    };
+
+    // A namespace with a dot in it resolves to a different reference than the
+    // one that was typed, so the entry would be invisible to the config.
+    assert_eq!(
+        put("has.a.dot/key", serde_json::json!({"value": "x"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    // An empty value is a deletion written as a deposit.
+    assert_eq!(
+        put("ns/key", serde_json::json!({"value": ""}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    // A note on nothing: there is no entry to annotate, and inventing an empty
+    // one would put a reference in the listing that authenticates nothing.
+    assert_eq!(
+        put("ns/key", serde_json::json!({"note": "about what"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    // Nothing above stored anything.
+    assert_eq!(b.state.vault_list().len(), secrets().len());
+}
+
+/// The token is read from the vault on every request rather than cached at
+/// startup, so replacing it through the dashboard takes effect immediately. A
+/// cached one would leave the old token working until a restart nobody would
+/// think to do.
+#[tokio::test]
+async fn rotating_the_admin_token_takes_effect_at_once() {
+    let (url, _up) = Upstream::spawn(Behaviour::Json).await;
+    let b = broker(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", None, vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+    )
+    .await;
+
+    let http = reqwest::Client::new();
+    let config = || format!("{}/admin/api/config", b.url);
+
+    let res = http
+        .put(format!("{}/admin/api/vault/douane/admin", b.url))
+        .header("x-douane-admin", "admin-token-for-the-dashboard")
+        .json(&serde_json::json!({"value": "the-new-admin-token"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    assert_eq!(
+        http.get(config())
+            .header("x-douane-admin", "admin-token-for-the-dashboard")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401,
+        "the token that was just replaced must stop working"
+    );
+    assert_eq!(
+        http.get(config())
+            .header("x-douane-admin", "the-new-admin-token")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
 }
 
 #[tokio::test]

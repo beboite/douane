@@ -1,0 +1,79 @@
+import type { Money } from './api';
+
+/** Sub-cent amounts get more digits, because most single calls cost less than a
+ *  cent and rounding them all to `0.00` would make the column useless. */
+export function amount(v: number | null | undefined, currency?: string | null): string {
+	if (v === null || v === undefined) return '';
+	const digits = Math.abs(v) > 0 && Math.abs(v) < 0.01 ? 5 : 2;
+	return v.toFixed(digits) + (currency ? ` ${currency}` : '');
+}
+
+/** Two currencies stay two numbers. Douane never converts, so a total spent
+ *  partly in yuan and partly in dollars reads as both and never as one. */
+export function money(m: Money | null | undefined): string {
+	if (!m) return '';
+	return Object.entries(m)
+		.map(([currency, v]) => amount(v, currency))
+		.join(' + ');
+}
+
+const compact = new Intl.NumberFormat('fr-FR', { notation: 'compact', maximumFractionDigits: 1 });
+const plain = new Intl.NumberFormat('fr-FR');
+
+export function tokens(n: number | null | undefined): string {
+	if (n === null || n === undefined) return '';
+	return n >= 10_000 ? compact.format(n) : plain.format(n);
+}
+
+export function count(n: number | null | undefined): string {
+	return n === null || n === undefined ? '' : plain.format(n);
+}
+
+export function bytes(n: number | null | undefined): string {
+	if (n === null || n === undefined) return '';
+	if (n < 1024) return `${n} o`;
+	if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} Ko`;
+	return `${(n / 1024 / 1024).toFixed(1)} Mo`;
+}
+
+export function ms(n: number | null | undefined): string {
+	if (n === null || n === undefined) return '';
+	return n < 1000 ? `${n} ms` : `${(n / 1000).toFixed(1)} s`;
+}
+
+const time = new Intl.DateTimeFormat('fr-FR', {
+	hour: '2-digit',
+	minute: '2-digit',
+	second: '2-digit'
+});
+const dateAndTime = new Intl.DateTimeFormat('fr-FR', {
+	day: '2-digit',
+	month: '2-digit',
+	hour: '2-digit',
+	minute: '2-digit'
+});
+
+/** Today shows a clock, anything older shows a date: a log where every row says
+ *  the same date wastes the width on repeating itself. */
+export function when(iso: string): string {
+	const d = new Date(iso);
+	if (Number.isNaN(d.getTime())) return iso;
+	const sameDay = d.toDateString() === new Date().toDateString();
+	return sameDay ? time.format(d) : dateAndTime.format(d);
+}
+
+export function ago(iso: string): string {
+	const d = new Date(iso).getTime();
+	if (Number.isNaN(d)) return '';
+	const s = Math.max(0, (Date.now() - d) / 1000);
+	if (s < 60) return "à l'instant";
+	if (s < 3600) return `il y a ${Math.floor(s / 60)} min`;
+	if (s < 86400) return `il y a ${Math.floor(s / 3600)} h`;
+	return `il y a ${Math.floor(s / 86400)} j`;
+}
+
+/** A fingerprint is 64 hex characters and nobody reads more than the first few.
+ *  Shortening it in the UI keeps the full value in the DOM for copying. */
+export function short(fingerprint: string | null | undefined, n = 8): string {
+	return fingerprint ? fingerprint.slice(0, n) : '';
+}
