@@ -345,18 +345,95 @@ impl Audit {
         rows.collect()
     }
 
-    /// Totals plus the four breakdowns the dashboard shows side by side.
+    /// Totals plus the four breakdowns the dashboard shows side by side, and the
+    /// same window cut into slots so it can be drawn rather than only read.
     ///
     /// `since` is an RFC 3339 timestamp compared as a string, which works
     /// because every `at` is written in the same fixed-width UTC format.
-    pub fn summary(&self, since: &str) -> rusqlite::Result<Summary> {
+    pub fn summary(&self, since: &str, hours: i64) -> rusqlite::Result<Summary> {
         Ok(Summary {
             totals: self.totals(since)?,
             by_provider: self.grouped(since, "provider")?,
             by_client: self.grouped(since, "client")?,
             by_route: self.grouped(since, "route")?,
             by_agent: self.grouped(since, "COALESCE(agent_fingerprint, 'none')")?,
+            series: self.series(since, hours)?,
         })
+    }
+
+    /// The window cut into `SLOTS` equal slices, empty ones included.
+    ///
+    /// The empties are the point. A curve drawn from the rows alone puts two
+    /// calls an hour apart next to each other and reads as steady traffic, so a
+    /// quiet night would look identical to a busy one. Filling the gaps here
+    /// means the shape of the chart is the shape of the day.
+    ///
+    /// Slot width comes from the window, so the 24 h view and the 30 d view both
+    /// return the same number of points and the front end never has to know how
+    /// wide one is: the timestamp on each point says it.
+    fn series(&self, since: &str, hours: i64) -> rusqlite::Result<Vec<Slot>> {
+        const SLOTS: i64 = 60;
+
+        let start = OffsetDateTime::parse(since, &time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| OffsetDateTime::now_utc());
+        let origin = start.unix_timestamp();
+        // A minute is the floor: below it the slots outnumber the seconds in the
+        // window and every point but one is empty by construction.
+        let width = ((hours * 3600) / SLOTS).max(60);
+
+        let conn = self.lock();
+        // `unixepoch` parses the stored RFC 3339 directly, so the bucketing is
+        // integer division on the server and no row crosses the wire to be
+        // bucketed here.
+        let mut stmt = conn.prepare(
+            r#"SELECT CAST((unixepoch(at) - ?2) / ?3 AS INTEGER) AS slot, currency, COUNT(*),
+                      SUM(CASE WHEN status >= 400 OR error IS NOT NULL THEN 1 ELSE 0 END),
+                      COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+                      COALESCE(SUM(cost),0)
+               FROM calls WHERE at >= ?1 GROUP BY slot, currency"#,
+        )?;
+        let rows = stmt.query_map(rusqlite::params![since, origin, width], |r| {
+            Ok((
+                // Null when `unixepoch` could not read the timestamp back. One
+                // malformed row must not take the whole dashboard down with a
+                // 500, so it loses its place on the curve and nothing else.
+                r.get::<_, Option<i64>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, f64>(6)?,
+            ))
+        })?;
+
+        let mut out: Vec<Slot> = (0..SLOTS)
+            .map(|i| Slot {
+                at: (start + time::Duration::seconds(i * width))
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default(),
+                seconds: width,
+                ..Default::default()
+            })
+            .collect();
+
+        for row in rows {
+            let (slot, currency, calls, errors, input, output, cost) = row?;
+            let Some(slot) = slot else { continue };
+            // A call logged between `since` being computed and the query running
+            // lands one past the end. Clamping keeps it in the last slot rather
+            // than dropping it, which would make the newest point read as a lull.
+            let i = slot.clamp(0, SLOTS - 1) as usize;
+            let s = &mut out[i];
+            s.calls += calls;
+            s.errors += errors;
+            s.input_tokens += input;
+            s.output_tokens += output;
+            if let Some(c) = currency {
+                *s.cost.entry(c).or_default() += cost;
+            }
+        }
+        Ok(out)
     }
 
     fn totals(&self, since: &str) -> rusqlite::Result<Bucket> {
@@ -561,6 +638,23 @@ pub struct Summary {
     pub by_client: Vec<Bucket>,
     pub by_route: Vec<Bucket>,
     pub by_agent: Vec<Bucket>,
+    pub series: Vec<Slot>,
+}
+
+/// One point on the activity curve.
+///
+/// `seconds` travels with the point because the slot width depends on the
+/// window that was asked for, and a chart that has to guess it labels the axis
+/// wrong on every window but the one it was written against.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Slot {
+    pub at: String,
+    pub seconds: i64,
+    pub calls: i64,
+    pub errors: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cost: Money,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -692,7 +786,7 @@ mod tests {
         )
         .unwrap();
 
-        let s = a.summary("1970-01-01T00:00:00Z").unwrap();
+        let s = a.summary("1970-01-01T00:00:00Z", 24).unwrap();
         assert_eq!(s.totals.calls, 4);
         assert_eq!(s.totals.errors, 1);
         assert_eq!(s.totals.input_tokens, 2800);
@@ -701,6 +795,80 @@ mod tests {
         assert_eq!(s.by_provider[0].calls, 3);
         assert_eq!(s.by_agent.len(), 2);
         assert!((s.totals.cost["USD"] - 0.0168).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_curve_keeps_its_empty_slots() {
+        // Two calls an hour apart over a day. Drawn from the rows alone they
+        // would sit side by side and read as continuous traffic, which is the
+        // whole reason the empties are carried.
+        let a = Audit::in_memory().unwrap();
+        let start = OffsetDateTime::now_utc() - time::Duration::hours(24);
+        let fmt = &time::format_description::well_known::Rfc3339;
+        for offset in [2i64, 3] {
+            let id = a.begin(&a_start()).unwrap();
+            a.finish(id, &a_finish()).unwrap();
+            let at = (start + time::Duration::hours(offset)).format(fmt).unwrap();
+            a.lock()
+                .execute("UPDATE calls SET at = ?1 WHERE id = ?2", (at, id))
+                .unwrap();
+        }
+
+        let s = a.summary(&start.format(fmt).unwrap(), 24).unwrap();
+        assert_eq!(s.series.len(), 60);
+        assert_eq!(s.totals.calls, 2);
+        // 24 h over 60 slots is 24 minutes each, so two calls an hour apart land
+        // in slots of their own with quiet ones between them.
+        let busy: Vec<usize> = s
+            .series
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.calls > 0)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(busy.len(), 2, "two calls, two slots");
+        assert!(busy[1] - busy[0] > 1, "with silence between them");
+        assert_eq!(s.series.iter().map(|p| p.calls).sum::<i64>(), 2);
+        assert!(s.series.iter().all(|p| p.seconds == 24 * 60));
+    }
+
+    #[test]
+    fn a_timestamp_nothing_can_read_costs_its_own_point_and_nothing_else() {
+        // A row whose `at` cannot be parsed used to answer the whole summary
+        // with a 500, so one bad write hid every good one behind it.
+        let a = Audit::in_memory().unwrap();
+        for _ in 0..2 {
+            let id = a.begin(&a_start()).unwrap();
+            a.finish(id, &a_finish()).unwrap();
+        }
+        a.lock()
+            .execute("UPDATE calls SET at = 'pas une date' WHERE id = 1", ())
+            .unwrap();
+
+        let s = a.summary("1970-01-01T00:00:00Z", 24).unwrap();
+        assert_eq!(s.totals.calls, 2, "the totals still count it");
+        assert_eq!(
+            s.series.iter().map(|p| p.calls).sum::<i64>(),
+            1,
+            "the curve cannot place it, and drops that one alone"
+        );
+    }
+
+    #[test]
+    fn a_window_short_enough_never_slices_below_a_minute() {
+        // 60 slots over one hour would be a slot a minute, which is the floor.
+        // Anything shorter has to widen instead, or every point but one is empty
+        // by construction and the chart says nothing.
+        let a = Audit::in_memory().unwrap();
+        let id = a.begin(&a_start()).unwrap();
+        a.finish(id, &a_finish()).unwrap();
+        let since = (OffsetDateTime::now_utc() - time::Duration::hours(1))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+
+        let s = a.summary(&since, 1).unwrap();
+        assert!(s.series.iter().all(|p| p.seconds == 60));
+        assert_eq!(s.series.iter().map(|p| p.calls).sum::<i64>(), 1);
     }
 
     #[test]
@@ -724,7 +892,7 @@ mod tests {
         )
         .unwrap();
 
-        let s = a.summary("1970-01-01T00:00:00Z").unwrap();
+        let s = a.summary("1970-01-01T00:00:00Z", 24).unwrap();
         assert_eq!(s.totals.calls, 2, "both calls counted once");
         assert_eq!(s.totals.cost.len(), 2, "two units, two entries");
         assert!((s.totals.cost["USD"] - 0.0042).abs() < 1e-9);
@@ -755,7 +923,7 @@ mod tests {
         )
         .unwrap();
 
-        let s = a.summary("1970-01-01T00:00:00Z").unwrap();
+        let s = a.summary("1970-01-01T00:00:00Z", 24).unwrap();
         assert_eq!(s.totals.calls, 1);
         assert!(s.totals.cost.is_empty(), "no cost, so no currency either");
         assert_eq!(a.recent(1, None, None).unwrap()[0].currency, None);
@@ -793,7 +961,7 @@ mod tests {
         let old = &a.recent(10, None, None).unwrap()[0];
         assert_eq!(old.cost, Some(0.5));
         assert_eq!(old.currency, None, "an old row claims no unit");
-        let s = a.summary("1970-01-01T00:00:00Z").unwrap();
+        let s = a.summary("1970-01-01T00:00:00Z", 24).unwrap();
         assert_eq!(s.totals.calls, 1);
         assert!(s.totals.cost.is_empty(), "a cost with no unit is not money");
     }

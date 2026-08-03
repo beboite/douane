@@ -179,9 +179,12 @@ pub struct Window {
 }
 
 impl Window {
+    fn hours(&self) -> i64 {
+        self.hours.unwrap_or(24).clamp(1, 24 * 365)
+    }
+
     fn since(&self) -> String {
-        let hours = self.hours.unwrap_or(24).clamp(1, 24 * 365);
-        (OffsetDateTime::now_utc() - time::Duration::hours(hours))
+        (OffsetDateTime::now_utc() - time::Duration::hours(self.hours()))
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default()
     }
@@ -208,7 +211,7 @@ pub async fn summary(
     if let Some(r) = denied(&state, &headers) {
         return r;
     }
-    match state.audit.summary(&w.since()) {
+    match state.audit.summary(&w.since(), w.hours()) {
         Ok(s) => Json(serde_json::json!({
             "currency": state.base.server.currency,
             "summary": s,

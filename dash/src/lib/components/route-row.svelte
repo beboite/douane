@@ -93,7 +93,11 @@
 	</Table.Cell>
 
 	<Table.Cell>
-		<Input bind:value={model} placeholder="le nom demandé, tel quel" class="font-mono text-xs" />
+		<Input
+			bind:value={model}
+			placeholder="le nom demandé, tel quel"
+			class="max-w-[22rem] font-mono text-xs"
+		/>
 	</Table.Cell>
 
 	<Table.Cell class="tabular text-right text-xs">

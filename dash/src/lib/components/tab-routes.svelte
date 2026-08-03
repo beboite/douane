@@ -1,5 +1,7 @@
 <script lang="ts">
 	import * as Table from '$lib/components/ui/table';
+	import Signpost from '@lucide/svelte/icons/signpost';
+	import Empty from './empty.svelte';
 	import Panel from './panel.svelte';
 	import RouteRow from './route-row.svelte';
 	import type { ConfigView } from '$lib/api';
@@ -20,6 +22,13 @@
 	note="un changement prend effet à l'appel suivant. Le TOML n'est jamais réécrit, donc un redémarrage revient au fichier"
 	flush
 >
+	{#if (config?.routes ?? []).length === 0}
+		<Empty
+			icon={Signpost}
+			title="aucune route configurée"
+			hint="une route donne un nom de modèle à un agent et décide chez qui l’appel part réellement"
+		/>
+	{:else}
 	<Table.Root>
 		<Table.Header>
 			<Table.Row>
@@ -33,13 +42,8 @@
 		<Table.Body>
 			{#each config?.routes ?? [] as route (key(route.name, stamp))}
 				<RouteRow {route} providers={config?.providers ?? []} {reload} />
-			{:else}
-				<Table.Row>
-					<Table.Cell colspan={5} class="text-muted-foreground py-8 text-center">
-						aucune route configurée
-					</Table.Cell>
-				</Table.Row>
 			{/each}
 		</Table.Body>
 	</Table.Root>
+	{/if}
 </Panel>

@@ -14,27 +14,35 @@
    something: an accent that borrowed one of them would make a routing button
    look like an alarm. */
 :root {
-	--radius: 0.625rem;
+	--radius: 0.75rem;
 
-	--background: oklch(0.995 0.002 220);
-	--foreground: oklch(0.205 0.014 220);
+	/* A page, not a document: the background sits a step below the cards so the
+	   cards read as objects on it rather than as boxes drawn on paper. */
+	--background: oklch(0.975 0.004 220);
+	--foreground: oklch(0.19 0.015 220);
 	--card: oklch(1 0 0);
-	--card-foreground: oklch(0.205 0.014 220);
+	--card-foreground: oklch(0.19 0.015 220);
 	--popover: oklch(1 0 0);
-	--popover-foreground: oklch(0.205 0.014 220);
-	--primary: oklch(0.55 0.115 218);
-	--primary-foreground: oklch(0.985 0.003 220);
-	--secondary: oklch(0.962 0.006 220);
+	--popover-foreground: oklch(0.19 0.015 220);
+	--primary: oklch(0.53 0.125 218);
+	--primary-foreground: oklch(0.99 0.003 220);
+	--secondary: oklch(0.955 0.007 220);
 	--secondary-foreground: oklch(0.27 0.016 220);
-	--muted: oklch(0.962 0.006 220);
-	--muted-foreground: oklch(0.508 0.018 220);
-	--accent: oklch(0.945 0.012 218);
-	--accent-foreground: oklch(0.3 0.05 218);
+	--muted: oklch(0.955 0.007 220);
+	--muted-foreground: oklch(0.495 0.019 220);
+	--accent: oklch(0.94 0.014 218);
+	--accent-foreground: oklch(0.28 0.055 218);
 	--destructive: oklch(0.577 0.245 27.3);
-	--destructive-foreground: oklch(0.985 0.003 220);
-	--border: oklch(0.915 0.008 220);
-	--input: oklch(0.915 0.008 220);
-	--ring: oklch(0.55 0.115 218);
+	--destructive-foreground: oklch(0.99 0.003 220);
+	--border: oklch(0.9 0.009 220);
+	--input: oklch(0.9 0.009 220);
+	--ring: oklch(0.53 0.125 218);
+
+	/* One step below the card, for a row nested inside one. */
+	--sunken: oklch(0.968 0.005 220);
+	--elevation: 0 1px 2px oklch(0.2 0.03 220 / 6%), 0 1px 1px oklch(0.2 0.03 220 / 4%);
+	--elevation-lifted: 0 4px 16px oklch(0.2 0.03 220 / 8%), 0 1px 2px oklch(0.2 0.03 220 / 5%);
+	--grid: oklch(0.9 0.009 220);
 
 	--chart-1: oklch(0.6 0.13 218);
 	--chart-2: oklch(0.64 0.12 165);
@@ -60,25 +68,30 @@
 }
 
 .dark {
-	--background: oklch(0.165 0.014 224);
-	--foreground: oklch(0.955 0.004 220);
-	--card: oklch(0.212 0.015 224);
-	--card-foreground: oklch(0.955 0.004 220);
-	--popover: oklch(0.235 0.016 224);
-	--popover-foreground: oklch(0.955 0.004 220);
-	--primary: oklch(0.78 0.125 205);
-	--primary-foreground: oklch(0.19 0.03 220);
-	--secondary: oklch(0.272 0.016 224);
-	--secondary-foreground: oklch(0.955 0.004 220);
-	--muted: oklch(0.272 0.016 224);
-	--muted-foreground: oklch(0.715 0.017 220);
-	--accent: oklch(0.3 0.03 214);
-	--accent-foreground: oklch(0.93 0.02 210);
+	--background: oklch(0.145 0.013 232);
+	--foreground: oklch(0.965 0.004 220);
+	--card: oklch(0.195 0.015 230);
+	--card-foreground: oklch(0.965 0.004 220);
+	--popover: oklch(0.225 0.016 230);
+	--popover-foreground: oklch(0.965 0.004 220);
+	--primary: oklch(0.8 0.13 200);
+	--primary-foreground: oklch(0.16 0.03 225);
+	--secondary: oklch(0.255 0.016 230);
+	--secondary-foreground: oklch(0.965 0.004 220);
+	--muted: oklch(0.255 0.016 230);
+	--muted-foreground: oklch(0.7 0.018 220);
+	--accent: oklch(0.29 0.03 214);
+	--accent-foreground: oklch(0.94 0.02 208);
 	--destructive: oklch(0.704 0.191 22.2);
-	--destructive-foreground: oklch(0.19 0.03 220);
-	--border: oklch(1 0 0 / 12%);
-	--input: oklch(1 0 0 / 15%);
-	--ring: oklch(0.78 0.125 205);
+	--destructive-foreground: oklch(0.16 0.03 225);
+	--border: oklch(1 0 0 / 10%);
+	--input: oklch(1 0 0 / 14%);
+	--ring: oklch(0.8 0.13 200);
+
+	--sunken: oklch(0.172 0.014 231);
+	--elevation: 0 1px 2px oklch(0 0 0 / 40%);
+	--elevation-lifted: 0 8px 28px oklch(0 0 0 / 45%), 0 1px 2px oklch(0 0 0 / 35%);
+	--grid: oklch(1 0 0 / 7%);
 
 	--chart-1: oklch(0.72 0.13 215);
 	--chart-2: oklch(0.72 0.12 165);
@@ -139,6 +152,11 @@
 	--color-trust-mid: var(--trust-mid);
 	--color-trust-low: var(--trust-low);
 
+	--color-sunken: var(--sunken);
+	--color-grid: var(--grid);
+	--shadow-panel: var(--elevation);
+	--shadow-lifted: var(--elevation-lifted);
+
 	--color-sidebar: var(--sidebar);
 	--color-sidebar-foreground: var(--sidebar-foreground);
 	--color-sidebar-primary: var(--sidebar-primary);
@@ -161,5 +179,31 @@
 	   digits keep the same width whatever they are. */
 	.tabular {
 		font-variant-numeric: tabular-nums;
+	}
+}
+
+@layer components {
+	/* The one label style in the app. Small, wide, quiet: it names the number
+	   under it and then gets out of the way. */
+	.eyebrow {
+		@apply text-muted-foreground text-[0.7rem] font-medium tracking-[0.08em] uppercase;
+	}
+
+	/* A row that reacts to being pointed at. Used everywhere a click does
+	   something, and nowhere it does not, so hover is a promise. */
+	.rowlink {
+		@apply hover:bg-accent/40 cursor-pointer transition-colors;
+	}
+}
+
+/* Someone who asked their system for less movement gets less movement. The
+   numbers still land, they just stop counting up to get there. */
+@media (prefers-reduced-motion: reduce) {
+	*,
+	*::before,
+	*::after {
+		animation-duration: 0.01ms !important;
+		animation-iteration-count: 1 !important;
+		transition-duration: 0.01ms !important;
 	}
 }

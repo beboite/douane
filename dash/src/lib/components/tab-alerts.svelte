@@ -2,6 +2,7 @@
 	import * as Table from '$lib/components/ui/table';
 	import ShieldAlert from '@lucide/svelte/icons/shield-alert';
 	import ShieldCheck from '@lucide/svelte/icons/shield-check';
+	import Empty from './empty.svelte';
 	import Panel from './panel.svelte';
 	import TrustBadge from './trust-badge.svelte';
 	import type { Alert } from '$lib/api';
@@ -28,20 +29,21 @@
 	flush
 >
 	{#if alerts.length === 0}
-		<div class="text-muted-foreground flex flex-col items-center gap-2 py-12 text-sm">
-			<ShieldCheck class="text-trust-max size-6" />
-			rien n’a essayé de sortir
-		</div>
+		<Empty
+			icon={ShieldCheck}
+			title="rien n’a essayé de sortir"
+			hint="chaque corps partant est comparé aux valeurs du coffre avant d’être envoyé, et aucun n’en portait"
+		/>
 	{:else}
 		<Table.Root>
 			<Table.Header>
 				<Table.Row>
 					<Table.Head class="w-[7rem]">quand</Table.Head>
-					<Table.Head>client</Table.Head>
-					<Table.Head>allait chez</Table.Head>
-					<Table.Head>quoi</Table.Head>
+					<Table.Head class="w-[9rem]">client</Table.Head>
+					<Table.Head class="w-[16rem]">allait chez</Table.Head>
+					<Table.Head class="w-[18rem]">quoi</Table.Head>
 					<Table.Head>nature</Table.Head>
-					<Table.Head class="text-right">verdict</Table.Head>
+					<Table.Head class="w-[10rem] text-right">verdict</Table.Head>
 				</Table.Row>
 			</Table.Header>
 			<Table.Body>

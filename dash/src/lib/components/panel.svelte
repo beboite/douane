@@ -1,4 +1,6 @@
 <script lang="ts">
+	import * as Card from '$lib/components/ui/card';
+	import { cn } from '$lib/utils';
 	import type { Snippet } from 'svelte';
 
 	let {
@@ -7,7 +9,8 @@
 		actions,
 		children,
 		flush = false,
-		cap = ''
+		cap = '',
+		class: className = ''
 	}: {
 		title: string;
 		note?: string;
@@ -18,20 +21,28 @@
 		/** A tailwind max-height for a table long enough to bury whatever comes
 		 *  after it. Scrolls inside itself rather than down the page. */
 		cap?: string;
+		class?: string;
 	} = $props();
 </script>
 
-<section class="bg-card overflow-hidden rounded-lg border">
-	<header class="flex items-center justify-between gap-4 border-b px-4 py-3">
+<Card.Root class={cn('shadow-panel gap-0 overflow-hidden py-0', className)}>
+	<Card.Header
+		class="flex flex-row items-center justify-between gap-4 space-y-0 border-b px-4 py-3 [.border-b]:pb-3"
+	>
 		<div class="min-w-0">
-			<h2 class="text-sm font-semibold">{title}</h2>
+			<Card.Title class="text-sm leading-tight font-semibold">{title}</Card.Title>
 			{#if note}
-				<p class="text-muted-foreground mt-0.5 truncate text-xs">{note}</p>
+				<Card.Description class="mt-1 text-xs leading-snug">{note}</Card.Description>
 			{/if}
 		</div>
 		{@render actions?.()}
-	</header>
-	<div class="{flush ? 'overflow-x-auto' : 'p-4'} {cap ? `${cap} overflow-y-auto` : ''}">
+	</Card.Header>
+	<Card.Content
+		class={cn(
+			flush ? 'overflow-x-auto p-0' : 'p-4',
+			cap && `${cap} overflow-y-auto`
+		)}
+	>
 		{@render children()}
-	</div>
-</section>
+	</Card.Content>
+</Card.Root>

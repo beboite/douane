@@ -1,9 +1,17 @@
 <script lang="ts">
-	import * as Table from '$lib/components/ui/table';
+	import * as Card from '$lib/components/ui/card';
+	import * as ToggleGroup from '$lib/components/ui/toggle-group';
+	import Activity from '@lucide/svelte/icons/activity';
+	import Coins from '@lucide/svelte/icons/coins';
+	import Server from '@lucide/svelte/icons/server';
+	import ShieldAlert from '@lucide/svelte/icons/shield-alert';
+	import Sigma from '@lucide/svelte/icons/sigma';
+	import ActivityChart from './activity-chart.svelte';
+	import Metric from './metric.svelte';
 	import Panel from './panel.svelte';
-	import Stat from './stat.svelte';
+	import Ranked from './ranked.svelte';
 	import TrustBadge from './trust-badge.svelte';
-	import type { Alert, Bucket, ConfigView, Summary } from '$lib/api';
+	import type { Alert, ConfigView, Summary } from '$lib/api';
 	import { count, money, tokens } from '$lib/format';
 
 	let {
@@ -18,156 +26,171 @@
 		hours: number;
 	} = $props();
 
+	let measure = $state<'calls' | 'tokens'>('calls');
+
 	const totals = $derived(summary?.totals);
 	const blocked = $derived(alerts.filter((a) => a.action === 'block').length);
+	const series = $derived(summary?.series ?? []);
 
-	/* An unpriced route is not a free one. Saying so here stops the cost figure
-	   from being read as the whole bill. */
+	const window = $derived(
+		hours <= 1 ? 'la dernière heure' : hours <= 24 ? `les ${hours} dernières heures` : `les ${Math.round(hours / 24)} derniers jours`
+	);
+
+	/* An unpriced route is not a free one. Saying so next to the figure stops the
+	   cost from being read as the whole bill. */
 	const unpriced = $derived(config?.routes.filter((r) => !r.price).length ?? 0);
 	const spentHint = $derived(
 		unpriced > 0
 			? `${unpriced} route${unpriced > 1 ? 's' : ''} sans tarif, donc non comptée${unpriced > 1 ? 's' : ''}`
 			: 'toutes les routes sont tarifées'
 	);
+
+	const errors = $derived(totals?.errors ?? 0);
 </script>
 
-<div class="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-	<Stat label="appels" value={count(totals?.calls ?? 0)} hint="sur {hours} h" />
-	<Stat
-		label="dépensé"
-		value={money(totals?.cost) || '0.00'}
-		tone="accent"
-		hint={spentHint}
-	/>
-	<Stat
-		label="tokens"
-		value={tokens((totals?.input_tokens ?? 0) + (totals?.output_tokens ?? 0))}
-		hint="{tokens(totals?.input_tokens)} entrants · {tokens(totals?.output_tokens)} sortants"
-	/>
-	<Stat
-		label="fuites bloquées"
-		value={count(blocked)}
-		tone={blocked > 0 ? 'warn' : 'plain'}
-		hint="{count(alerts.length)} alertes au total"
-	/>
-</div>
+<div class="space-y-4">
+	<Card.Root class="shadow-panel gap-0 overflow-hidden py-0">
+		<!-- The four figures and the curve they came from, in one object. Split
+		     across five cards they read as five unrelated facts. -->
+		<div class="divide-border grid divide-y sm:grid-cols-2 sm:divide-x xl:grid-cols-4">
+			<Metric
+				label="appels"
+				value={totals?.calls ?? 0}
+				format={count}
+				icon={Activity}
+				hint="sur {window}"
+			/>
+			<Metric
+				label="dépensé"
+				text={money(totals?.cost) || '0.00'}
+				icon={Coins}
+				tone="accent"
+				hint={spentHint}
+			/>
+			<Metric
+				label="tokens"
+				value={(totals?.input_tokens ?? 0) + (totals?.output_tokens ?? 0)}
+				format={tokens}
+				icon={Sigma}
+				hint="{tokens(totals?.input_tokens)} entrants · {tokens(totals?.output_tokens)} sortants"
+			/>
+			<Metric
+				label="fuites bloquées"
+				value={blocked}
+				format={count}
+				icon={ShieldAlert}
+				tone={blocked > 0 ? 'warn' : 'quiet'}
+				hint="{count(alerts.length)} alertes au total"
+			/>
+		</div>
 
-{#snippet buckets(rows: Bucket[], head: string)}
-	<Table.Root>
-		<Table.Header>
-			<Table.Row>
-				<Table.Head>{head}</Table.Head>
-				<Table.Head class="text-right">appels</Table.Head>
-				<Table.Head class="text-right">erreurs</Table.Head>
-				<Table.Head class="text-right">tokens</Table.Head>
-				<Table.Head class="text-right">coût</Table.Head>
-			</Table.Row>
-		</Table.Header>
-		<Table.Body>
-			{#each rows as row (row.key)}
-				<Table.Row>
-					<Table.Cell class="font-medium">{row.key}</Table.Cell>
-					<Table.Cell class="tabular text-right">{count(row.calls)}</Table.Cell>
-					<Table.Cell
-						class="tabular text-right {row.errors > 0 ? 'text-trust-low font-medium' : 'text-muted-foreground'}"
-					>
-						{count(row.errors)}
-					</Table.Cell>
-					<Table.Cell class="tabular text-muted-foreground text-right">
-						{tokens(row.input_tokens + row.output_tokens)}
-					</Table.Cell>
-					<Table.Cell class="tabular text-right">{money(row.cost) || '—'}</Table.Cell>
-				</Table.Row>
-			{:else}
-				<Table.Row>
-					<Table.Cell colspan={5} class="text-muted-foreground py-8 text-center">
-						rien sur cette fenêtre
-					</Table.Cell>
-				</Table.Row>
-			{/each}
-		</Table.Body>
-	</Table.Root>
-{/snippet}
+		<div class="border-t px-2 pt-4 pb-2">
+			<div class="mb-2 flex items-center justify-between gap-3 px-2">
+				<div class="min-w-0">
+					<h2 class="text-sm font-semibold">Activité</h2>
+					<p class="text-muted-foreground text-xs">
+						{#if errors > 0}
+							<span class="text-trust-low font-medium">{count(errors)} en échec</span> sur
+							{count(totals?.calls ?? 0)} appels
+						{:else}
+							ce qui est passé par le broker sur {window}
+						{/if}
+					</p>
+				</div>
+				<ToggleGroup.Root type="single" size="sm" bind:value={measure} class="shrink-0">
+					<ToggleGroup.Item value="calls" class="h-7 px-2.5 text-xs">appels</ToggleGroup.Item>
+					<ToggleGroup.Item value="tokens" class="h-7 px-2.5 text-xs">tokens</ToggleGroup.Item>
+				</ToggleGroup.Root>
+			</div>
 
-<div class="mt-4 grid gap-4 lg:grid-cols-2">
-	<Panel title="Par route" note="ce que chaque nom de modèle a coûté" flush>
-		{@render buckets(summary?.by_route ?? [], 'route')}
-	</Panel>
-	<Panel title="Par client" note="quelle clé virtuelle a dépensé quoi" flush>
-		{@render buckets(summary?.by_client ?? [], 'client')}
-	</Panel>
-</div>
+			{#if series.length}
+				<ActivityChart {series} bind:measure />
+			{/if}
 
-<div class="mt-4 grid gap-4 lg:grid-cols-2">
-	<Panel title="Fournisseurs" note="qui reçoit vraiment les conversations" flush>
-		<Table.Root>
-			<Table.Header>
-				<Table.Row>
-					<Table.Head>nom</Table.Head>
-					<Table.Head>confiance</Table.Head>
-					<Table.Head>adresse</Table.Head>
-					<Table.Head class="text-right">clé</Table.Head>
-				</Table.Row>
-			</Table.Header>
-			<Table.Body>
+			{#if (totals?.calls ?? 0) === 0}
+				<p class="text-muted-foreground -mt-24 mb-16 text-center text-xs">
+					aucun appel sur cette fenêtre
+				</p>
+			{/if}
+		</div>
+	</Card.Root>
+
+	<!-- `items-start` so a panel with one row does not stretch to match a panel
+	     with ten and leave a rectangle of nothing under it. -->
+	<div class="grid items-start gap-4 lg:grid-cols-2">
+		<Panel title="Par route" note="ce que chaque nom de modèle a coûté" flush>
+			<Ranked rows={summary?.by_route ?? []} empty="aucun agent n’a demandé de modèle" />
+		</Panel>
+		<Panel title="Par client" note="quelle clé virtuelle a dépensé quoi" flush>
+			<Ranked rows={summary?.by_client ?? []} empty="aucune clé virtuelle ne s’est présentée" />
+		</Panel>
+	</div>
+
+	<!-- `items-start` so a panel with one row does not stretch to match a panel
+	     with ten and leave a rectangle of nothing under it. -->
+	<div class="grid items-start gap-4 lg:grid-cols-2">
+		<Panel title="Fournisseurs" note="qui reçoit vraiment les conversations" flush>
+			<ul class="divide-border divide-y">
 				{#each config?.providers ?? [] as p (p.name)}
-					<Table.Row>
-						<Table.Cell class="font-medium">{p.name}</Table.Cell>
-						<Table.Cell><TrustBadge trust={p.trust} /></Table.Cell>
-						<Table.Cell class="text-muted-foreground font-mono text-xs">{p.base_url}</Table.Cell>
-						<Table.Cell class="text-right text-xs">
-							{#if p.keyed}
-								<span class="text-muted-foreground">en coffre</span>
-							{:else}
-								<span class="text-muted-foreground/60">aucune</span>
-							{/if}
-						</Table.Cell>
-					</Table.Row>
-				{/each}
-			</Table.Body>
-		</Table.Root>
-	</Panel>
-
-	<Panel title="État" note="ce que le broker fait en ce moment">
-		<dl class="grid gap-3 text-sm">
-			<div class="flex items-baseline justify-between gap-4">
-				<dt class="text-muted-foreground">valeurs surveillées en sortie</dt>
-				<dd class="tabular font-medium">{count(config?.watching ?? 0)}</dd>
-			</div>
-			<div class="flex items-baseline justify-between gap-4">
-				<dt class="text-muted-foreground">routes sans tarif</dt>
-				<dd class="tabular font-medium">
-					{count(unpriced)} / {count(config?.routes.length ?? 0)}
-				</dd>
-			</div>
-			<div class="flex items-baseline justify-between gap-4">
-				<dt class="text-muted-foreground">clients autorisés</dt>
-				<dd class="tabular font-medium">{count(config?.clients.length ?? 0)}</dd>
-			</div>
-			<div class="flex items-baseline justify-between gap-4">
-				<dt class="text-muted-foreground">proxy de sortie</dt>
-				<dd class="font-medium">
-					{#if config?.egress.listening}
-						à l'écoute · {count(config.egress.rules)} règles
-					{:else}
-						<span class="text-muted-foreground">éteint</span>
-					{/if}
-				</dd>
-			</div>
-		</dl>
-
-		{#if config?.clients.length}
-			<div class="mt-4 space-y-2 border-t pt-4">
-				{#each config.clients as c (c.name)}
-					<div class="flex items-center justify-between gap-3 text-sm">
-						<span class="font-medium">{c.name}</span>
-						<span class="flex items-center gap-2">
-							{#if c.note}<span class="text-muted-foreground truncate text-xs">{c.note}</span>{/if}
-							<TrustBadge trust={c.max_trust} />
+					<li class="flex items-center gap-3 px-4 py-2.5">
+						<Server class="text-muted-foreground/60 size-4 shrink-0" />
+						<div class="min-w-0 flex-1">
+							<div class="flex items-center gap-2">
+								<span class="truncate text-sm font-medium">{p.name}</span>
+								<TrustBadge trust={p.trust} />
+							</div>
+							<div class="text-muted-foreground truncate font-mono text-xs">{p.base_url}</div>
+						</div>
+						<span class="text-muted-foreground shrink-0 text-xs">
+							{p.keyed ? 'clé en coffre' : 'sans clé'}
 						</span>
-					</div>
+					</li>
 				{/each}
-			</div>
-		{/if}
-	</Panel>
+			</ul>
+		</Panel>
+
+		<Panel title="État" note="ce que le broker fait en ce moment">
+			<dl class="grid gap-2.5 text-sm">
+				<div class="flex items-baseline justify-between gap-4">
+					<dt class="text-muted-foreground">valeurs surveillées en sortie</dt>
+					<dd class="tabular font-medium">{count(config?.watching ?? 0)}</dd>
+				</div>
+				<div class="flex items-baseline justify-between gap-4">
+					<dt class="text-muted-foreground">routes sans tarif</dt>
+					<dd class="tabular font-medium">
+						{count(unpriced)} / {count(config?.routes.length ?? 0)}
+					</dd>
+				</div>
+				<div class="flex items-baseline justify-between gap-4">
+					<dt class="text-muted-foreground">proxy de sortie</dt>
+					<dd class="font-medium">
+						{#if config?.egress.listening}
+							à l’écoute · {count(config.egress.rules)} règles
+						{:else}
+							<span class="text-muted-foreground">éteint</span>
+						{/if}
+					</dd>
+				</div>
+			</dl>
+
+			{#if config?.clients.length}
+				<div class="mt-4 space-y-2 border-t pt-3.5">
+					<p class="eyebrow">clés virtuelles admises</p>
+					{#each config.clients as c (c.name)}
+						<div class="flex items-center justify-between gap-3 text-sm">
+							<span class="truncate font-medium">{c.name}</span>
+							<span class="flex shrink-0 items-center gap-2">
+								{#if c.note}
+									<span class="text-muted-foreground hidden max-w-[16rem] truncate text-xs sm:inline">
+										{c.note}
+									</span>
+								{/if}
+								<TrustBadge trust={c.max_trust} />
+							</span>
+						</div>
+					{/each}
+				</div>
+			{/if}
+		</Panel>
+	</div>
 </div>

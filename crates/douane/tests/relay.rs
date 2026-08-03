@@ -579,7 +579,7 @@ async fn a_route_priced_in_another_currency_is_billed_and_totalled_in_it() {
     );
     assert_eq!(calls[0].currency.as_deref(), Some("CNY"));
 
-    let s = b.state.audit.summary("1970-01-01T00:00:00Z").unwrap();
+    let s = b.state.audit.summary("1970-01-01T00:00:00Z", 24).unwrap();
     assert_eq!(s.totals.cost.keys().collect::<Vec<_>>(), ["CNY"]);
     assert!(
         !s.totals.cost.contains_key("USD"),
@@ -1017,7 +1017,7 @@ async fn attribution_survives_into_the_summary() {
 
     wait_for_finished(&b).await;
 
-    let s = b.state.audit.summary("1970-01-01T00:00:00Z").unwrap();
+    let s = b.state.audit.summary("1970-01-01T00:00:00Z", 24).unwrap();
     assert_eq!(s.totals.calls, 3);
     assert_eq!(s.totals.errors, 0);
     assert_eq!(s.totals.input_tokens, 3000);

@@ -14,12 +14,28 @@ export type Bucket = {
 	cost: Money;
 };
 
+/** One point on the activity curve. The broker fills the quiet slots itself, so
+ *  a gap in the traffic is a gap in the chart and never a straight line drawn
+ *  between two calls an hour apart. */
+export type Slot = {
+	at: string;
+	/** Slot width in seconds. It travels with the point because it depends on the
+	 *  window that was asked for, and a guess mislabels the axis. */
+	seconds: number;
+	calls: number;
+	errors: number;
+	input_tokens: number;
+	output_tokens: number;
+	cost: Money;
+};
+
 export type Summary = {
 	totals: Bucket;
 	by_provider: Bucket[];
 	by_client: Bucket[];
 	by_route: Bucket[];
 	by_agent: Bucket[];
+	series: Slot[];
 };
 
 export type Call = {

@@ -77,3 +77,30 @@ export function ago(iso: string): string {
 export function short(fingerprint: string | null | undefined, n = 8): string {
 	return fingerprint ? fingerprint.slice(0, n) : '';
 }
+
+const dayAndTime = new Intl.DateTimeFormat('fr-FR', {
+	weekday: 'short',
+	hour: '2-digit',
+	minute: '2-digit'
+});
+const dayOnly = new Intl.DateTimeFormat('fr-FR', { day: '2-digit', month: 'short' });
+const hourOnly = new Intl.DateTimeFormat('fr-FR', { hour: '2-digit', minute: '2-digit' });
+
+/** How a point on the curve names itself, decided by how wide the slot is
+ *  rather than by which window was picked. A day-wide slot labelled with a
+ *  clock reads as a precision the number does not have. */
+export function slotLabel(iso: string, seconds: number): string {
+	const d = new Date(iso);
+	if (Number.isNaN(d.getTime())) return iso;
+	if (seconds >= 86_400) return dayOnly.format(d);
+	if (seconds >= 3_600) return dayAndTime.format(d);
+	return hourOnly.format(d);
+}
+
+/** The axis, thinned. Sixty labels do not fit and a chart that draws them all
+ *  is unreadable at every width. */
+export function axisLabel(iso: string, seconds: number): string {
+	const d = new Date(iso);
+	if (Number.isNaN(d.getTime())) return '';
+	return seconds >= 86_400 ? dayOnly.format(d) : hourOnly.format(d);
+}
