@@ -14,6 +14,7 @@ pub mod mcp;
 pub mod proxy;
 pub mod scrub;
 pub mod usage;
+pub mod wire;
 
 use std::sync::Arc;
 

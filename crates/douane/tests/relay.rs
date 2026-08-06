@@ -101,6 +101,11 @@ enum Behaviour {
     /// A two-event SSE stream, the way a real streamed answer arrives.
     Sse,
     Status(u16),
+    /// An upstream that only sells the OpenAI shape, answering buffered.
+    OpenaiJson,
+    /// The same, streaming, ending with the usage-only frame that
+    /// `stream_options.include_usage` buys.
+    OpenaiSse,
 }
 
 struct Upstream {
@@ -116,6 +121,9 @@ impl Upstream {
         });
         let app = axum::Router::new()
             .route("/v1/messages", axum::routing::post(handle))
+            // The other dialect's endpoint, so a test can prove douane asked for
+            // the right path and not only that it sent the right body.
+            .route("/chat/completions", axum::routing::post(handle))
             .with_state(up.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -182,6 +190,37 @@ async fn handle(
             )
                 .into_response()
         }
+        Behaviour::OpenaiJson => axum::Json(serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "hello"},
+            }],
+            // 1040 prompt tokens of which 40 were cached, which is 1000 fresh
+            // once the shapes are lined up. The same numbers the Anthropic
+            // upstream above reports, so the two paths can be compared.
+            "usage": {
+                "prompt_tokens": 1040,
+                "completion_tokens": 250,
+                "prompt_tokens_details": {"cached_tokens": 40},
+            }
+        }))
+        .into_response(),
+        Behaviour::OpenaiSse => {
+            let events = concat!(
+                "data: {\"id\":\"chatcmpl-test\",\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1040,\"completion_tokens\":250,\"prompt_tokens_details\":{\"cached_tokens\":40}}}\n\n",
+                "data: [DONE]\n\n",
+            );
+            (
+                [("content-type", "text/event-stream")],
+                axum::body::Body::from(events),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -235,6 +274,7 @@ async fn broker_with(
                 key: Some(SecretRef::parse(&format!("{name}.api_key")).unwrap()),
                 auth_header: "x-api-key".to_owned(),
                 bearer: false,
+                wire: douane::wire::Wire::Anthropic,
                 trust,
                 timeout_secs: 10,
             },
@@ -679,6 +719,103 @@ async fn a_buffered_answer_is_counted() {
     let s = b.state.audit.summary("1970-01-01T00:00:00Z", 24).unwrap();
     assert_eq!(s.totals.input_tokens, 1000);
     assert_eq!(s.totals.cache_read_tokens, 40);
+}
+
+#[tokio::test]
+async fn an_upstream_that_only_speaks_openai_is_translated_both_ways() {
+    // The reason this exists: crof.ai's Anthropic endpoint has been 502 since
+    // 2026-08-01 while its OpenAI one answers fine. The unit tests in `wire`
+    // prove the translation; this proves `forward` actually reaches for it, on
+    // the right path, and that the ledger still fills in.
+    let (url, up) = Upstream::spawn(Behaviour::OpenaiJson).await;
+    let b = broker_with(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", None, vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+        |c| {
+            c.providers.get_mut("primary").unwrap().wire = douane::wire::Wire::Openai;
+        },
+    )
+    .await;
+
+    let mut body = ask("haiku");
+    body["system"] = serde_json::json!([{"type": "text", "text": "be brief"}]);
+    body["stop_sequences"] = serde_json::json!(["END"]);
+    let res = call(&b, "vk-the-virtual-one", body).await;
+    assert_eq!(res.status(), 200);
+    let answer: serde_json::Value = res.json().await.unwrap();
+
+    // What the upstream received is the other dialect.
+    let sent = up.last().body;
+    assert_eq!(sent["messages"][0]["role"], "system");
+    assert_eq!(sent["messages"][0]["content"], "be brief");
+    assert_eq!(sent["stop"][0], "END");
+    assert!(
+        sent.get("stop_sequences").is_none() && sent.get("system").is_none(),
+        "the Anthropic-only fields must not travel: {sent}"
+    );
+
+    // What the client receives is its own, unchanged.
+    assert_eq!(answer["type"], "message");
+    assert_eq!(answer["role"], "assistant");
+    assert_eq!(answer["content"][0]["text"], "hello");
+    assert_eq!(answer["stop_reason"], "end_turn");
+
+    // And the ledger reads the same numbers it would from an Anthropic upstream,
+    // which is the whole point of translating before the tap rather than after.
+    let calls = wait_for_finished(&b).await;
+    assert_eq!(calls[0].input_tokens, Some(1000));
+    assert_eq!(calls[0].output_tokens, Some(250));
+    assert_eq!(calls[0].cache_read_tokens, Some(40));
+}
+
+#[tokio::test]
+async fn a_translated_stream_is_counted_like_any_other() {
+    let (url, up) = Upstream::spawn(Behaviour::OpenaiSse).await;
+    let b = broker_with(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", None, vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+        |c| {
+            c.providers.get_mut("primary").unwrap().wire = douane::wire::Wire::Openai;
+        },
+    )
+    .await;
+
+    let mut body = ask("haiku");
+    body["stream"] = serde_json::json!(true);
+    let res = call(&b, "vk-the-virtual-one", body).await;
+    assert_eq!(res.status(), 200);
+    let text = res.text().await.unwrap();
+
+    // Without this the upstream streams no usage at all and the row lands with
+    // tokens unknown, which is the one thing douane exists to avoid.
+    assert_eq!(
+        up.last().body["stream_options"]["include_usage"],
+        serde_json::json!(true),
+        "a streamed request has to ask for its own counts"
+    );
+
+    // The client is handed Anthropic events, in the order one expects them.
+    for event in [
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    ] {
+        assert!(text.contains(event), "missing {event} in:\n{text}");
+    }
+
+    let calls = wait_for_finished(&b).await;
+    assert_eq!(calls[0].input_tokens, Some(1000));
+    assert_eq!(calls[0].output_tokens, Some(250));
+    assert_eq!(calls[0].cache_read_tokens, Some(40));
 }
 
 #[tokio::test]

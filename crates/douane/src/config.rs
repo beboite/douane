@@ -100,6 +100,12 @@ pub struct Provider {
     pub auth_header: String,
     #[serde(default)]
     pub bearer: bool,
+    /// Which dialect this upstream speaks. `openai` makes douane translate the
+    /// request on the way out and the answer on the way back, so an agent still
+    /// only ever writes and reads the Anthropic shape. See [`crate::wire`] for
+    /// what survives that translation and what is refused rather than guessed.
+    #[serde(default)]
+    pub wire: crate::wire::Wire,
     pub trust: Trust,
     /// Seconds before giving up on the upstream. Streaming responses are exempt
     /// once the first byte has arrived.

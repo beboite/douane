@@ -36,6 +36,7 @@ use crate::audit::{Audit, Finish, NewAlert, Start, fingerprint};
 use crate::config::{Action, Config, Provider, Trust};
 use crate::scrub::Scrubber;
 use crate::usage::{Mode, Tap};
+use crate::wire::{self, Wire};
 
 pub struct AppState {
     /// The configuration as written in the TOML. Never mutated.
@@ -543,7 +544,30 @@ async fn forward(
         serde_json::to_vec(&v)?
     };
 
-    let url = format!("{}/v1/messages", provider.base_url.trim_end_matches('/'));
+    // The one place the body stops being forwarded byte for byte. A provider
+    // that only sells the OpenAI shape gets the request rewritten here and its
+    // answer rewritten back below, so everything either side of `forward` still
+    // sees the Anthropic shape and only the Anthropic shape.
+    let outgoing = match provider.wire {
+        Wire::Anthropic => outgoing,
+        Wire::Openai => match wire::request_to_openai(&outgoing) {
+            Ok(v) => v,
+            // A 400 rather than a 500: the request is the thing that cannot be
+            // carried, and the message says which part.
+            Err(e) => {
+                return Ok((
+                    StatusCode::BAD_REQUEST,
+                    json_error(StatusCode::BAD_REQUEST, "invalid_request_error", &e.0),
+                ));
+            }
+        },
+    };
+
+    let url = format!(
+        "{}{}",
+        provider.base_url.trim_end_matches('/'),
+        provider.wire.path()
+    );
     let mut req = state.http.post(&url).body(outgoing);
 
     // A total timeout is right for a buffered answer and wrong for a streamed
@@ -593,11 +617,22 @@ async fn forward(
         out = out.header(name, value);
     }
 
+    // Translated before the tap, never after. The tap, the pricing, the audit
+    // row and the dashboard were all written against the Anthropic shape, and
+    // they stay that way because nothing downstream of this line ever sees the
+    // other one.
+    let translated = wire::translate_stream(
+        upstream.bytes_stream(),
+        provider.wire,
+        sse,
+        model_sent.to_owned(),
+    );
+
     // Streamed straight through, with a tap on the way past. Buffering would
     // break SSE, and buffering a long generation would also mean holding the
     // whole answer in memory for no reason.
     let tapped = tap_stream(
-        upstream.bytes_stream(),
+        translated,
         Ledger {
             state: state.clone(),
             call_id,
