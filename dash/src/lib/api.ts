@@ -10,7 +10,11 @@ export type Bucket = {
 	errors: number;
 	input_tokens: number;
 	output_tokens: number;
+	/** Read and written cache tokens stay two numbers. Their ratio says whether
+	 *  the upstream held the prefix between turns or primed it again, and summed
+	 *  into one "cached" figure the two cases look the same. */
 	cache_read_tokens: number;
+	cache_write_tokens: number;
 	cost: Money;
 };
 

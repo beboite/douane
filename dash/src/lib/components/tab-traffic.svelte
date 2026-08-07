@@ -113,6 +113,7 @@
 						<Table.Head>sous le nom</Table.Head>
 						<Table.Head class="text-right">entrée</Table.Head>
 						<Table.Head class="text-right">sortie</Table.Head>
+						<Table.Head class="text-right">cache écrit / lu</Table.Head>
 						<Table.Head class="text-right">durée</Table.Head>
 						<Table.Head class="text-right">coût</Table.Head>
 					</Table.Row>
@@ -140,6 +141,23 @@
 							</Table.Cell>
 							<Table.Cell class="tabular text-muted-foreground text-right text-xs">
 								{tokens(c.output_tokens)}
+							</Table.Cell>
+							<!-- The two cache counts of a single call, which is the only place
+							     a rewritten prefix is visible: a turn that writes more than it
+							     reads back paid for a context the upstream already had. -->
+							<Table.Cell class="tabular text-muted-foreground text-right text-xs">
+								{#if c.cache_write_tokens === null && c.cache_read_tokens === null}
+									—
+								{:else}
+									<span
+										class={(c.cache_write_tokens ?? 0) > (c.cache_read_tokens ?? 0)
+											? 'text-trust-low font-medium'
+											: ''}
+									>
+										{tokens(c.cache_write_tokens ?? 0)}
+									</span>
+									/ {tokens(c.cache_read_tokens ?? 0)}
+								{/if}
 							</Table.Cell>
 							<Table.Cell class="tabular text-muted-foreground text-right text-xs">
 								{ms(c.duration_ms)}

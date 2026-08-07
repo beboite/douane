@@ -1,4 +1,5 @@
 <script lang="ts">
+	import CacheBadge from './cache-badge.svelte';
 	import Empty from './empty.svelte';
 	import Inbox from '@lucide/svelte/icons/inbox';
 	import type { Bucket } from '$lib/api';
@@ -39,6 +40,11 @@
 
 					<span class="tabular text-muted-foreground hidden shrink-0 text-xs sm:inline">
 						{tokens(row.input_tokens + row.output_tokens)} tok
+					</span>
+					<!-- Next to the token count on purpose: the tokens say how much went
+					     through, this says how much of it was paid for twice. -->
+					<span class="hidden sm:inline">
+						<CacheBadge read={row.cache_read_tokens} write={row.cache_write_tokens} />
 					</span>
 					<span class="tabular shrink-0 text-sm font-medium">{count(row.calls)}</span>
 					<span

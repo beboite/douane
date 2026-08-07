@@ -458,7 +458,8 @@ impl Audit {
             r#"SELECT {by} AS k, currency, COUNT(*),
                       SUM(CASE WHEN status >= 400 OR error IS NOT NULL THEN 1 ELSE 0 END),
                       COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-                      COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cost),0)
+                      COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
+                      COALESCE(SUM(cost),0)
                FROM calls WHERE at >= ?1 GROUP BY k, currency"#
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -471,13 +472,14 @@ impl Audit {
                 r.get::<_, i64>(4)?,
                 r.get::<_, i64>(5)?,
                 r.get::<_, i64>(6)?,
-                r.get::<_, f64>(7)?,
+                r.get::<_, i64>(7)?,
+                r.get::<_, f64>(8)?,
             ))
         })?;
 
         let mut out: BTreeMap<String, Bucket> = BTreeMap::new();
         for row in rows {
-            let (key, currency, calls, errors, input, output, cache_read, cost) = row?;
+            let (key, currency, calls, errors, input, output, cache_read, cache_write, cost) = row?;
             let b = out.entry(key.clone()).or_insert_with(|| Bucket {
                 key,
                 ..Default::default()
@@ -487,6 +489,7 @@ impl Audit {
             b.input_tokens += input;
             b.output_tokens += output;
             b.cache_read_tokens += cache_read;
+            b.cache_write_tokens += cache_write;
             if let Some(c) = currency {
                 *b.cost.entry(c).or_default() += cost;
             }
@@ -620,6 +623,14 @@ pub struct Call {
 /// the window was priced.
 pub type Money = BTreeMap<String, f64>;
 
+/// One breakdown row: a provider, a client, a route or an agent.
+///
+/// The two cache counts are kept apart rather than folded into one "cached"
+/// figure. Read and write are what say whether an upstream is holding the
+/// prefix at all: a pool that keeps it reads the same tokens back turn after
+/// turn, and one that spreads a client over rotating accounts pays to write the
+/// whole context again instead. Summed together those two look identical, and
+/// the second is several times the bill of the first.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Bucket {
     pub key: String,
@@ -628,6 +639,7 @@ pub struct Bucket {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
     pub cost: Money,
 }
 
@@ -795,6 +807,38 @@ mod tests {
         assert_eq!(s.by_provider[0].calls, 3);
         assert_eq!(s.by_agent.len(), 2);
         assert!((s.totals.cost["USD"] - 0.0168).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_two_cache_counts_reach_the_breakdown_apart() {
+        // Written and read tokens are the same tokens seen twice, and their
+        // ratio is the only thing that says whether an upstream held the prefix
+        // or primed it again. A breakdown carrying one of the two cannot answer
+        // that, which is what this pins.
+        let a = Audit::in_memory().unwrap();
+        for write in [Some(40_000), Some(600), None] {
+            let id = a.begin(&a_start()).unwrap();
+            a.finish(
+                id,
+                &Finish {
+                    usage: Usage {
+                        cache_write_tokens: write,
+                        ..a_finish().usage
+                    },
+                    ..a_finish()
+                },
+            )
+            .unwrap();
+        }
+
+        let s = a.summary("1970-01-01T00:00:00Z", 24).unwrap();
+        assert_eq!(s.totals.cache_write_tokens, 40_600);
+        // A call the upstream reported no write for counts as no write, not as a
+        // missing row: three calls read 50 each.
+        assert_eq!(s.totals.cache_read_tokens, 150);
+        assert_eq!(s.by_route[0].key, "haiku");
+        assert_eq!(s.by_route[0].cache_write_tokens, 40_600);
+        assert_eq!(s.by_route[0].cache_read_tokens, 150);
     }
 
     #[test]

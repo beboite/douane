@@ -7,6 +7,7 @@
 	import ShieldAlert from '@lucide/svelte/icons/shield-alert';
 	import Sigma from '@lucide/svelte/icons/sigma';
 	import ActivityChart from './activity-chart.svelte';
+	import CacheBadge from './cache-badge.svelte';
 	import Metric from './metric.svelte';
 	import Panel from './panel.svelte';
 	import Ranked from './ranked.svelte';
@@ -166,6 +167,20 @@
 				<div class="flex items-baseline justify-between gap-4">
 					<dt class="text-muted-foreground">valeurs surveillées en sortie</dt>
 					<dd class="tabular font-medium">{count(config?.watching ?? 0)}</dd>
+				</div>
+				<div class="flex items-baseline justify-between gap-4">
+					<dt class="text-muted-foreground">cache relu par écrit</dt>
+					<dd class="font-medium">
+						{#if (totals?.cache_read_tokens ?? 0) + (totals?.cache_write_tokens ?? 0) > 0}
+							<CacheBadge
+								read={totals?.cache_read_tokens ?? 0}
+								write={totals?.cache_write_tokens ?? 0}
+								compact
+							/>
+						{:else}
+							<span class="text-muted-foreground text-xs">aucun cache signalé</span>
+						{/if}
+					</dd>
 				</div>
 				<div class="flex items-baseline justify-between gap-4">
 					<dt class="text-muted-foreground">routes sans tarif</dt>
