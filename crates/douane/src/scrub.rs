@@ -42,12 +42,21 @@ const MIN_VALUE_LEN: usize = 12;
 /// that quotes its own documentation gets its request blocked, which teaches
 /// everyone to turn the scrubber off. Matched on the key name only: the value
 /// is never inspected to decide whether it is a secret.
-const NOT_CREDENTIALS: &[&str] = &["notes", "_path", "_url", "_public_key", "username"];
+///
+/// The match is on whole `_` separated words, anywhere in the key, not on a
+/// suffix. A key names its subject before it names its machine, so
+/// `control_url_node2` is as much a URL as `node2_control_url` is, and
+/// a suffix rule watches the first one: the agent then quotes the address it
+/// was configured with and every request it makes is refused.
+const NOT_CREDENTIALS: &[&str] = &["notes", "path", "url", "public_key", "username"];
 
 fn is_documentation(r: &SecretRef) -> bool {
-    NOT_CREDENTIALS
-        .iter()
-        .any(|s| r.key == *s || r.key.ends_with(s))
+    NOT_CREDENTIALS.iter().any(|s| {
+        r.key == *s
+            || r.key.starts_with(&format!("{s}_"))
+            || r.key.ends_with(&format!("_{s}"))
+            || r.key.contains(&format!("_{s}_"))
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -267,12 +276,21 @@ mod tests {
                 Secret::new("~/.tauri/boite.key"),
             ),
             (
+                // The subject is named before the machine, so the word to
+                // recognise is in the middle of the key and not at its end.
+                SecretRef::new("scraper", "control_url_node2"),
+                Secret::new("https://control.example.invalid/hook"),
+            ),
+            (
                 SecretRef::new("boite", "tauri_signing_password"),
                 Secret::new("an-actual-secret-value"),
             ),
         ]);
         let s = Scrubber::build(&vault, ScrubConfig::default());
         assert_eq!(s.watching(), 1);
+
+        let (hits, _) = s.inspect(b"posting to https://control.example.invalid/hook", Trust::Low);
+        assert!(hits.is_empty());
 
         // Quoting one's own documentation must not get a request refused: that
         // is how a scrubber ends up switched off.
