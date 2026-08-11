@@ -42,6 +42,12 @@ pub struct Server {
     /// all, rather than served openly.
     #[serde(default)]
     pub admin_key: Option<SecretRef>,
+    /// Where to POST a one-line notification when an agent files a credential
+    /// request (an ntfy topic URL, typically). Fire and forget: a notification
+    /// that cannot be delivered never blocks or fails the request itself.
+    /// Absent means the dashboard's pending list is the only signal.
+    #[serde(default)]
+    pub notify_url: Option<String>,
 }
 
 impl Default for Server {
@@ -50,6 +56,7 @@ impl Default for Server {
             listen: default_listen(),
             database: default_db(),
             admin_key: None,
+            notify_url: None,
         }
     }
 }

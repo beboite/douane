@@ -1138,3 +1138,403 @@ async fn wait_for_finished(b: &Broker) -> Vec<douane::audit::Call> {
     }
     panic!("a call never closed its row");
 }
+
+// ------------------------------------------------------------------- MCP --
+
+/// One stateless JSON-RPC exchange, the way an MCP client would make it.
+async fn mcp(b: &Broker, key: &str, method: &str, params: serde_json::Value) -> serde_json::Value {
+    reqwest::Client::new()
+        .post(format!("{}/mcp", b.url))
+        .header("x-api-key", key)
+        .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+async fn decide(b: &Broker, id: i64, body: serde_json::Value) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{}/admin/api/grants/{id}/decide", b.url))
+        .header("x-douane-admin", "admin-token-for-the-dashboard")
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_credential_request_waits_on_the_owner_and_hands_back_a_name() {
+    let (url, _up) = Upstream::spawn(Behaviour::Json).await;
+    let b = broker(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", None, vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+    )
+    .await;
+
+    // The agent asks, and is not blocked: it gets a task handle at once.
+    let res = mcp(
+        &b,
+        "vk-the-virtual-one",
+        "tools/call",
+        serde_json::json!({"name": "credential_request", "arguments": {
+            "reference": "proxy.password",
+            "reason": "the scraping job needs the proxy login"
+        }}),
+    )
+    .await;
+    let task = &res["result"]["task"];
+    assert_eq!(task["status"], "working");
+    let task_id = task["taskId"].as_str().unwrap().to_owned();
+
+    // Polling before the owner moves answers `working`, not an error and not
+    // a block.
+    let res = mcp(
+        &b,
+        "vk-the-virtual-one",
+        "tasks/get",
+        serde_json::json!({"taskId": task_id}),
+    )
+    .await;
+    assert_eq!(res["result"]["task"]["status"], "working");
+
+    // The owner approves from the dashboard.
+    let pending = b.state.audit.grants(Some("pending"), 10).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].client, "test");
+    assert_eq!(pending[0].reference, "proxy.password");
+    let r = decide(
+        &b,
+        pending[0].id,
+        serde_json::json!({"approve": true, "note": "ok for tonight"}),
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+
+    // The next poll completes with the placeholder. The value is nowhere in
+    // the answer, because this answer lands in a model's context.
+    let res = mcp(
+        &b,
+        "vk-the-virtual-one",
+        "tasks/get",
+        serde_json::json!({"taskId": task_id}),
+    )
+    .await;
+    let raw = res.to_string();
+    assert_eq!(res["result"]["task"]["status"], "completed");
+    assert_eq!(
+        res["result"]["task"]["result"]["placeholder"],
+        "__DOUANE_PROXY_PASSWORD__"
+    );
+    assert!(
+        !raw.contains("Tr0ub4dor"),
+        "a value crossed the MCP door: {raw}"
+    );
+
+    // Deciding twice does not work: the first word stands.
+    let r = decide(&b, pending[0].id, serde_json::json!({"approve": false})).await;
+    assert_eq!(r.status(), 409);
+}
+
+#[tokio::test]
+async fn a_denied_request_fails_the_task_and_says_why() {
+    let (url, _up) = Upstream::spawn(Behaviour::Json).await;
+    let b = broker(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", None, vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+    )
+    .await;
+
+    let res = mcp(
+        &b,
+        "vk-the-virtual-one",
+        "tools/call",
+        serde_json::json!({"name": "credential_request", "arguments": {
+            "reference": "proxy.password", "reason": "testing the refusal"
+        }}),
+    )
+    .await;
+    let task_id = res["result"]["task"]["taskId"].as_str().unwrap().to_owned();
+
+    let pending = b.state.audit.grants(Some("pending"), 10).unwrap();
+    decide(
+        &b,
+        pending[0].id,
+        serde_json::json!({"approve": false, "note": "not for this job"}),
+    )
+    .await;
+
+    let res = mcp(
+        &b,
+        "vk-the-virtual-one",
+        "tasks/get",
+        serde_json::json!({"taskId": task_id}),
+    )
+    .await;
+    assert_eq!(res["result"]["task"]["status"], "failed");
+    let msg = res["result"]["task"]["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("not for this job"), "{msg}");
+}
+
+#[tokio::test]
+async fn the_mcp_door_is_shut_without_a_virtual_key() {
+    let (url, _up) = Upstream::spawn(Behaviour::Json).await;
+    let b = broker(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", None, vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+    )
+    .await;
+
+    let bare = reqwest::Client::new()
+        .post(format!("{}/mcp", b.url))
+        .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bare.status(), 401);
+
+    let wrong = reqwest::Client::new()
+        .post(format!("{}/mcp", b.url))
+        .header("x-api-key", "vk-not-a-key")
+        .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), 401);
+}
+
+#[tokio::test]
+async fn an_agents_task_is_invisible_to_another_agent() {
+    let (url, _up) = Upstream::spawn(Behaviour::Json).await;
+    let mut pairs = secrets();
+    pairs.push(("douane.vk_other", "vk-the-other-one"));
+    let b = broker_with(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", None, vec![])],
+        &pairs,
+        ScrubConfig::default(),
+        None,
+        |c| {
+            c.clients.insert(
+                "other".to_owned(),
+                douane::config::Client {
+                    key: SecretRef::parse("douane.vk_other").unwrap(),
+                    routes: Vec::new(),
+                    max_trust: None,
+                    note: None,
+                },
+            );
+        },
+    )
+    .await;
+
+    let res = mcp(
+        &b,
+        "vk-the-virtual-one",
+        "tools/call",
+        serde_json::json!({"name": "credential_request", "arguments": {
+            "reference": "proxy.password", "reason": "mine"
+        }}),
+    )
+    .await;
+    let task_id = res["result"]["task"]["taskId"].as_str().unwrap().to_owned();
+
+    // The other agent polling the same handle learns nothing, and cannot
+    // cancel it either.
+    let res = mcp(
+        &b,
+        "vk-the-other-one",
+        "tasks/get",
+        serde_json::json!({"taskId": task_id}),
+    )
+    .await;
+    assert!(res["error"]["message"].as_str().unwrap().contains("no task"));
+    let res = mcp(
+        &b,
+        "vk-the-other-one",
+        "tasks/cancel",
+        serde_json::json!({"taskId": task_id}),
+    )
+    .await;
+    assert!(res.get("error").is_some());
+
+    // Its owner can withdraw it.
+    let res = mcp(
+        &b,
+        "vk-the-virtual-one",
+        "tasks/cancel",
+        serde_json::json!({"taskId": task_id}),
+    )
+    .await;
+    assert_eq!(res["result"]["status"], "cancelled");
+}
+
+#[tokio::test]
+async fn a_deposit_over_mcp_is_watched_on_the_way_out() {
+    let (url, up) = Upstream::spawn(Behaviour::Json).await;
+    let b = broker(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", None, vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+    )
+    .await;
+
+    let value = "agent-made-credential-abcdef123456";
+    let res = mcp(
+        &b,
+        "vk-the-virtual-one",
+        "tools/call",
+        serde_json::json!({"name": "vault_deposit", "arguments": {
+            "reference": "vercel.deploy_token", "value": value
+        }}),
+    )
+    .await;
+    let text = res["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("__DOUANE_VERCEL_DEPLOY_TOKEN__"), "{text}");
+    assert!(!text.contains(value), "the deposit answer repeated the value");
+
+    // The scrubber knows it at once: the same value heading for the reseller
+    // in a chat body is refused.
+    let mut body = ask("haiku");
+    body["messages"][0]["content"] = format!("the token is {value}").into();
+    let res = call(&b, "vk-the-virtual-one", body).await;
+    assert_eq!(res.status(), 403);
+    assert_eq!(up.calls(), 0);
+
+    // Write-only also means write-once from an agent: no overwriting.
+    let res = mcp(
+        &b,
+        "vk-the-virtual-one",
+        "tools/call",
+        serde_json::json!({"name": "vault_deposit", "arguments": {
+            "reference": "vercel.deploy_token", "value": "something-else-entirely"
+        }}),
+    )
+    .await;
+    assert_eq!(res["result"]["isError"], true);
+}
+
+#[tokio::test]
+async fn douanes_own_keys_are_not_grantable() {
+    let (url, _up) = Upstream::spawn(Behaviour::Json).await;
+    let b = broker(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", None, vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+    )
+    .await;
+
+    let res = mcp(
+        &b,
+        "vk-the-virtual-one",
+        "tools/call",
+        serde_json::json!({"name": "credential_request", "arguments": {
+            "reference": "primary.api_key", "reason": "let me talk to the provider myself"
+        }}),
+    )
+    .await;
+    assert_eq!(res["result"]["isError"], true);
+    assert!(b.state.audit.grants(None, 10).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_filed_request_rings_the_owners_bell() {
+    // A tiny listener standing in for ntfy.
+    let heard: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = heard.clone();
+    let app = axum::Router::new().route(
+        "/ring",
+        axum::routing::post(move |body: String| {
+            let sink = sink.clone();
+            async move {
+                sink.lock().unwrap().push(body);
+                axum::http::StatusCode::OK
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let notify_url = format!("http://{}/ring", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let (url, _up) = Upstream::spawn(Behaviour::Json).await;
+    let b = broker_with(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", None, vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+        |c| c.server.notify_url = Some(notify_url),
+    )
+    .await;
+
+    mcp(
+        &b,
+        "vk-the-virtual-one",
+        "tools/call",
+        serde_json::json!({"name": "credential_request", "arguments": {
+            "reference": "proxy.password", "reason": "need the proxy"
+        }}),
+    )
+    .await;
+
+    let messages = heard.lock().unwrap().clone();
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].contains("test"), "{}", messages[0]);
+    assert!(messages[0].contains("proxy.password"), "{}", messages[0]);
+    assert!(!messages[0].contains("Tr0ub4dor"), "{}", messages[0]);
+}
+
+#[tokio::test]
+async fn no_mcp_surface_hands_a_value_back() {
+    let (url, _up) = Upstream::spawn(Behaviour::Json).await;
+    let b = broker(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", None, vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+    )
+    .await;
+
+    for method in ["tools/list", "tasks/get"] {
+        let res = mcp(
+            &b,
+            "vk-the-virtual-one",
+            method,
+            serde_json::json!({"taskId": "task_none"}),
+        )
+        .await;
+        let text = res.to_string();
+        for (_, value) in secrets() {
+            assert!(!text.contains(value), "{method} carried {value}");
+        }
+    }
+
+    let res = mcp(
+        &b,
+        "vk-the-virtual-one",
+        "tools/call",
+        serde_json::json!({"name": "vault_list", "arguments": {}}),
+    )
+    .await;
+    let text = res.to_string();
+    for (_, value) in secrets() {
+        assert!(!text.contains(value), "vault_list carried {value}");
+    }
+    assert!(text.contains("proxy"), "the names are the point: {text}");
+}

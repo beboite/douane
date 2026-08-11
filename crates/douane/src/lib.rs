@@ -10,6 +10,7 @@ pub mod config;
 pub mod dash;
 pub mod egress;
 pub mod guard;
+pub mod mcp;
 pub mod proxy;
 pub mod scrub;
 pub mod usage;
@@ -30,6 +31,9 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/messages", post(proxy::messages))
         .route("/health", get(proxy::health))
+        // Stateless MCP: one POST per request, no session, Tasks for anything
+        // that waits on a human. Guarded by the same virtual keys as the relay.
+        .route("/mcp", post(mcp::endpoint))
         .route("/admin", get(dash::page))
         .route("/admin/", get(dash::page))
         // The compiled bundle. Every asset SvelteKit emits lives under `_app`,
@@ -50,6 +54,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/api/config", get(dash::config))
         .route("/admin/api/routes/{name}", put(dash::set_route))
         .route("/admin/api/routes/{name}", delete(dash::clear_route))
+        .route("/admin/api/grants", get(dash::grants))
+        .route("/admin/api/grants/{id}/decide", post(dash::decide_grant))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             64 * 1024 * 1024,
         ))

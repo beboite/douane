@@ -17,6 +17,11 @@ database = "douane.sqlite"
 # The dashboard's token. Comment this out and no admin surface is served at all,
 # which is the right setting for an instance nobody is watching.
 admin_key = { namespace = "douane", key = "admin_token" }
+# Where a one-line ping goes when an agent files a credential request over MCP
+# (an ntfy topic works as is). Best effort: a dead notification channel never
+# blocks the request it announces. Absent, the dashboard's pending list is the
+# only signal.
+# notify_url = "https://ntfy.example/douane"
 
 # ---------------------------------------------------------------- providers --
 # `trust` is not about model quality. It is about who reads the conversation

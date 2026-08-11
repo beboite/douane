@@ -266,8 +266,9 @@ fn peek(body: &[u8]) -> Option<Peek> {
     })
 }
 
-/// Pull the presented key out of either header form.
-fn presented_key(headers: &HeaderMap) -> Option<String> {
+/// Pull the presented key out of either header form. The MCP endpoint
+/// authenticates the same way, which is why this is crate-visible.
+pub(crate) fn presented_key(headers: &HeaderMap) -> Option<String> {
     if let Some(v) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
         return Some(v.to_owned());
     }

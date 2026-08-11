@@ -270,7 +270,7 @@ pub async fn vault(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Re
     }
     Json(serde_json::json!({
         "entries": state.vault_list(),
-        "in_use": in_use(&state),
+        "in_use": operating_refs(&state),
         "watching": state.scrubber().watching(),
     }))
     .into_response()
@@ -280,8 +280,10 @@ pub async fn vault(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Re
 ///
 /// Deleting one of these would break the broker on its next request, and
 /// replacing one is a deliberate act rather than a slip, so the dashboard marks
-/// them and the delete handler refuses them outright.
-fn in_use(state: &AppState) -> Vec<String> {
+/// them and the delete handler refuses them outright. The MCP endpoint refuses
+/// to *grant* them for the same reason: they are douane's own working keys,
+/// not credentials an agent has any business borrowing.
+pub(crate) fn operating_refs(state: &AppState) -> Vec<String> {
     let live = state.config();
     let mut refs: Vec<String> = live
         .providers
@@ -311,7 +313,7 @@ pub struct Deposit {
 
 /// A credential is a line of text. Anything larger is a mistake on the way in,
 /// and storing it would only make the vault file and every scrubber pass bigger.
-const MAX_SECRET_BYTES: usize = 8 * 1024;
+pub(crate) const MAX_SECRET_BYTES: usize = 8 * 1024;
 
 fn vault_error(e: douane_vault::VaultError) -> Response {
     tracing::error!("vault write failed: {e}");
@@ -398,7 +400,7 @@ pub async fn delete_secret(
         return r;
     }
     let r = SecretRef::new(&namespace, &key);
-    if in_use(&state).contains(&r.to_string()) {
+    if operating_refs(&state).contains(&r.to_string()) {
         return json_error(
             StatusCode::CONFLICT,
             "invalid_request_error",
@@ -534,6 +536,93 @@ pub async fn config(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
         },
     }))
     .into_response()
+}
+
+/// The access requests agents have filed, newest first. `?status=pending` is
+/// what the approval screen polls.
+pub async fn grants(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<GrantQuery>,
+) -> Response {
+    if let Some(r) = denied(&state, &headers) {
+        return r;
+    }
+    match state
+        .audit
+        .grants(q.status.as_deref(), q.limit.unwrap_or(100).clamp(1, 1000))
+    {
+        Ok(g) => Json(g).into_response(),
+        Err(e) => db_error(e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GrantQuery {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+/// The owner's word on a request. One decision per request: a second click, or
+/// a race between two dashboard tabs, answers 409 rather than re-deciding.
+#[derive(Debug, Deserialize)]
+pub struct Decision {
+    approve: bool,
+    #[serde(default)]
+    note: Option<String>,
+    /// How long an approval stands. Bounded: an approval that never lapses is
+    /// a standing credential grant nobody remembers making.
+    #[serde(default)]
+    ttl_hours: Option<i64>,
+}
+
+pub async fn decide_grant(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(d): Json<Decision>,
+) -> Response {
+    if let Some(r) = denied(&state, &headers) {
+        return r;
+    }
+    let expires_at = if d.approve {
+        let hours = d
+            .ttl_hours
+            .unwrap_or(crate::mcp::DEFAULT_GRANT_HOURS)
+            .clamp(1, 24 * 30);
+        Some(
+            (OffsetDateTime::now_utc() + time::Duration::hours(hours))
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+        )
+    } else {
+        None
+    };
+    match state
+        .audit
+        .grant_decide(id, d.approve, d.note.as_deref(), expires_at.as_deref())
+    {
+        Ok(true) => {
+            let g = state.audit.grant_by_id(id).ok().flatten();
+            if let Some(g) = &g {
+                tracing::info!(
+                    client = g.client,
+                    reference = g.reference,
+                    approved = d.approve,
+                    "a credential request was decided"
+                );
+            }
+            Json(g).into_response()
+        }
+        Ok(false) => json_error(
+            StatusCode::CONFLICT,
+            "invalid_request_error",
+            "that request is not pending: it was already decided or withdrawn",
+        ),
+        Err(e) => db_error(e),
+    }
 }
 
 /// Repoint a route. The change lands in the database and takes effect on the

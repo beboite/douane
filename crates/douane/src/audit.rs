@@ -163,6 +163,24 @@ impl Audit {
                 model    TEXT,
                 at       TEXT NOT NULL
             );
+
+            -- Credential access requests, filed by agents over MCP and decided
+            -- by the owner on the dashboard. `reference` is a vault name; the
+            -- value never appears in this table or in anything derived from it.
+            CREATE TABLE IF NOT EXISTS grants (
+                id         INTEGER PRIMARY KEY,
+                task_id    TEXT    NOT NULL UNIQUE,
+                at         TEXT    NOT NULL,
+                client     TEXT    NOT NULL,
+                reference  TEXT    NOT NULL,
+                reason     TEXT    NOT NULL,
+                status     TEXT    NOT NULL,
+                note       TEXT,
+                decided_at TEXT,
+                expires_at TEXT,
+                used_at    TEXT
+            );
+            CREATE INDEX IF NOT EXISTS grants_status ON grants(status);
             "#,
         )
         // A database written before the pricing removal still carries `cost`
@@ -264,6 +282,82 @@ impl Audit {
         let n = self
             .lock()
             .execute("DELETE FROM route_overrides WHERE route=?1", [route])?;
+        Ok(n > 0)
+    }
+
+    // -------------------------------------------------------------- grants --
+
+    /// File a request. `task_id` is the opaque handle the agent will poll with.
+    pub fn grant_create(
+        &self,
+        task_id: &str,
+        client: &str,
+        reference: &str,
+        reason: &str,
+    ) -> rusqlite::Result<i64> {
+        let conn = self.lock();
+        conn.execute(
+            r#"INSERT INTO grants (task_id, at, client, reference, reason, status)
+               VALUES (?1,?2,?3,?4,?5,'pending')"#,
+            rusqlite::params![task_id, now(), client, reference, reason],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn grant_by_task(&self, task_id: &str) -> rusqlite::Result<Option<Grant>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!("{GRANT_SELECT} WHERE task_id = ?1"))?;
+        let mut rows = stmt.query_map([task_id], grant_row)?;
+        rows.next().transpose()
+    }
+
+    pub fn grant_by_id(&self, id: i64) -> rusqlite::Result<Option<Grant>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!("{GRANT_SELECT} WHERE id = ?1"))?;
+        let mut rows = stmt.query_map([id], grant_row)?;
+        rows.next().transpose()
+    }
+
+    /// Newest first, optionally narrowed to one status.
+    pub fn grants(&self, status: Option<&str>, limit: u32) -> rusqlite::Result<Vec<Grant>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "{GRANT_SELECT} WHERE (?2 IS NULL OR status = ?2) ORDER BY id DESC LIMIT ?1"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params![limit, status], grant_row)?;
+        rows.collect()
+    }
+
+    /// Decide a pending request. Returns false when it was not pending, so a
+    /// double click or a race between two dashboard tabs decides once.
+    pub fn grant_decide(
+        &self,
+        id: i64,
+        approve: bool,
+        note: Option<&str>,
+        expires_at: Option<&str>,
+    ) -> rusqlite::Result<bool> {
+        let n = self.lock().execute(
+            r#"UPDATE grants SET status=?2, note=?3, decided_at=?4, expires_at=?5
+               WHERE id=?1 AND status='pending'"#,
+            rusqlite::params![
+                id,
+                if approve { "approved" } else { "denied" },
+                note,
+                now(),
+                expires_at,
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// An agent withdrawing its own request. Only a pending one can go.
+    pub fn grant_cancel(&self, task_id: &str, client: &str) -> rusqlite::Result<bool> {
+        let n = self.lock().execute(
+            r#"UPDATE grants SET status='cancelled', decided_at=?3
+               WHERE task_id=?1 AND client=?2 AND status='pending'"#,
+            rusqlite::params![task_id, client, now()],
+        )?;
         Ok(n > 0)
     }
 
@@ -569,6 +663,43 @@ pub struct Thread {
     pub providers: String,
     pub input_tokens: i64,
     pub output_tokens: i64,
+}
+
+/// One credential access request, as filed by an agent and decided by the
+/// owner. Everything here is a name or a timestamp; there is no field a value
+/// could travel in, the same property `EntryInfo` has.
+#[derive(Debug, Clone, Serialize)]
+pub struct Grant {
+    pub id: i64,
+    pub task_id: String,
+    pub at: String,
+    pub client: String,
+    pub reference: String,
+    pub reason: String,
+    pub status: String,
+    pub note: Option<String>,
+    pub decided_at: Option<String>,
+    pub expires_at: Option<String>,
+    pub used_at: Option<String>,
+}
+
+const GRANT_SELECT: &str = "SELECT id, task_id, at, client, reference, reason, status, note, \
+                            decided_at, expires_at, used_at FROM grants";
+
+fn grant_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Grant> {
+    Ok(Grant {
+        id: r.get(0)?,
+        task_id: r.get(1)?,
+        at: r.get(2)?,
+        client: r.get(3)?,
+        reference: r.get(4)?,
+        reason: r.get(5)?,
+        status: r.get(6)?,
+        note: r.get(7)?,
+        decided_at: r.get(8)?,
+        expires_at: r.get(9)?,
+        used_at: r.get(10)?,
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
