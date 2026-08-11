@@ -1817,11 +1817,11 @@ async fn the_key_check_tells_a_dead_key_from_a_live_one() {
     assert_eq!(dead["ok"], false);
     assert_eq!(dead["status"], 401);
 
-    // The probe went out with the provider's real credential and one token,
-    // exactly like traffic and nothing like a listing.
+    // The probe went out with the provider's real credential and a handful of
+    // tokens, exactly like traffic and nothing like a listing.
     let seen = live_up.last();
     assert_eq!(seen.api_key.as_deref(), Some("sk-real-primary-key-value"));
-    assert_eq!(seen.body["max_tokens"], 1);
+    assert_eq!(seen.body["max_tokens"], 16);
     assert_eq!(seen.body["model"], "deepseek-chat");
 }
 
@@ -1853,7 +1853,7 @@ async fn the_key_check_speaks_each_providers_own_dialect() {
 
     // It landed on the OpenAI path, in the OpenAI shape.
     let seen = up.last();
-    assert_eq!(seen.body["max_tokens"], 1);
+    assert_eq!(seen.body["max_tokens"], 16);
     assert!(seen.body.get("messages").is_some());
 }
 

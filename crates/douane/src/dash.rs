@@ -556,16 +556,19 @@ struct ProbeResult {
     detail: Option<String>,
 }
 
-/// A probe is one real, one-token call per provider, sent with the provider's
-/// own credential. It spends a fraction of a cent and answers the question no
+/// A probe is one real, tiny call per provider, sent with the provider's own
+/// credential. It spends a fraction of a cent and answers the question no
 /// listing can: not "is a key configured" but "does the key still work".
-const PROBE_MAX_TOKENS: u32 = 1;
+/// Sixteen and not one: Meta's endpoint refuses `max_tokens` under 16, and a
+/// probe that trips a validator reads as a dead key.
+const PROBE_MAX_TOKENS: u32 = 16;
 
-/// Long enough for a slow reseller, short enough that a dead one does not hold
-/// the whole sweep. Deliberately shorter than the cold start of the local
-/// gateway: a probe that wakes a sleeping machine reports the timeout and the
-/// machine still wakes, which is the honest reading of "not answering *now*".
-const PROBE_TIMEOUT_SECS: u64 = 20;
+/// Long enough for a slow reseller (the grok backends take over ten seconds on
+/// a good day), short enough that a dead one does not hold the whole sweep.
+/// Deliberately shorter than the cold start of the local gateway: a probe that
+/// wakes a sleeping machine reports the timeout and the machine still wakes,
+/// which is the honest reading of "not answering *now*".
+const PROBE_TIMEOUT_SECS: u64 = 30;
 
 async fn probe_one(
     state: &AppState,
@@ -617,6 +620,13 @@ async fn probe_one(
         .post(&url)
         .header("content-type", "application/json")
         .header("anthropic-version", "2023-06-01")
+        // The shape of real traffic, because that is the question being asked.
+        // agentrouter answers 401 `unauthorized_client_error` on a perfectly
+        // valid key when the caller does not look like Claude Code, and a probe
+        // that trips a client check reads as a dead key.
+        .header("user-agent", "claude-cli/2.1.220 (external, cli)")
+        .header("x-app", "cli")
+        .header("anthropic-beta", "claude-code-20250219")
         .timeout(std::time::Duration::from_secs(
             provider.timeout_secs.min(PROBE_TIMEOUT_SECS),
         ))
