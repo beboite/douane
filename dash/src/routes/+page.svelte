@@ -11,17 +11,15 @@
 	import { Toaster } from '$lib/components/ui/sonner';
 	import Activity from '@lucide/svelte/icons/activity';
 	import KeyRound from '@lucide/svelte/icons/key-round';
-	import LayoutDashboard from '@lucide/svelte/icons/layout-dashboard';
 	import LockKeyhole from '@lucide/svelte/icons/lock-keyhole';
 	import Moon from '@lucide/svelte/icons/moon';
 	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
-	import ShieldAlert from '@lucide/svelte/icons/shield-alert';
+	import ShieldCheck from '@lucide/svelte/icons/shield-check';
 	import Signpost from '@lucide/svelte/icons/signpost';
 	import Sun from '@lucide/svelte/icons/sun';
 	import Vault from '@lucide/svelte/icons/vault';
 
-	import TabAlerts from '$lib/components/tab-alerts.svelte';
-	import TabOverview from '$lib/components/tab-overview.svelte';
+	import TabProtection from '$lib/components/tab-protection.svelte';
 	import TabRoutes from '$lib/components/tab-routes.svelte';
 	import TabTraffic from '$lib/components/tab-traffic.svelte';
 	import TabVault from '$lib/components/tab-vault.svelte';
@@ -32,6 +30,7 @@
 		type Alert,
 		type Call,
 		type ConfigView,
+		type Grant,
 		type Summary,
 		type Thread,
 		type VaultView
@@ -47,7 +46,7 @@
 	];
 
 	let hours = $state('24');
-	let tab = $state('apercu');
+	let tab = $state('protection');
 	let typed = $state('');
 	let rejected = $state('');
 
@@ -57,13 +56,14 @@
 	let calls = $state<Call[]>([]);
 	let threads = $state<Thread[]>([]);
 	let alerts = $state<Alert[]>([]);
+	let grants = $state<Grant[]>([]);
 	let thread = $state<string | null>(null);
 
 	let loading = $state(false);
 	let failure = $state('');
 	let dark = $state(true);
 
-	const blocked = $derived(alerts.filter((a) => a.action === 'block').length);
+	const pending = $derived(grants.filter((g) => g.status === 'pending').length);
 	const repointed = $derived(config?.routes.filter((r) => r.overridden).length ?? 0);
 
 	async function load() {
@@ -72,13 +72,14 @@
 		failure = '';
 		const h = Number(hours);
 		try {
-			const [s, c, v, k, t, a] = await Promise.all([
+			const [s, c, v, k, t, a, g] = await Promise.all([
 				api.summary(session.token, h),
 				api.config(session.token),
 				api.vault(session.token),
 				api.calls(session.token, 200, { thread: thread ?? undefined }),
 				api.threads(session.token, h),
-				api.alerts(session.token)
+				api.alerts(session.token),
+				api.grants(session.token)
 			]);
 			summary = s.summary;
 			config = c;
@@ -86,6 +87,7 @@
 			calls = k;
 			threads = t;
 			alerts = a;
+			grants = g;
 		} catch (e) {
 			if (e instanceof ApiError && e.status === UNAUTHORIZED) {
 				// The token stopped working: rotated, or wrong from the start.
@@ -297,11 +299,10 @@
 					<Tabs.List
 						class="h-auto gap-1 rounded-none border-0 bg-transparent p-0 [&>*]:rounded-none"
 					>
-						{@render item('apercu', 'Aperçu', LayoutDashboard)}
+						{@render item('protection', 'Protection', ShieldCheck, pending > 0 ? String(pending) : undefined)}
 						{@render item('trafic', 'Trafic', Activity)}
 						{@render item('routes', 'Routes', Signpost, repointed > 0 ? String(repointed) : undefined)}
 						{@render item('coffre', 'Coffre', Vault, count(vault?.entries.length ?? 0) || undefined)}
-						{@render item('alertes', 'Alertes', ShieldAlert, blocked > 0 ? String(blocked) : undefined)}
 					</Tabs.List>
 				</div>
 			</div>
@@ -320,15 +321,20 @@
 
 				<!-- Each screen slides in a few pixels. Enough to say the page
 				     changed, short enough that nobody waits for it. -->
-				<Tabs.Content value="apercu">
+				<Tabs.Content value="protection">
 					<div in:fly={{ y: 8, duration: 220, easing: cubicOut }}>
-						<TabOverview {summary} {config} {alerts} hours={Number(hours)} />
+						<TabProtection
+							{alerts}
+							{grants}
+							watching={config?.watching ?? 0}
+							reload={load}
+						/>
 					</div>
 				</Tabs.Content>
 
 				<Tabs.Content value="trafic">
 					<div in:fly={{ y: 8, duration: 220, easing: cubicOut }}>
-						<TabTraffic {calls} {threads} bind:filter={thread} />
+						<TabTraffic {summary} hours={Number(hours)} {calls} {threads} bind:filter={thread} />
 					</div>
 				</Tabs.Content>
 
@@ -341,12 +347,6 @@
 				<Tabs.Content value="coffre">
 					<div in:fly={{ y: 8, duration: 220, easing: cubicOut }}>
 						<TabVault {vault} reload={load} />
-					</div>
-				</Tabs.Content>
-
-				<Tabs.Content value="alertes">
-					<div in:fly={{ y: 8, duration: 220, easing: cubicOut }}>
-						<TabAlerts {alerts} />
 					</div>
 				</Tabs.Content>
 			</main>

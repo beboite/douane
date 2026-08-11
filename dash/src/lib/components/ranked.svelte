@@ -3,7 +3,7 @@
 	import Empty from './empty.svelte';
 	import Inbox from '@lucide/svelte/icons/inbox';
 	import type { Bucket } from '$lib/api';
-	import { count, money, tokens } from '$lib/format';
+	import { count, tokens } from '$lib/format';
 
 	/** A breakdown as a ranked list rather than a table.
 	 *
@@ -47,12 +47,6 @@
 						<CacheBadge read={row.cache_read_tokens} write={row.cache_write_tokens} />
 					</span>
 					<span class="tabular shrink-0 text-sm font-medium">{count(row.calls)}</span>
-					<span
-						class="tabular text-muted-foreground w-40 shrink-0 truncate text-right text-xs"
-						title={money(row.cost) || 'aucun tarif configuré pour cette route'}
-					>
-						{money(row.cost) || 'sans tarif'}
-					</span>
 				</div>
 			</li>
 		{/each}

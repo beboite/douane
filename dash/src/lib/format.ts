@@ -1,22 +1,3 @@
-import type { Money } from './api';
-
-/** Sub-cent amounts get more digits, because most single calls cost less than a
- *  cent and rounding them all to `0.00` would make the column useless. */
-export function amount(v: number | null | undefined, currency?: string | null): string {
-	if (v === null || v === undefined) return '';
-	const digits = Math.abs(v) > 0 && Math.abs(v) < 0.01 ? 5 : 2;
-	return v.toFixed(digits) + (currency ? ` ${currency}` : '');
-}
-
-/** Two currencies stay two numbers. Douane never converts, so a total spent
- *  partly in yuan and partly in dollars reads as both and never as one. */
-export function money(m: Money | null | undefined): string {
-	if (!m) return '';
-	return Object.entries(m)
-		.map(([currency, v]) => amount(v, currency))
-		.join(' + ');
-}
-
 const compact = new Intl.NumberFormat('fr-FR', { notation: 'compact', maximumFractionDigits: 1 });
 const plain = new Intl.NumberFormat('fr-FR');
 

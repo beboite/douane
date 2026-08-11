@@ -1,9 +1,7 @@
 import { base } from '$app/paths';
 
-/** Every cost in this app is a map keyed by currency. Douane never converts, so
- *  two units stay two numbers and a total is never a scalar. */
-export type Money = Record<string, number>;
-
+/** douane prices nothing: a reseller's price list is fiction. The counters
+ *  below are trust signals and attribution, never a bill. */
 export type Bucket = {
 	key: string;
 	calls: number;
@@ -15,7 +13,6 @@ export type Bucket = {
 	 *  into one "cached" figure the two cases look the same. */
 	cache_read_tokens: number;
 	cache_write_tokens: number;
-	cost: Money;
 };
 
 /** One point on the activity curve. The broker fills the quiet slots itself, so
@@ -30,7 +27,6 @@ export type Slot = {
 	errors: number;
 	input_tokens: number;
 	output_tokens: number;
-	cost: Money;
 };
 
 export type Summary = {
@@ -62,8 +58,6 @@ export type Call = {
 	output_tokens: number | null;
 	cache_read_tokens: number | null;
 	cache_write_tokens: number | null;
-	cost: number | null;
-	currency: string | null;
 	error: string | null;
 };
 
@@ -76,7 +70,6 @@ export type Thread = {
 	providers: string;
 	input_tokens: number;
 	output_tokens: number;
-	cost: Money;
 };
 
 export type Alert = {
@@ -88,7 +81,23 @@ export type Alert = {
 	trust: Trust;
 	kind: string;
 	label: string;
-	action: 'allow' | 'warn' | 'block' | string;
+	action: 'allow' | 'warn' | 'substitute' | 'block' | string;
+};
+
+/** One credential access request, filed by an agent over MCP. Names and
+ *  timestamps only: there is no field a value could travel in. */
+export type Grant = {
+	id: number;
+	task_id: string;
+	at: string;
+	client: string;
+	reference: string;
+	reason: string;
+	status: 'pending' | 'approved' | 'denied' | 'cancelled' | string;
+	note: string | null;
+	decided_at: string | null;
+	expires_at: string | null;
+	used_at: string | null;
 };
 
 export type Trust = 'max' | 'mid' | 'low' | string;
@@ -98,7 +107,6 @@ export type ProviderView = {
 	base_url: string;
 	trust: Trust;
 	keyed: boolean;
-	priced: boolean;
 };
 
 export type RouteView = {
@@ -109,7 +117,6 @@ export type RouteView = {
 	base_provider: string;
 	base_model: string | null;
 	overridden: boolean;
-	price: string | null;
 };
 
 export type ClientView = {
@@ -123,7 +130,6 @@ export type ConfigView = {
 	providers: ProviderView[];
 	routes: RouteView[];
 	clients: ClientView[];
-	currency: string;
 	scrub: Record<string, unknown>;
 	watching: number;
 	egress: { listening: boolean; rules: number };
@@ -189,7 +195,7 @@ async function request<T>(token: string, path: string, init?: RequestInit): Prom
 
 export const api = {
 	summary: (token: string, hours: number) =>
-		request<{ currency: string; summary: Summary }>(token, `/summary?hours=${hours}`),
+		request<{ summary: Summary }>(token, `/summary?hours=${hours}`),
 
 	calls: (token: string, limit: number, filter: { client?: string; thread?: string } = {}) => {
 		const q = new URLSearchParams({ limit: String(limit) });
@@ -204,6 +210,24 @@ export const api = {
 	alerts: (token: string, limit = 200) => request<Alert[]>(token, `/alerts?limit=${limit}`),
 
 	config: (token: string) => request<ConfigView>(token, '/config'),
+
+	grants: (token: string, status?: string, limit = 200) => {
+		const q = new URLSearchParams({ limit: String(limit) });
+		if (status) q.set('status', status);
+		return request<Grant[]>(token, `/grants?${q}`);
+	},
+
+	/** The owner's word on a request. One decision each: a second call answers
+	 *  409, which the page reads as "already handled elsewhere". */
+	decideGrant: (
+		token: string,
+		id: number,
+		body: { approve: boolean; note?: string; ttl_hours?: number }
+	) =>
+		request<Grant>(token, `/grants/${id}/decide`, {
+			method: 'POST',
+			body: JSON.stringify(body)
+		}),
 
 	vault: (token: string) => request<VaultView>(token, '/vault'),
 

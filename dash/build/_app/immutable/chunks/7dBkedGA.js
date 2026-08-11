@@ -1,6 +1,0 @@
-var e=e=>e;function t(e){let t=e-1;return t*t*t+1}function n(e){return e<.5?4*e*e*e:.5*(2*e-2)**3+1}function r(e){let t=typeof e==`string`&&e.match(/^\s*(-?[\d.]+)([^\s]*)\s*$/);return t?[parseFloat(t[1]),t[2]||`px`]:[e,`px`]}function i(t,{delay:n=0,duration:r=400,easing:i=e}={}){let a=+getComputedStyle(t).opacity;return{delay:n,duration:r,easing:i,css:e=>`opacity: ${e*a}`}}function a(e,{delay:n=0,duration:i=400,easing:a=t,x:o=0,y:s=0,opacity:c=0}={}){let l=getComputedStyle(e),u=+l.opacity,d=l.transform===`none`?``:l.transform,f=u*(1-c),[p,m]=r(o),[h,g]=r(s);return{delay:n,duration:i,easing:a,css:(e,t)=>`
-			transform: ${d} translate(${(1-e)*p}${m}, ${(1-e)*h}${g});
-			opacity: ${u-f*t}`}}function o(e,{delay:t=0,speed:r,duration:i,easing:a=n}={}){let o=e.getTotalLength(),s=getComputedStyle(e);return s.strokeLinecap!==`butt`&&(o+=parseInt(s.strokeWidth)),i===void 0?i=r===void 0?800:o/r:typeof i==`function`&&(i=i(o)),{delay:t,duration:i,easing:a,css:(e,t)=>`
-			stroke-dasharray: ${o};
-			stroke-dashoffset: ${t*o};
-		`}}export{i as n,a as r,o as t};

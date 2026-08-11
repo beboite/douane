@@ -100,16 +100,6 @@
 		/>
 	</Table.Cell>
 
-	<Table.Cell class="tabular text-right text-xs">
-		{#if route.price}
-			{route.price}
-		{:else}
-			<span class="text-muted-foreground" title="aucun tarif connu, donc aucun coût inventé">
-				non tarifée
-			</span>
-		{/if}
-	</Table.Cell>
-
 	<Table.Cell>
 		<div class="flex justify-end gap-1.5">
 			{#if dirty}
