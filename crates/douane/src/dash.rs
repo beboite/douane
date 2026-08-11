@@ -538,6 +538,165 @@ pub async fn config(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
     .into_response()
 }
 
+/// One provider's answer to "does your key still open the door".
+#[derive(Debug, Serialize)]
+struct ProbeResult {
+    provider: String,
+    /// The route the probe went out as, so a failure can be replayed by hand.
+    route: Option<String>,
+    model: Option<String>,
+    ok: bool,
+    /// The HTTP status the upstream answered, absent when nothing answered at
+    /// all (DNS, refused connection, timeout).
+    status: Option<u16>,
+    ms: u64,
+    /// The upstream's own words on failure, truncated. Passed through the
+    /// scrubber first: an error page that echoes a credential must not become
+    /// the one place the dashboard shows one.
+    detail: Option<String>,
+}
+
+/// A probe is one real, one-token call per provider, sent with the provider's
+/// own credential. It spends a fraction of a cent and answers the question no
+/// listing can: not "is a key configured" but "does the key still work".
+const PROBE_MAX_TOKENS: u32 = 1;
+
+/// Long enough for a slow reseller, short enough that a dead one does not hold
+/// the whole sweep. Deliberately shorter than the cold start of the local
+/// gateway: a probe that wakes a sleeping machine reports the timeout and the
+/// machine still wakes, which is the honest reading of "not answering *now*".
+const PROBE_TIMEOUT_SECS: u64 = 20;
+
+async fn probe_one(
+    state: &AppState,
+    name: &str,
+    provider: &crate::config::Provider,
+    route: Option<(String, String)>,
+) -> ProbeResult {
+    let started = std::time::Instant::now();
+    let mut out = ProbeResult {
+        provider: name.to_owned(),
+        route: route.as_ref().map(|(r, _)| r.clone()),
+        model: route.as_ref().map(|(_, m)| m.clone()),
+        ok: false,
+        status: None,
+        ms: 0,
+        detail: None,
+    };
+
+    let Some((_, model)) = route else {
+        out.detail = Some("no route names this provider, nothing to send".to_owned());
+        return out;
+    };
+
+    let body = serde_json::json!({
+        "model": model,
+        "max_tokens": PROBE_MAX_TOKENS,
+        "messages": [{"role": "user", "content": "ping"}],
+    });
+    let body = serde_json::to_vec(&body).unwrap_or_default();
+    let body = match provider.wire {
+        crate::wire::Wire::Anthropic => body,
+        crate::wire::Wire::Openai => match crate::wire::request_to_openai(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                out.detail = Some(e.0);
+                out.ms = started.elapsed().as_millis() as u64;
+                return out;
+            }
+        },
+    };
+
+    let url = format!(
+        "{}{}",
+        provider.base_url.trim_end_matches('/'),
+        provider.wire.path()
+    );
+    let mut req = state
+        .http
+        .post(&url)
+        .header("content-type", "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .timeout(std::time::Duration::from_secs(
+            provider.timeout_secs.min(PROBE_TIMEOUT_SECS),
+        ))
+        .body(body);
+
+    if let Some(key_ref) = &provider.key {
+        let Some(key) = state.secret(key_ref) else {
+            out.detail = Some(format!("the vault has no `{key_ref}`"));
+            out.ms = started.elapsed().as_millis() as u64;
+            return out;
+        };
+        let value = provider.header_value(key.expose());
+        req = match axum::http::HeaderValue::from_str(&value) {
+            Ok(v) => req.header(provider.auth_header.as_str(), v),
+            Err(_) => {
+                out.detail = Some("the key does not fit in a header".to_owned());
+                out.ms = started.elapsed().as_millis() as u64;
+                return out;
+            }
+        };
+    }
+
+    match req.send().await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            out.status = Some(status);
+            out.ok = resp.status().is_success();
+            if !out.ok {
+                let text = resp.text().await.unwrap_or_default();
+                let mut short: String = text.chars().take(300).collect();
+                // The scrubber sees what the upstream wrote before the page does.
+                if let Some(clean) = state.scrubber().substitute(short.as_bytes())
+                    && let Ok(s) = String::from_utf8(clean)
+                {
+                    short = s;
+                }
+                out.detail = (!short.is_empty()).then_some(short);
+            }
+        }
+        Err(e) => {
+            // The error chain, not the display: reqwest's top line is `error
+            // sending request` and the reason lives one `source()` down.
+            let mut parts = vec![e.to_string()];
+            let mut src = std::error::Error::source(&e);
+            while let Some(s) = src {
+                parts.push(s.to_string());
+                src = s.source();
+            }
+            out.detail = Some(parts.join(": "));
+        }
+    }
+    out.ms = started.elapsed().as_millis() as u64;
+    out
+}
+
+/// Try every configured provider's credential against its real upstream, all at
+/// once, and say which ones no longer work. POST rather than GET: each probe
+/// spends real (tiny) money upstream, so nothing should trigger one by
+/// prefetching a URL.
+pub async fn probe(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Some(r) = denied(&state, &headers) {
+        return r;
+    }
+    let live = state.config();
+
+    let jobs = live.providers.iter().map(|(name, p)| {
+        // The first route pointing here decides which model the probe asks for,
+        // exactly as a real call through that route would.
+        let route = live
+            .routes
+            .iter()
+            .find(|(_, r)| &r.provider == name)
+            .map(|(rn, r)| (rn.clone(), r.model.clone().unwrap_or_else(|| rn.clone())));
+        probe_one(&state, name, p, route)
+    });
+
+    let results = futures_util::future::join_all(jobs).await;
+    Json(serde_json::json!({ "probes": results })).into_response()
+}
+
 /// The access requests agents have filed, newest first. `?status=pending` is
 /// what the approval screen polls.
 pub async fn grants(

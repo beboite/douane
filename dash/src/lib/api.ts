@@ -126,6 +126,19 @@ export type ClientView = {
 	note: string | null;
 };
 
+/** One provider's answer to "does your key still open the door". A real
+ *  one-token call with the real credential, so `ok` means the key works today,
+ *  not that one is configured. */
+export type Probe = {
+	provider: string;
+	route: string | null;
+	model: string | null;
+	ok: boolean;
+	status: number | null;
+	ms: number;
+	detail: string | null;
+};
+
 export type ConfigView = {
 	providers: ProviderView[];
 	routes: RouteView[];
@@ -210,6 +223,9 @@ export const api = {
 	alerts: (token: string, limit = 200) => request<Alert[]>(token, `/alerts?limit=${limit}`),
 
 	config: (token: string) => request<ConfigView>(token, '/config'),
+
+	/** POST on purpose: each probe spends a (tiny) real call per provider. */
+	probe: (token: string) => request<{ probes: Probe[] }>(token, '/providers/probe', { method: 'POST' }),
 
 	grants: (token: string, status?: string, limit = 200) => {
 		const q = new URLSearchParams({ limit: String(limit) });

@@ -56,6 +56,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             delete(dash::delete_secret),
         )
         .route("/admin/api/config", get(dash::config))
+        // POST on purpose: a probe sends one real, paid call per provider.
+        .route("/admin/api/providers/probe", post(dash::probe))
         .route("/admin/api/routes/{name}", put(dash::set_route))
         .route("/admin/api/routes/{name}", delete(dash::clear_route))
         .route("/admin/api/grants", get(dash::grants))

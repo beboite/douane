@@ -1761,3 +1761,126 @@ async fn no_mcp_surface_hands_a_value_back() {
     }
     assert!(text.contains("proxy"), "the names are the point: {text}");
 }
+
+#[tokio::test]
+async fn the_key_check_tells_a_dead_key_from_a_live_one() {
+    // Two providers, two keys, one of which the upstream no longer accepts.
+    // The dashboard's question is exactly this: which of my keys still work.
+    let (live_url, live_up) = Upstream::spawn(Behaviour::Json).await;
+    let (dead_url, _dead_up) = Upstream::spawn(Behaviour::Status(401)).await;
+    let b = broker(
+        vec![
+            ("primary", &live_url, Trust::Low),
+            ("backup", &dead_url, Trust::Low),
+        ],
+        vec![
+            ("haiku", "primary", Some("deepseek-chat"), vec![]),
+            ("opus", "backup", None, vec![]),
+        ],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+    )
+    .await;
+
+    // The door is shut without the admin token: a probe spends money.
+    let bare = reqwest::Client::new()
+        .post(format!("{}/admin/api/providers/probe", b.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bare.status(), 401);
+
+    let res = reqwest::Client::new()
+        .post(format!("{}/admin/api/providers/probe", b.url))
+        .header("x-douane-admin", "admin-token-for-the-dashboard")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let answer: serde_json::Value = res.json().await.unwrap();
+    let probes = answer["probes"].as_array().unwrap();
+    assert_eq!(probes.len(), 2);
+
+    let by_name = |n: &str| {
+        probes
+            .iter()
+            .find(|p| p["provider"] == n)
+            .unwrap_or_else(|| panic!("no probe for {n}"))
+    };
+    let live = by_name("primary");
+    assert_eq!(live["ok"], true);
+    assert_eq!(live["status"], 200);
+    assert_eq!(live["model"], "deepseek-chat", "the route's model, as a real call would send");
+
+    let dead = by_name("backup");
+    assert_eq!(dead["ok"], false);
+    assert_eq!(dead["status"], 401);
+
+    // The probe went out with the provider's real credential and one token,
+    // exactly like traffic and nothing like a listing.
+    let seen = live_up.last();
+    assert_eq!(seen.api_key.as_deref(), Some("sk-real-primary-key-value"));
+    assert_eq!(seen.body["max_tokens"], 1);
+    assert_eq!(seen.body["model"], "deepseek-chat");
+}
+
+#[tokio::test]
+async fn the_key_check_speaks_each_providers_own_dialect() {
+    // A provider douane translates for must be probed in the shape it sells,
+    // or every probe of it would read as a dead key.
+    let (url, up) = Upstream::spawn(Behaviour::OpenaiJson).await;
+    let b = broker_with(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", None, vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+        |c| {
+            c.providers.get_mut("primary").unwrap().wire = douane::wire::Wire::Openai;
+        },
+    )
+    .await;
+
+    let res = reqwest::Client::new()
+        .post(format!("{}/admin/api/providers/probe", b.url))
+        .header("x-douane-admin", "admin-token-for-the-dashboard")
+        .send()
+        .await
+        .unwrap();
+    let answer: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(answer["probes"][0]["ok"], true);
+
+    // It landed on the OpenAI path, in the OpenAI shape.
+    let seen = up.last();
+    assert_eq!(seen.body["max_tokens"], 1);
+    assert!(seen.body.get("messages").is_some());
+}
+
+#[tokio::test]
+async fn a_failing_probe_reports_the_upstreams_words_but_never_a_value() {
+    // An upstream whose error page echoes the credential back is exactly the
+    // page the dashboard must not display verbatim.
+    let (url, _up) = Upstream::spawn(Behaviour::Status(401)).await;
+    let b = broker(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", None, vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+    )
+    .await;
+
+    let res = reqwest::Client::new()
+        .post(format!("{}/admin/api/providers/probe", b.url))
+        .header("x-douane-admin", "admin-token-for-the-dashboard")
+        .send()
+        .await
+        .unwrap();
+    let answer: serde_json::Value = res.json().await.unwrap();
+    let text = answer.to_string();
+    for (_, value) in secrets() {
+        assert!(!text.contains(value), "the probe answer carried {value}");
+    }
+    assert_eq!(answer["probes"][0]["status"], 401);
+}
