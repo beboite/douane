@@ -330,6 +330,103 @@ fn tasks_get(state: &Arc<AppState>, client: &str, params: &Value, id: Value) -> 
     rpc_result(id, json!({ "task": task }))
 }
 
+/// Redeem an approved grant: `POST /agent/api/use` with the virtual key and
+/// `{"reference": "ns.key"}`.
+///
+/// **This is the one surface in douane that answers with a value**, and it is
+/// the deliberate, load-bearing exception to the no-read rule. What makes it
+/// tolerable where every other read surface is banned: the value only moves
+/// after a human approved this client for this reference, only until the
+/// approval expires, only to the client that asked, and every redemption is
+/// stamped on the grant. The caller is `douanectl use`, a local process that
+/// puts the value in a child's environment; the value never enters a model's
+/// context on this path, which is the property the whole design defends.
+pub async fn redeem(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let config = state.config();
+    let Some(presented) = crate::proxy::presented_key(&headers) else {
+        return (StatusCode::UNAUTHORIZED, "no virtual key presented").into_response();
+    };
+    let Some((client_name, _)) = state.authenticate(&config, &presented) else {
+        return (StatusCode::UNAUTHORIZED, "unknown virtual key").into_response();
+    };
+    let client = client_name.clone();
+
+    let reference = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|v| v.get("reference").and_then(Value::as_str).map(str::to_owned));
+    let Some(reference) = reference else {
+        return crate::proxy::json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "the body is `{\"reference\": \"namespace.key\"}`",
+        );
+    };
+    let Ok(r) = douane_vault::SecretRef::parse(&reference) else {
+        return crate::proxy::json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "a reference is `namespace.key`",
+        );
+    };
+
+    use crate::audit::Redeem;
+    match state.audit.grant_redeem(&client, &reference) {
+        Ok(Redeem::Approved(g)) => {
+            let Some(secret) = state.secret(&r) else {
+                // Approved, then deleted from the vault: the approval outlived
+                // the thing it approved.
+                return crate::proxy::json_error(
+                    StatusCode::GONE,
+                    "not_found_error",
+                    "the entry behind that approval is no longer in the vault",
+                );
+            };
+            tracing::info!(client, reference, "an approved credential was redeemed");
+            axum::Json(json!({
+                "reference": reference,
+                "value": secret.expose(),
+                "expires_at": g.expires_at,
+            }))
+            .into_response()
+        }
+        Ok(Redeem::Pending) => crate::proxy::json_error(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            "still waiting on the owner: poll tasks/get rather than this endpoint",
+        ),
+        Ok(Redeem::Denied(note)) => crate::proxy::json_error(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            &format!(
+                "the owner said no{}",
+                note.map(|n| format!(": {n}")).unwrap_or_default()
+            ),
+        ),
+        Ok(Redeem::Expired) => crate::proxy::json_error(
+            StatusCode::GONE,
+            "permission_error",
+            "that approval has lapsed: file a new credential_request",
+        ),
+        Ok(Redeem::NoRequest) => crate::proxy::json_error(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            "no grant of yours on that reference: file a credential_request first",
+        ),
+        Err(e) => {
+            tracing::error!("redeem lookup failed: {e}");
+            crate::proxy::json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "the request log could not be read",
+            )
+        }
+    }
+}
+
 /// One line to the owner's phone, best effort. Failure is logged and swallowed:
 /// a notification channel that can fail a request is a denial-of-service on
 /// the thing it announces.

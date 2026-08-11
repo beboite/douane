@@ -74,6 +74,28 @@ enum Command {
         overwrite: bool,
     },
 
+    /// Run a command with an approved credential in its environment.
+    ///
+    /// The value comes from the broker, not from a local vault: it moves only
+    /// after the owner approved this machine's request for it, only until that
+    /// approval lapses, and it lands in the child process's environment, never
+    /// in `argv` and never on stdout. The variable is named after the
+    /// reference: `proxy.password` becomes `DOUANE_PROXY_PASSWORD`.
+    Use {
+        /// `namespace.key`, the reference an approved grant covers.
+        reference: String,
+        /// Broker base URL. Defaults to `$DOUANE_BROKER`.
+        #[arg(long)]
+        broker: Option<String>,
+        /// File holding this machine's virtual key. Defaults to
+        /// `$DOUANE_VK_FILE`, then to the `$DOUANE_VK` value itself.
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+        /// The command to run, after `--`.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+
     /// The egress broker's certificate authority.
     #[command(subcommand)]
     Ca(CaCommand),
@@ -103,6 +125,20 @@ enum CaCommand {
     },
 }
 
+/// This machine's virtual key: from the named file, from `$DOUANE_VK_FILE`,
+/// or from `$DOUANE_VK` directly. A file beats an environment variable and
+/// both beat `argv`, which is why there is no `--key <value>` flag.
+fn virtual_key(key_file: Option<PathBuf>) -> Result<String> {
+    if let Some(path) = key_file.or_else(|| std::env::var("DOUANE_VK_FILE").ok().map(PathBuf::from))
+    {
+        let key = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading the virtual key from {}", path.display()))?;
+        return Ok(key.trim().to_owned());
+    }
+    std::env::var("DOUANE_VK")
+        .context("no virtual key: pass --key-file, or set DOUANE_VK_FILE or DOUANE_VK")
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let path = vault_path(cli.vault)?;
@@ -114,6 +150,57 @@ fn main() -> Result<()> {
             let r = SecretRef::parse(&reference).map_err(anyhow::Error::from)?;
             println!("{}", r.placeholder());
             return Ok(());
+        }
+        Command::Use {
+            reference,
+            broker,
+            key_file,
+            command,
+        } => {
+            // No vault and no passphrase on this path: the machine running an
+            // agent holds a virtual key and nothing else, which is the point.
+            let r = SecretRef::parse(&reference).map_err(anyhow::Error::from)?;
+            let broker = broker
+                .or_else(|| std::env::var("DOUANE_BROKER").ok())
+                .context("no broker address: pass --broker or set DOUANE_BROKER")?;
+            let key = virtual_key(key_file)?;
+
+            let url = format!("{}/agent/api/use", broker.trim_end_matches('/'));
+            let value = match ureq::post(&url)
+                .set("x-api-key", &key)
+                .send_json(serde_json::json!({ "reference": reference }))
+            {
+                Ok(res) => res
+                    .into_json::<serde_json::Value>()?
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .context("the broker's answer carries no value")?
+                    .to_owned(),
+                Err(ureq::Error::Status(code, res)) => {
+                    let why = res
+                        .into_json::<serde_json::Value>()
+                        .ok()
+                        .and_then(|v| {
+                            v.pointer("/error/message").and_then(|m| m.as_str()).map(str::to_owned)
+                        })
+                        .unwrap_or_else(|| format!("HTTP {code}"));
+                    bail!("the broker refused: {why}");
+                }
+                Err(e) => bail!("cannot reach the broker at {url}: {e}"),
+            };
+
+            // `__DOUANE_PROXY_PASSWORD__` minus the underscores is a name a
+            // shell can address, and it is the same name the placeholder
+            // teaches, so nothing new to learn.
+            let var = r.placeholder().trim_matches('_').to_owned();
+            eprintln!("{r} is in the child's environment as ${var}, and nowhere else");
+
+            let status = std::process::Command::new(&command[0])
+                .args(&command[1..])
+                .env(&var, &value)
+                .status()
+                .with_context(|| format!("running `{}`", command[0]))?;
+            std::process::exit(status.code().unwrap_or(1));
         }
         Command::Init => {
             if let Some(parent) = path.parent() {

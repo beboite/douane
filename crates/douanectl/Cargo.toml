@@ -21,6 +21,9 @@ serde_json.workspace = true
 time.workspace = true
 
 rpassword = "7"
+# For `use`, the grant redemption call. Synchronous and small on purpose: this
+# binary talks to one broker on the LAN and has no business carrying tokio.
+ureq = { version = "2", features = ["json"] }
 
 [dev-dependencies]
 tempfile = "3"

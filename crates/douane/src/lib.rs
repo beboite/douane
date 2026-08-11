@@ -34,6 +34,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         // Stateless MCP: one POST per request, no session, Tasks for anything
         // that waits on a human. Guarded by the same virtual keys as the relay.
         .route("/mcp", post(mcp::endpoint))
+        // The redemption path: the one surface that answers with a value,
+        // gated on a human approval. See `mcp::redeem` for why it exists.
+        .route("/agent/api/use", post(mcp::redeem))
         .route("/admin", get(dash::page))
         .route("/admin/", get(dash::page))
         // The compiled bundle. Every asset SvelteKit emits lives under `_app`,

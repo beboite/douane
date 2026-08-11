@@ -1500,6 +1500,92 @@ async fn a_filed_request_rings_the_owners_bell() {
 }
 
 #[tokio::test]
+async fn redemption_hands_the_value_to_the_approved_client_and_nobody_else() {
+    // The one surface that answers with a value, and everything that gates it.
+    let (url, _up) = Upstream::spawn(Behaviour::Json).await;
+    let b = broker(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", None, vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+    )
+    .await;
+    let http = reqwest::Client::new();
+    let redeem = |key: &'static str, reference: &'static str| {
+        http.post(format!("{}/agent/api/use", b.url))
+            .header("x-api-key", key)
+            .json(&serde_json::json!({ "reference": reference }))
+            .send()
+    };
+
+    // No key, no door.
+    let bare = http
+        .post(format!("{}/agent/api/use", b.url))
+        .json(&serde_json::json!({ "reference": "proxy.password" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bare.status(), 401);
+
+    // No request filed: nothing to redeem.
+    let res = redeem("vk-the-virtual-one", "proxy.password").await.unwrap();
+    assert_eq!(res.status(), 404);
+
+    // Filed but pending: still no.
+    mcp(
+        &b,
+        "vk-the-virtual-one",
+        "tools/call",
+        serde_json::json!({"name": "credential_request", "arguments": {
+            "reference": "proxy.password", "reason": "the job needs the proxy"
+        }}),
+    )
+    .await;
+    let res = redeem("vk-the-virtual-one", "proxy.password").await.unwrap();
+    assert_eq!(res.status(), 403);
+    let text = res.text().await.unwrap();
+    assert!(text.contains("waiting"), "{text}");
+    assert!(!text.contains("Tr0ub4dor"), "{text}");
+
+    // Approved: the value comes back, to this client, on this path only.
+    let id = b.state.audit.grants(Some("pending"), 10).unwrap()[0].id;
+    decide(&b, id, serde_json::json!({"approve": true, "ttl_hours": 2})).await;
+    let res = redeem("vk-the-virtual-one", "proxy.password").await.unwrap();
+    assert_eq!(res.status(), 200);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["value"], "Tr0ub4dor-and-3-more");
+    assert!(body["expires_at"].as_str().is_some());
+
+    // The grant remembers it was used.
+    let g = b.state.audit.grant_by_id(id).unwrap().unwrap();
+    assert!(g.used_at.is_some());
+
+    // A denial reads as the owner's word, not as a broken server.
+    mcp(
+        &b,
+        "vk-the-virtual-one",
+        "tools/call",
+        serde_json::json!({"name": "credential_request", "arguments": {
+            "reference": "backup.api_key", "reason": "reaching the backup myself"
+        }}),
+    )
+    .await;
+    let id = b.state.audit.grants(Some("pending"), 10).unwrap()[0].id;
+    decide(
+        &b,
+        id,
+        serde_json::json!({"approve": false, "note": "use the relay"}),
+    )
+    .await;
+    let res = redeem("vk-the-virtual-one", "backup.api_key").await.unwrap();
+    assert_eq!(res.status(), 403);
+    let text = res.text().await.unwrap();
+    assert!(text.contains("use the relay"), "{text}");
+    assert!(!text.contains("sk-real-backup-key-value"), "{text}");
+}
+
+#[tokio::test]
 async fn no_mcp_surface_hands_a_value_back() {
     let (url, _up) = Upstream::spawn(Behaviour::Json).await;
     let b = broker(

@@ -351,6 +351,47 @@ impl Audit {
         Ok(n > 0)
     }
 
+    /// Redeem an approval: the one moment a value is allowed to travel, and
+    /// the caller of this method is what gates it. Finds the newest grant this
+    /// client holds on this reference and says exactly where it stands, so the
+    /// refusal an agent reads names the actual obstacle rather than a generic
+    /// no. A hit stamps `used_at`; an approval stays redeemable until it
+    /// expires, because the value is out after the first read anyway and a
+    /// retry loop that needs a fresh human approval per attempt teaches people
+    /// to approve without reading.
+    pub fn grant_redeem(&self, client: &str, reference: &str) -> rusqlite::Result<Redeem> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "{GRANT_SELECT} WHERE client = ?1 AND reference = ?2 ORDER BY id DESC LIMIT 1"
+        ))?;
+        let mut rows = stmt.query_map([client, reference], grant_row)?;
+        let Some(g) = rows.next().transpose()? else {
+            return Ok(Redeem::NoRequest);
+        };
+        drop(rows);
+        drop(stmt);
+        Ok(match g.status.as_str() {
+            "pending" => Redeem::Pending,
+            "denied" => Redeem::Denied(g.note),
+            "cancelled" => Redeem::NoRequest,
+            "approved" => {
+                // RFC 3339 in fixed-width UTC compares correctly as a string,
+                // the same property `summary` relies on.
+                let live = g.expires_at.as_deref().is_some_and(|e| e > now().as_str());
+                if live {
+                    conn.execute(
+                        "UPDATE grants SET used_at = ?2 WHERE id = ?1",
+                        rusqlite::params![g.id, now()],
+                    )?;
+                    Redeem::Approved(g)
+                } else {
+                    Redeem::Expired
+                }
+            }
+            _ => Redeem::NoRequest,
+        })
+    }
+
     /// An agent withdrawing its own request. Only a pending one can go.
     pub fn grant_cancel(&self, task_id: &str, client: &str) -> rusqlite::Result<bool> {
         let n = self.lock().execute(
@@ -681,6 +722,17 @@ pub struct Grant {
     pub decided_at: Option<String>,
     pub expires_at: Option<String>,
     pub used_at: Option<String>,
+}
+
+/// Where a redemption attempt stands. Only `Approved` carries anything, and
+/// what it carries is still just the grant row: names and timestamps.
+#[derive(Debug)]
+pub enum Redeem {
+    NoRequest,
+    Pending,
+    Denied(Option<String>),
+    Expired,
+    Approved(Grant),
 }
 
 const GRANT_SELECT: &str = "SELECT id, task_id, at, client, reference, reason, status, note, \
@@ -1034,6 +1086,61 @@ mod tests {
         assert!(a.clear_override("haiku").unwrap());
         assert!(!a.clear_override("haiku").unwrap());
         assert!(a.overrides().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_grant_is_redeemable_between_approval_and_expiry_and_not_otherwise() {
+        let a = Audit::in_memory().unwrap();
+        a.grant_create("task_1", "test", "proxy.password", "why")
+            .unwrap();
+
+        // Pending is pending, and another client has no request at all.
+        assert!(matches!(
+            a.grant_redeem("test", "proxy.password").unwrap(),
+            Redeem::Pending
+        ));
+        assert!(matches!(
+            a.grant_redeem("other", "proxy.password").unwrap(),
+            Redeem::NoRequest
+        ));
+
+        let id = a.grants(None, 10).unwrap()[0].id;
+        a.grant_decide(id, true, None, Some("2999-01-01T00:00:00Z"))
+            .unwrap();
+        assert!(matches!(
+            a.grant_redeem("test", "proxy.password").unwrap(),
+            Redeem::Approved(_)
+        ));
+        // The redemption is stamped, and does not consume the approval: it
+        // stays redeemable until it lapses.
+        assert!(a.grant_by_id(id).unwrap().unwrap().used_at.is_some());
+        assert!(matches!(
+            a.grant_redeem("test", "proxy.password").unwrap(),
+            Redeem::Approved(_)
+        ));
+
+        // An approval whose clock has run out is an approval no longer.
+        a.grant_create("task_2", "test", "backup.api_key", "why")
+            .unwrap();
+        let id2 = a.grants(Some("pending"), 10).unwrap()[0].id;
+        a.grant_decide(id2, true, None, Some("2000-01-01T00:00:00Z"))
+            .unwrap();
+        assert!(matches!(
+            a.grant_redeem("test", "backup.api_key").unwrap(),
+            Redeem::Expired
+        ));
+
+        // A denial answers with the owner's note, and deciding what was
+        // already decided changes nothing.
+        a.grant_create("task_3", "test", "proxy.username", "why")
+            .unwrap();
+        let id3 = a.grants(Some("pending"), 10).unwrap()[0].id;
+        assert!(a.grant_decide(id3, false, Some("not tonight"), None).unwrap());
+        assert!(!a.grant_decide(id3, true, None, None).unwrap());
+        assert!(matches!(
+            a.grant_redeem("test", "proxy.username").unwrap(),
+            Redeem::Denied(Some(n)) if n == "not tonight"
+        ));
     }
 
     #[test]
