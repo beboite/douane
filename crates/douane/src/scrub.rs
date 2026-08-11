@@ -104,6 +104,30 @@ impl Scrubber {
         self.known.len()
     }
 
+    /// The body with every watched vault value rewritten to its placeholder.
+    ///
+    /// `None` when there is nothing to rewrite, so the caller keeps the
+    /// original bytes and the byte-for-byte forwarding path stays exactly what
+    /// it was for a clean body. Values are replaced longest first, the order
+    /// `known` is already in, so a credential that contains another is
+    /// rewritten once, under the longer name.
+    ///
+    /// This is the one place a value is used to *produce* outgoing text, and
+    /// what it produces is the placeholder, never the value.
+    pub fn substitute(&self, body: &[u8]) -> Option<Vec<u8>> {
+        let text = std::str::from_utf8(body).ok()?;
+        if !self.known.iter().any(|(_, v)| text.contains(v.as_str())) {
+            return None;
+        }
+        let mut out = text.to_owned();
+        for (r, value) in &self.known {
+            if out.contains(value.as_str()) {
+                out = out.replace(value.as_str(), &r.placeholder());
+            }
+        }
+        Some(out.into_bytes())
+    }
+
     /// Look at a body about to leave for a provider of the given trust level.
     ///
     /// Returns every hit found and the strongest action any of them calls for.
@@ -322,6 +346,23 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].label, "proxy.password");
         assert_eq!(hits[0].kind, "vault");
+    }
+
+    #[test]
+    fn substitution_renames_the_value_and_nothing_else() {
+        let s = scrubber();
+        let body = br#"{"content":"the password is Tr0ub4dor-and-3-more ok"}"#;
+        let text = String::from_utf8(s.substitute(body).unwrap()).unwrap();
+        assert!(!text.contains("Tr0ub4dor-and-3-more"));
+        assert!(text.contains("__DOUANE_PROXY_PASSWORD__"));
+        assert!(
+            text.contains(r#"{"content":"the password is "#),
+            "the rest of the body travels as written: {text}"
+        );
+
+        // A clean body is not copied at all: `None` keeps the original bytes on
+        // the byte-for-byte path.
+        assert!(s.substitute(b"nothing secret in here").is_none());
     }
 
     #[test]

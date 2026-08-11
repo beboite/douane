@@ -180,6 +180,13 @@ pub enum Action {
     Allow,
     /// Let it through, record an alert. The dashboard is where it surfaces.
     Warn,
+    /// Let it through with every vault value rewritten to its placeholder.
+    /// The provider reads `__DOUANE_PROXY_PASSWORD__` where the credential
+    /// was, the conversation stays usable, and the alert says what was hidden.
+    /// Sits above `Warn` because it modifies what leaves, and below `Block`
+    /// because something still leaves: one blocking hit outranks any number of
+    /// substitutions.
+    Substitute,
     /// Refuse the request. The agent gets a 403 naming what was found, never
     /// the text that was found.
     Block,
@@ -283,6 +290,11 @@ pub enum ConfigError {
     UnknownRoute { client: String, route: String },
     #[error("route `{0}` falls back to itself")]
     SelfFallback(String),
+    #[error(
+        "scrub.shape_hit.{0} is `substitute`, but a shape hit has no vault value \
+         to substitute: use `warn` or `block`"
+    )]
+    ShapeSubstitute(&'static str),
     #[error("{0}")]
     Egress(String),
 }
@@ -328,6 +340,18 @@ impl Config {
                         route: r.clone(),
                     });
                 }
+            }
+        }
+        // Substituting needs a value to substitute *with*. A shape hit is a
+        // pattern match on text douane does not hold, so there is nothing to
+        // write in its place and the config is asking for the impossible.
+        for (level, action) in [
+            ("low", self.scrub.shape_hit.low),
+            ("mid", self.scrub.shape_hit.mid),
+            ("max", self.scrub.shape_hit.max),
+        ] {
+            if action == Action::Substitute {
+                return Err(ConfigError::ShapeSubstitute(level));
             }
         }
         // Reported all at once rather than one per run: a rule file is edited
@@ -533,6 +557,28 @@ max_trust = "max"
         // Combining verdicts takes the strongest.
         assert_eq!(Action::Warn.max(Action::Block), Action::Block);
         assert_eq!(Action::Allow.max(Action::Warn), Action::Warn);
+    }
+
+    #[test]
+    fn substitute_sits_between_warn_and_block() {
+        // It modifies what leaves, so it outranks a warning; something still
+        // leaves, so one blocking hit outranks any number of substitutions.
+        assert!(Action::Warn < Action::Substitute);
+        assert!(Action::Substitute < Action::Block);
+        assert_eq!(Action::Substitute.max(Action::Block), Action::Block);
+        assert_eq!(Action::Warn.max(Action::Substitute), Action::Substitute);
+    }
+
+    #[test]
+    fn a_shape_hit_cannot_ask_for_substitution() {
+        // A shape hit is a pattern match on text douane does not hold, so
+        // there is no value to substitute with and the config is nonsense.
+        let mut c = sample();
+        c.scrub.shape_hit.low = Action::Substitute;
+        assert!(matches!(
+            c.validate(),
+            Err(ConfigError::ShapeSubstitute("low"))
+        ));
     }
 
     #[test]

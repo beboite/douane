@@ -108,10 +108,15 @@ enabled = true
 #   "off"        vault values only.
 shapes = "vendor"
 
-# A value that is verbatim in the vault. No false positive is possible, so this
-# blocks anywhere it would leave the house. `max` allows because nothing leaves
-# the LAN there, so there is nothing to protect it from.
-vault_hit = { low = "block", mid = "block", max = "allow" }
+# A value that is verbatim in the vault. No false positive is possible.
+#   "block"       refuse the request, nothing leaves.
+#   "substitute"  forward it with the value rewritten to its placeholder
+#                 (`__DOUANE_PROXY_PASSWORD__`): the conversation keeps
+#                 working and the provider reads a name instead of a secret.
+#   "allow"       for `max` only, where nothing leaves the LAN.
+# `substitute` is the net, `block` is the wall. Blocking is the safer default;
+# substituting is what lets a session survive a pasted credential.
+vault_hit = { low = "substitute", mid = "substitute", max = "allow" }
 
 # Something that merely looks like a credential. Warns, because blocking a
 # coding agent over a fixture is its own kind of damage. Move `low` to "block"

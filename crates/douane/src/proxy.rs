@@ -10,13 +10,17 @@
 //! wire feature Anthropic ships (signed thinking blocks, cache breakpoints, the
 //! exact SSE event order), and getting one of them subtly wrong produces bugs
 //! that look like model misbehaviour. So: read the few fields needed to route,
-//! forward the rest untouched.
+//! forward the rest untouched. Two exceptions, both deliberate: `model` is
+//! rewritten to whatever the route says, and a verdict of
+//! [`Action::Substitute`] rewrites vault values into their placeholders, which
+//! is the point of that verdict.
 //!
-//! **Placeholders are never substituted here.** `__DOUANE_NS_KEY__` exists so an
-//! agent can carry a credential's name through a conversation; expanding one on
-//! the way to a provider would hand that provider the value, which is the exact
-//! thing this program is built to prevent. A placeholder in an outgoing body is
-//! harmless and stays as it is.
+//! **Placeholders are never expanded here, in either direction.**
+//! `__DOUANE_NS_KEY__` exists so an agent can carry a credential's name through
+//! a conversation; expanding one on the way to a provider would hand that
+//! provider the value, which is the exact thing this program is built to
+//! prevent. The substitution above only ever turns a value *into* a
+//! placeholder, never the reverse.
 
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -367,7 +371,8 @@ pub async fn messages(
         }
 
         // 4. Look at what is about to leave, for this destination's trust level.
-        let (hits, verdict) = state.scrubber().inspect(&body, provider.trust);
+        let scrubber = state.scrubber();
+        let (hits, verdict) = scrubber.inspect(&body, provider.trust);
         for h in &hits {
             let _ = state.audit.alert(&NewAlert {
                 call_id: None,
@@ -378,6 +383,7 @@ pub async fn messages(
                 label: &h.label,
                 action: match verdict {
                     Action::Block => "block",
+                    Action::Substitute => "substitute",
                     Action::Warn => "warn",
                     Action::Allow => "allow",
                 },
@@ -407,6 +413,18 @@ pub async fn messages(
             );
         }
 
+        // The same scrubber snapshot that produced the verdict does the
+        // rewriting, so a vault write between the two cannot leave a value the
+        // verdict never saw. On any other verdict the original bytes travel.
+        let outgoing: std::borrow::Cow<'_, [u8]> = if verdict == Action::Substitute {
+            match scrubber.substitute(&body) {
+                Some(rewritten) => std::borrow::Cow::Owned(rewritten),
+                None => std::borrow::Cow::Borrowed(&body),
+            }
+        } else {
+            std::borrow::Cow::Borrowed(&body)
+        };
+
         let model_sent = route.model.as_deref().unwrap_or(&peeked.model).to_owned();
         let call_id = state
             .audit
@@ -420,14 +438,14 @@ pub async fn messages(
                 agent_fingerprint: peeked.agent_fingerprint.clone(),
                 thread_fingerprint: peeked.thread_fingerprint.clone(),
                 streamed: peeked.stream,
-                bytes_up: body.len(),
+                bytes_up: outgoing.len(),
             })
             .unwrap_or(-1);
 
         match forward(
             &state,
             provider,
-            &body,
+            &outgoing,
             &headers,
             &model_sent,
             peeked.stream,

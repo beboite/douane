@@ -461,6 +461,64 @@ async fn a_vault_value_never_leaves_for_a_reseller() {
 }
 
 #[tokio::test]
+async fn a_vault_value_is_substituted_rather_than_sent_when_asked() {
+    // The net instead of the wall: the request still goes out, but the
+    // credential reads as its placeholder by the time the reseller sees it.
+    // This covers a value pasted by the user exactly as much as one an agent
+    // copied out of a file, because by this point they are the same bytes.
+    let (url, up) = Upstream::spawn(Behaviour::Json).await;
+    let scrub = ScrubConfig {
+        vault_hit: douane::config::ByTrust {
+            low: douane::config::Action::Substitute,
+            mid: douane::config::Action::Substitute,
+            max: douane::config::Action::Allow,
+        },
+        ..ScrubConfig::default()
+    };
+    let b = broker(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", None, vec![])],
+        &secrets(),
+        scrub,
+        None,
+    )
+    .await;
+
+    let mut body = ask("haiku");
+    body["messages"][0]["content"] =
+        "here is my nas password, Tr0ub4dor-and-3-more, what do you think".into();
+
+    let res = call(&b, "vk-the-virtual-one", body).await;
+    assert_eq!(res.status(), 200);
+    assert_eq!(up.calls(), 1, "the request was forwarded, not refused");
+
+    let seen = up.last();
+    let content = seen.body["messages"][0]["content"].as_str().unwrap();
+    assert!(
+        !content.contains("Tr0ub4dor"),
+        "the value must not reach the upstream: {content}"
+    );
+    assert!(
+        content.contains("__DOUANE_PROXY_PASSWORD__"),
+        "the placeholder travels in its place: {content}"
+    );
+    assert!(
+        content.contains("here is my nas password"),
+        "and the rest of the sentence is untouched: {content}"
+    );
+
+    // The audit says what was hidden, names the reference, and never stores
+    // the value anywhere.
+    let alerts = b.state.audit.alerts(10).unwrap();
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(alerts[0].action, "substitute");
+    assert_eq!(alerts[0].label, "proxy.password");
+    assert_eq!(alerts[0].kind, "vault");
+    let json = serde_json::to_string(&alerts).unwrap();
+    assert!(!json.contains("Tr0ub4dor"));
+}
+
+#[tokio::test]
 async fn the_same_value_goes_through_to_a_local_model() {
     let (url, up) = Upstream::spawn(Behaviour::Json).await;
     let b = broker(
