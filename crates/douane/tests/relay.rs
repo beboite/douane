@@ -237,13 +237,6 @@ async fn broker_with(
                 bearer: false,
                 trust,
                 timeout_secs: 10,
-                pricing: Some(douane::config::Pricing {
-                    input_per_mtok: 1.0,
-                    output_per_mtok: 10.0,
-                    cache_read_per_mtok: 0.1,
-                    cache_write_per_mtok: 0.0,
-                    currency: None,
-                }),
             },
         );
     }
@@ -254,7 +247,6 @@ async fn broker_with(
                 provider: provider.to_owned(),
                 model: model.map(str::to_owned),
                 fallback: fallback.into_iter().map(str::to_owned).collect(),
-                pricing: None,
             },
         );
     }
@@ -546,7 +538,6 @@ async fn a_route_a_client_is_not_listed_for_says_so_when_nothing_else_serves() {
                     provider: "primary".to_owned(),
                     model: None,
                     fallback: Vec::new(),
-                    pricing: None,
                 },
             );
         },
@@ -602,7 +593,7 @@ async fn a_skip_a_fallback_covers_is_not_worth_an_alert() {
 }
 
 #[tokio::test]
-async fn a_buffered_answer_is_counted_and_priced() {
+async fn a_buffered_answer_is_counted() {
     let (url, _up) = Upstream::spawn(Behaviour::Json).await;
     let b = broker(
         vec![("primary", &url, Trust::Low)],
@@ -624,61 +615,12 @@ async fn a_buffered_answer_is_counted_and_priced() {
     assert_eq!(calls[0].input_tokens, Some(1000));
     assert_eq!(calls[0].output_tokens, Some(250));
     assert_eq!(calls[0].cache_read_tokens, Some(40));
-    // 1000 in at 1/Mtok, 250 out at 10/Mtok, 40 cached at 0.1/Mtok.
-    let cost = calls[0].cost.unwrap();
-    assert!((cost - (0.001 + 0.0025 + 0.000_004)).abs() < 1e-9, "{cost}");
     assert!(calls[0].bytes_down.unwrap() > 0);
-    assert_eq!(
-        calls[0].currency.as_deref(),
-        Some("USD"),
-        "the unit is recorded on the row, not looked up later"
-    );
-}
 
-#[tokio::test]
-async fn a_route_priced_in_another_currency_is_billed_and_totalled_in_it() {
-    // The real shape of this: one reseller quotes CNY per model, another quotes
-    // USD. A route's own rate has to win over the provider's, and the unit has
-    // to survive all the way into the summary without being converted or
-    // silently added to the other one.
-    let (url, _up) = Upstream::spawn(Behaviour::Json).await;
-    let b = broker_with(
-        vec![("primary", &url, Trust::Low)],
-        vec![("haiku", "primary", None, vec![])],
-        &secrets(),
-        ScrubConfig::default(),
-        None,
-        // Ten times the provider's rate, quoted in CNY.
-        |config| {
-            config.routes.get_mut("haiku").unwrap().pricing = Some(douane::config::Pricing {
-                input_per_mtok: 10.0,
-                output_per_mtok: 100.0,
-                cache_read_per_mtok: 1.0,
-                cache_write_per_mtok: 0.0,
-                currency: Some("CNY".into()),
-            });
-        },
-    )
-    .await;
-
-    let res = call(&b, "vk-the-virtual-one", ask("haiku")).await;
-    assert_eq!(res.status(), 200);
-    let _ = res.bytes().await.unwrap();
-
-    let calls = wait_for_finished(&b).await;
-    let cost = calls[0].cost.unwrap();
-    assert!(
-        (cost - (0.01 + 0.025 + 0.000_04)).abs() < 1e-9,
-        "the route's rate, not the provider's: {cost}"
-    );
-    assert_eq!(calls[0].currency.as_deref(), Some("CNY"));
-
+    // And the counts reach the summary, where the trust signals are read.
     let s = b.state.audit.summary("1970-01-01T00:00:00Z", 24).unwrap();
-    assert_eq!(s.totals.cost.keys().collect::<Vec<_>>(), ["CNY"]);
-    assert!(
-        !s.totals.cost.contains_key("USD"),
-        "nothing lands in the server default just because it is the default"
-    );
+    assert_eq!(s.totals.input_tokens, 1000);
+    assert_eq!(s.totals.cache_read_tokens, 40);
 }
 
 #[tokio::test]

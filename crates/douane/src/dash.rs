@@ -212,11 +212,7 @@ pub async fn summary(
         return r;
     }
     match state.audit.summary(&w.since(), w.hours()) {
-        Ok(s) => Json(serde_json::json!({
-            "currency": state.base.server.currency,
-            "summary": s,
-        }))
-        .into_response(),
+        Ok(s) => Json(serde_json::json!({ "summary": s })).into_response(),
         Err(e) => db_error(e),
     }
 }
@@ -449,7 +445,6 @@ struct ProviderView {
     trust: &'static str,
     /// Whether a credential is configured. Never which one, never its value.
     keyed: bool,
-    priced: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -464,10 +459,6 @@ struct RouteView {
     base_provider: String,
     base_model: Option<String>,
     overridden: bool,
-    /// The rate actually in force here, already resolved through route then
-    /// provider, as `in/out CUR` per million tokens. Null means this route is
-    /// unpriced and its calls will report tokens and no cost.
-    price: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -500,7 +491,6 @@ pub async fn config(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
             base_url: p.base_url.clone(),
             trust: trust_label(p.trust),
             keyed: p.key.is_some(),
-            priced: p.pricing.is_some(),
         })
         .collect();
 
@@ -509,20 +499,6 @@ pub async fn config(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
         .iter()
         .map(|(name, r)| {
             let base = &state.base.routes[name];
-            // Resolved the same way a real call resolves it, so what is shown
-            // here is what would actually be billed. A route pointed at a
-            // provider that does not exist is caught by `validate`, so the
-            // lookup below cannot be the thing that fails.
-            let price = live.providers.get(&r.provider).and_then(|p| {
-                let resolved =
-                    crate::proxy::Price::resolve(r.pricing.as_ref(), p, &live.server.currency);
-                resolved.pricing.map(|pr| {
-                    format!(
-                        "{}/{} {}",
-                        pr.input_per_mtok, pr.output_per_mtok, resolved.currency
-                    )
-                })
-            });
             RouteView {
                 name: name.clone(),
                 provider: r.provider.clone(),
@@ -531,7 +507,6 @@ pub async fn config(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
                 base_provider: base.provider.clone(),
                 base_model: base.model.clone(),
                 overridden: base.provider != r.provider || base.model != r.model,
-                price,
             }
         })
         .collect();
@@ -551,7 +526,6 @@ pub async fn config(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
         "providers": providers,
         "routes": routes,
         "clients": clients,
-        "currency": state.base.server.currency,
         "scrub": state.base.scrub,
         "watching": state.scrubber().watching(),
         "egress": {

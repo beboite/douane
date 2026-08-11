@@ -1,9 +1,11 @@
-//! Counting what a call actually cost.
+//! Counting what actually travelled.
 //!
-//! douane bills nobody, but it is the only place that sees both sides of every
-//! call. A reseller's invoice is otherwise unfalsifiable: it claims a number of
-//! tokens and there is no second record to hold it against. This module builds
-//! that second record.
+//! douane prices nothing: a reseller's price list is fiction, so any cost this
+//! program computed would be a precise number built on a made-up one. What it
+//! does keep is the token counts themselves, because they are trust signals. A
+//! cache-write count that dwarfs the reads says the upstream rewrites the whole
+//! context every few calls, which is what a pool rotating one client across
+//! accounts looks like, and no token total shows it.
 //!
 //! Two response shapes have to be handled. A buffered answer carries `usage` in
 //! the JSON body. A streamed one spreads it across two SSE events: input and
@@ -41,22 +43,6 @@ impl Usage {
 
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
-    }
-
-    /// What the call cost, given a price list. `None` when the provider has no
-    /// pricing configured, which is honest: an invented zero would show up in
-    /// the dashboard as a free provider.
-    pub fn cost(&self, p: &crate::config::Pricing) -> Option<f64> {
-        if self.is_empty() {
-            return None;
-        }
-        let per = |tokens: Option<u64>, rate: f64| tokens.unwrap_or(0) as f64 * rate / 1_000_000.0;
-        Some(
-            per(self.input_tokens, p.input_per_mtok)
-                + per(self.output_tokens, p.output_per_mtok)
-                + per(self.cache_read_tokens, p.cache_read_per_mtok)
-                + per(self.cache_write_tokens, p.cache_write_per_mtok),
-        )
     }
 }
 
@@ -242,25 +228,5 @@ mod tests {
         assert!(t.truncated);
         // The byte count is still exact: only the parse is given up on.
         assert_eq!(t.bytes, 5 * 1024 * 1024);
-    }
-
-    #[test]
-    fn cost_is_none_without_counts_and_priced_with_them() {
-        let p = crate::config::Pricing {
-            input_per_mtok: 3.0,
-            output_per_mtok: 15.0,
-            cache_read_per_mtok: 0.3,
-            cache_write_per_mtok: 3.75,
-            currency: None,
-        };
-        assert_eq!(Usage::default().cost(&p), None);
-
-        let u = Usage {
-            input_tokens: Some(1_000_000),
-            output_tokens: Some(1_000_000),
-            cache_read_tokens: None,
-            cache_write_tokens: None,
-        };
-        assert_eq!(u.cost(&p), Some(18.0));
     }
 }
