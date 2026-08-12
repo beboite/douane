@@ -21,16 +21,18 @@
 	const Icon = $derived(icon);
 </script>
 
-<div
-	class="text-muted-foreground flex flex-col items-center justify-center gap-2 text-center {tight
-		? 'py-8'
-		: 'py-14'}"
->
-	<div class="bg-sunken text-muted-foreground/70 flex size-9 items-center justify-center rounded-full">
-		<Icon class="size-4" />
+<!-- An empty register is drawn as an empty case on the form: a dashed frame,
+     nothing inside it, and one line saying why. -->
+<div class="p-4">
+	<div
+		class="border-border/80 text-muted-foreground flex flex-col items-center justify-center gap-2 rounded-md border border-dashed text-center {tight
+			? 'py-7'
+			: 'py-12'}"
+	>
+		<Icon class="text-muted-foreground/60 size-4" />
+		<p class="text-foreground/80 text-sm font-medium">{title}</p>
+		{#if hint}
+			<p class="max-w-xs text-xs leading-relaxed">{hint}</p>
+		{/if}
 	</div>
-	<p class="text-foreground/80 text-sm font-medium">{title}</p>
-	{#if hint}
-		<p class="max-w-xs text-xs leading-relaxed">{hint}</p>
-	{/if}
 </div>

@@ -112,36 +112,57 @@
 </script>
 
 <div class="space-y-4">
-	<div class="shadow-panel bg-card divide-border grid divide-y rounded-xl border sm:grid-cols-3 sm:divide-x sm:divide-y-0">
-		<Metric
-			label="valeurs surveillées"
-			value={watching}
-			format={count}
-			icon={Eye}
-			hint="reconnues dans tout ce qui part"
-		/>
-		<Metric
-			label="fuites arrêtées"
-			value={stopped}
-			format={count}
-			icon={stopped > 0 ? ShieldAlert : ShieldCheck}
-			tone={stopped > 0 ? 'warn' : 'quiet'}
-			hint={stopped > 0 ? 'bloquées ou réécrites avant de partir' : 'rien à arrêter pour le moment'}
-		/>
-		<Metric
-			label="demandes en attente"
-			value={pending.length}
-			format={count}
-			icon={HandCoins}
-			tone={pending.length > 0 ? 'accent' : 'quiet'}
-			hint={pending.length > 0 ? 'un agent attend votre décision' : 'aucun agent n’attend'}
-		/>
+	<!-- The verdict, stamped. The one thing this page exists to say, said the
+	     way this office says things: R.A.S. when every body left clean, the
+	     interception count in stamp ink when the net caught something. -->
+	<div
+		class="shadow-panel bg-card grid rounded-lg border sm:grid-cols-[minmax(15rem,1.2fr)_2fr]"
+	>
+		<div
+			class="border-border flex flex-col items-start justify-center gap-2.5 border-b px-5 py-6 sm:border-r sm:border-b-0"
+		>
+			{#key stopped}
+				<span class="stamp-hero {stopped > 0 ? 'text-primary' : 'text-trust-max'}">
+					{stopped > 0 ? `${count(stopped)} interception${stopped > 1 ? 's' : ''}` : 'R.A.S.'}
+				</span>
+			{/key}
+			<p class="text-muted-foreground text-xs leading-snug">
+				{stopped > 0
+					? 'des corps partants portaient une valeur du coffre, bloqués ou réécrits avant la sortie'
+					: 'aucun corps parti ne portait de valeur du coffre'}
+			</p>
+		</div>
+		<div class="divide-border grid divide-y sm:grid-cols-3 sm:divide-x sm:divide-y-0">
+			<Metric
+				label="valeurs surveillées"
+				value={watching}
+				format={count}
+				icon={Eye}
+				hint="reconnues dans tout ce qui part"
+			/>
+			<Metric
+				label="fuites arrêtées"
+				value={stopped}
+				format={count}
+				icon={stopped > 0 ? ShieldAlert : ShieldCheck}
+				tone={stopped > 0 ? 'warn' : 'quiet'}
+				hint={stopped > 0 ? 'bloquées ou réécrites avant de partir' : 'rien à arrêter'}
+			/>
+			<Metric
+				label="en attente"
+				value={pending.length}
+				format={count}
+				icon={HandCoins}
+				tone={pending.length > 0 ? 'accent' : 'quiet'}
+				hint={pending.length > 0 ? 'un agent attend votre décision' : 'aucun agent n’attend'}
+			/>
+		</div>
 	</div>
 
 	{#if pending.length > 0}
 		<Panel
 			title="Demandes d’accès"
-			note="un agent a demandé une clé par MCP et continue de travailler en attendant. Accorder livre le nom, jamais la valeur : elle ne se déplace que par la rédemption locale"
+			note="accorder livre le nom, jamais la valeur : elle ne bouge que par la rédemption locale"
 			flush
 		>
 			<ul class="divide-border divide-y">
@@ -219,7 +240,7 @@
 
 	<Panel
 		title="Registre des interceptions"
-		note="ce que douane a arrêté ou réécrit avant que ça parte. Chaque ligne nomme la référence ou le motif, jamais le texte trouvé : un registre plein d’identifiants serait pire que la fuite qu’il signale"
+		note="ce qui a été arrêté ou réécrit avant la sortie. Chaque ligne nomme la référence, jamais le texte trouvé"
 		flush
 		cap={alerts.length ? 'max-h-[30rem]' : ''}
 	>
@@ -289,47 +310,3 @@
 		</Panel>
 	{/if}
 </div>
-
-<style>
-	/* The customs stamp: one word, inked, slightly off the horizontal the way a
-	   hand stamp lands. The register is the signature of this page and the only
-	   place that earns the flourish. */
-	.stamp {
-		display: inline-block;
-		flex-shrink: 0;
-		width: 5.5rem;
-		text-align: center;
-		padding: 0.15rem 0.4rem;
-		border: 1.5px solid currentcolor;
-		border-radius: 0.25rem;
-		font-size: 0.62rem;
-		font-weight: 700;
-		letter-spacing: 0.09em;
-		text-transform: uppercase;
-		transform: rotate(-2deg);
-		opacity: 0.9;
-	}
-	.stamp-block {
-		color: var(--destructive);
-	}
-	.stamp-substitute {
-		color: var(--primary);
-	}
-	.stamp-warn {
-		color: var(--trust-mid);
-	}
-	.stamp-ok {
-		color: var(--trust-max);
-	}
-	.stamp-quiet {
-		color: var(--muted-foreground);
-		transform: none;
-		border-style: dashed;
-		border-width: 1px;
-	}
-	@media (prefers-reduced-motion: reduce) {
-		.stamp {
-			transform: none;
-		}
-	}
-</style>

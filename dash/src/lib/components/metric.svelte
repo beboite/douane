@@ -48,7 +48,7 @@
 	   a headline figure on two lines stops being a headline. */
 	const shown = $derived(text ?? format(counted.current));
 	const size = $derived(
-		shown.length > 22 ? 'text-lg' : shown.length > 14 ? 'text-xl' : 'text-[1.75rem]'
+		shown.length > 22 ? 'text-lg' : shown.length > 14 ? 'text-xl' : 'text-[1.6rem]'
 	);
 </script>
 
@@ -57,13 +57,11 @@
 		{#if Icon}
 			<Icon class="text-muted-foreground/70 size-3.5 shrink-0" />
 		{/if}
-		<span class="eyebrow truncate">{label}</span>
+		<!-- The label wraps rather than truncating: a figure whose name is cut
+		     off is a figure that cannot be trusted to mean what it seems to. -->
+		<span class="eyebrow">{label}</span>
 	</div>
-	<div
-		class="tabular mt-1.5 truncate leading-none font-semibold tracking-tight {size} {toneClass[
-			tone
-		]}"
-	>
+	<div class="ledger mt-1.5 truncate leading-none {size} {toneClass[tone]}">
 		{shown}
 	</div>
 	{#if hint}

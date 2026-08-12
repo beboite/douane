@@ -50,19 +50,26 @@
 <div class="space-y-4">
 	<Card.Root class="shadow-panel gap-0 overflow-hidden py-0">
 		<div class="px-2 pt-4 pb-2">
-			<div class="mb-2 flex items-center justify-between gap-3 px-2">
-				<div class="min-w-0">
-					<h2 class="text-sm font-semibold">Activité</h2>
-					<p class="text-muted-foreground text-xs">
-						{#if errors > 0}
-							<span class="text-trust-low font-medium">{count(errors)} en échec</span> sur
-							{count(totals?.calls ?? 0)} appels sur {window}
-						{:else}
-							{count(totals?.calls ?? 0)} appels, {tokens(
-								(totals?.input_tokens ?? 0) + (totals?.output_tokens ?? 0)
-							)} tokens sur {window}
-						{/if}
-					</p>
+			<div class="mb-2 flex items-end justify-between gap-3 px-2">
+				<!-- The window's totals as ledger figures rather than a sentence:
+				     three numbers side by side compare, a sentence has to be read. -->
+				<div class="flex min-w-0 items-baseline gap-5">
+					<div>
+						<div class="eyebrow">appels · {window}</div>
+						<div class="ledger mt-0.5 text-xl leading-none">{count(totals?.calls ?? 0)}</div>
+					</div>
+					<div>
+						<div class="eyebrow">tokens</div>
+						<div class="ledger text-muted-foreground mt-0.5 text-xl leading-none">
+							{tokens((totals?.input_tokens ?? 0) + (totals?.output_tokens ?? 0))}
+						</div>
+					</div>
+					{#if errors > 0}
+						<div>
+							<div class="eyebrow text-trust-low">en échec</div>
+							<div class="ledger text-trust-low mt-0.5 text-xl leading-none">{count(errors)}</div>
+						</div>
+					{/if}
 				</div>
 				<ToggleGroup.Root type="single" size="sm" bind:value={measure} class="shrink-0">
 					<ToggleGroup.Item value="calls" class="h-7 px-2.5 text-xs">appels</ToggleGroup.Item>
@@ -99,7 +106,7 @@
 
 	<Panel
 		title="Conversations"
-		note="regroupées par empreinte du fil, ce qui suit une session d’agent sans jamais en lire le contenu. Cliquer une ligne filtre le journal en dessous"
+		note="regroupées par empreinte du fil, sans jamais en lire le contenu. Cliquer une ligne filtre le journal"
 		flush
 		cap={threads.length ? 'max-h-[22rem]' : ''}
 	>
@@ -173,9 +180,8 @@
 					<Table.Row>
 						<Table.Head class="w-[6rem]">quand</Table.Head>
 						<Table.Head>client</Table.Head>
-						<Table.Head>demandé</Table.Head>
-						<Table.Head>parti chez</Table.Head>
-						<Table.Head>sous le nom</Table.Head>
+						<Table.Head>demandé · parti sous</Table.Head>
+						<Table.Head>chez</Table.Head>
 						<Table.Head class="text-right">entrée</Table.Head>
 						<Table.Head class="text-right">sortie</Table.Head>
 						<Table.Head class="text-right">cache écrit / lu</Table.Head>
@@ -190,16 +196,23 @@
 								{when(c.at)}
 							</Table.Cell>
 							<Table.Cell class="text-sm">{c.client}</Table.Cell>
-							<Table.Cell class="font-mono text-xs">{c.model_requested}</Table.Cell>
+							<!-- The two names of one call stacked in a single cell: what the
+							     agent asked for, and what actually crossed. Reading down the
+							     column shows every rename at once. -->
+							<Table.Cell class="font-mono text-xs">
+								<div>{c.model_requested}</div>
+								{#if c.model_sent !== c.model_requested || c.streamed}
+									<div class="text-muted-foreground mt-0.5">
+										{c.model_sent}
+										{#if c.streamed}<span class="ml-1 opacity-60">flux</span>{/if}
+									</div>
+								{/if}
+							</Table.Cell>
 							<Table.Cell>
 								<span class="flex items-center gap-2 text-sm">
 									{c.provider}
 									<TrustBadge trust={c.trust} />
 								</span>
-							</Table.Cell>
-							<Table.Cell class="text-muted-foreground font-mono text-xs">
-								{c.model_sent}
-								{#if c.streamed}<span class="ml-1 opacity-60">flux</span>{/if}
 							</Table.Cell>
 							<Table.Cell class="tabular text-muted-foreground text-right text-xs">
 								{tokens(c.input_tokens)}

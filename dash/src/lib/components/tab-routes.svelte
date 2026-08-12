@@ -142,16 +142,6 @@
 					</div>
 				{/each}
 			</div>
-			<div class="text-muted-foreground mt-4 flex items-baseline justify-between gap-4 border-t pt-3.5 text-xs">
-				<span>proxy de sortie</span>
-				<span>
-					{#if config?.egress.listening}
-						à l’écoute · {config.egress.rules} règles
-					{:else}
-						éteint
-					{/if}
-				</span>
-			</div>
 		</Panel>
 	</div>
 </div>
