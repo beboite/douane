@@ -1,7 +1,6 @@
 <script lang="ts">
 	import { fly } from 'svelte/transition';
 	import { cubicOut } from 'svelte/easing';
-	import { Badge } from '$lib/components/ui/badge';
 	import { Button } from '$lib/components/ui/button';
 	import * as Card from '$lib/components/ui/card';
 	import { Input } from '$lib/components/ui/input';
@@ -9,7 +8,9 @@
 	import * as Select from '$lib/components/ui/select';
 	import { Toaster } from '$lib/components/ui/sonner';
 	import Activity from '@lucide/svelte/icons/activity';
+	import Boxes from '@lucide/svelte/icons/boxes';
 	import KeyRound from '@lucide/svelte/icons/key-round';
+	import LogOut from '@lucide/svelte/icons/log-out';
 	import Moon from '@lucide/svelte/icons/moon';
 	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
 	import ShieldCheck from '@lucide/svelte/icons/shield-check';
@@ -17,6 +18,7 @@
 	import Sun from '@lucide/svelte/icons/sun';
 	import Vault from '@lucide/svelte/icons/vault';
 
+	import TabModels from '$lib/components/tab-models.svelte';
 	import TabProtection from '$lib/components/tab-protection.svelte';
 	import TabRoutes from '$lib/components/tab-routes.svelte';
 	import TabTraffic from '$lib/components/tab-traffic.svelte';
@@ -27,6 +29,7 @@
 		UNAUTHORIZED,
 		type Alert,
 		type Call,
+		type CatalogView,
 		type ConfigView,
 		type Grant,
 		type Summary,
@@ -50,6 +53,7 @@
 
 	let summary = $state<Summary | null>(null);
 	let config = $state<ConfigView | null>(null);
+	let catalog = $state<CatalogView | null>(null);
 	let vault = $state<VaultView | null>(null);
 	let calls = $state<Call[]>([]);
 	let threads = $state<Thread[]>([]);
@@ -63,25 +67,37 @@
 
 	const pending = $derived(grants.filter((g) => g.status === 'pending').length);
 	const repointed = $derived(config?.routes.filter((r) => r.overridden).length ?? 0);
+	const served = $derived(catalog?.models.filter((m) => m.enabled).length ?? 0);
 
-	/* Each screen names itself and says in one line what it answers. The line
-	   lives here, in the header, so the panels below can keep their titles
-	   short. */
+	/* What the barrier reads off: everything the broker did not simply wave
+	   through. A refusal and a substitution are both interceptions here, because
+	   both mean a credential was about to leave and did not. */
+	const stopped = $derived(
+		alerts.filter((a) => a.action === 'block' || a.action === 'substitute').length
+	);
+
+	/* Each screen names itself and says in one line what it answers, so the
+	   panels below can keep their titles short. */
 	const SCREENS: Record<string, { label: string; icon: typeof Activity; desc: string }> = {
 		protection: {
 			label: 'Protection',
 			icon: ShieldCheck,
-			desc: 'ce que le broker a arrêté avant que ça parte, et qui attend une décision'
+			desc: 'ce qui a été arrêté avant de sortir, et qui attend une décision'
 		},
 		trafic: {
 			label: 'Trafic',
 			icon: Activity,
-			desc: 'ce qui est passé par le guichet sur la fenêtre choisie'
+			desc: 'qui a appelé quoi, et ce que ça a consommé'
+		},
+		modeles: {
+			label: 'Modèles',
+			icon: Boxes,
+			desc: 'ce que chaque fournisseur vend, et ce que douane accepte de servir'
 		},
 		routes: {
-			label: 'Routes',
+			label: 'Routage',
 			icon: Signpost,
-			desc: 'qui reçoit vraiment chaque nom de modèle, et si les clés marchent encore'
+			desc: 'où part chaque nom de modèle, et si les clés marchent encore'
 		},
 		coffre: {
 			label: 'Coffre',
@@ -96,9 +112,10 @@
 		failure = '';
 		const h = Number(hours);
 		try {
-			const [s, c, v, k, t, a, g] = await Promise.all([
+			const [s, c, m, v, k, t, a, g] = await Promise.all([
 				api.summary(session.token, h),
 				api.config(session.token),
+				api.models(session.token),
 				api.vault(session.token),
 				api.calls(session.token, 200, { thread: thread ?? undefined }),
 				api.threads(session.token, h),
@@ -107,6 +124,7 @@
 			]);
 			summary = s.summary;
 			config = c;
+			catalog = m;
 			vault = v;
 			calls = k;
 			threads = t;
@@ -165,44 +183,64 @@
 
 <Toaster position="bottom-right" />
 
-<!-- The round stamp of the office, drawn once and used wherever the office
-     signs: the login page, and the corner of the rail. Two rings and the name
-     run around them, the way a customs seal is engraved. -->
-{#snippet seal(cls: string)}
-	<svg viewBox="0 0 200 200" class={cls} aria-hidden="true">
-		<defs>
-			<path id="seal-ring" d="M100,100 m-77,0 a77,77 0 1,1 154,0 a77,77 0 1,1 -154,0" />
-		</defs>
-		<circle cx="100" cy="100" r="94" fill="none" stroke="currentcolor" stroke-width="3" />
-		<circle cx="100" cy="100" r="60" fill="none" stroke="currentcolor" stroke-width="1.5" />
-		<text
-			fill="currentcolor"
-			font-family="IBM Plex Mono, monospace"
-			font-size="13.5"
-			font-weight="600"
-			letter-spacing="5"
+<!-- The signature of the whole dashboard: the boom of a border post.
+     Raised means nothing was stopped on this window, lowered means something
+     was. It is the one drawing in the app, it says the state before a word is
+     read, and it is the only thing allowed to move. -->
+{#snippet barrier(raised: boolean, cls: string)}
+	<!-- The viewBox is tall enough to hold the boom when it is up: swing a
+	     118-unit arm off a pivot at y=72 and anything steeper than about 35
+	     degrees leaves the frame, which reads as a broken drawing rather than
+	     as an open road. -->
+	<svg
+		viewBox="0 0 200 150"
+		class={cls}
+		role="img"
+		aria-label={raised ? 'barrière levée' : 'barrière baissée'}
+	>
+		<!-- The road under it, so the boom reads as blocking a way through. -->
+		<line x1="0" y1="140" x2="200" y2="140" stroke="currentcolor" stroke-width="3" opacity="0.2" />
+		<line
+			x1="112"
+			y1="140"
+			x2="196"
+			y2="140"
+			stroke="currentcolor"
+			stroke-width="3"
+			stroke-dasharray="12 14"
+			opacity="0.4"
+		/>
+		<!-- The post, on its footing. -->
+		<rect x="18" y="130" width="34" height="9" rx="4" fill="currentcolor" opacity="0.45" />
+		<rect x="28" y="72" width="14" height="60" rx="6" fill="currentcolor" opacity="0.85" />
+		<circle cx="35" cy="72" r="8.5" fill="currentcolor" />
+		<!-- The boom, hinged on the post. A CSS transition, so the reduced-motion
+		     rule already covers it. -->
+		<g
+			style="transform-origin: 35px 72px; transition: transform 700ms cubic-bezier(0.34, 1.25, 0.5, 1); transform: rotate({raised
+				? -32
+				: 0}deg)"
 		>
-			<textPath href="#seal-ring">DOUANE · CONTRÔLE DES SORTIES · </textPath>
-		</text>
-		<text
-			x="100"
-			y="106"
-			text-anchor="middle"
-			fill="currentcolor"
-			font-family="IBM Plex Mono, monospace"
-			font-size="15"
-			font-weight="600"
-			letter-spacing="2"
-		>
-			N° 8787
-		</text>
+			<rect x="35" y="64" width="118" height="16" rx="8" fill="currentcolor" opacity="0.22" />
+			{#each [0, 1, 2, 3] as i (i)}
+				<rect
+					x={41 + i * 28}
+					y="64"
+					width="17"
+					height="16"
+					rx="4"
+					fill="currentcolor"
+					opacity="0.95"
+				/>
+			{/each}
+		</g>
 	</svg>
 {/snippet}
 
 {#snippet navBadge(n: number, alarm: boolean)}
 	{#if n > 0}
 		<span
-			class="ml-auto inline-flex h-5 min-w-5 items-center justify-center rounded-full px-1.5 font-mono text-[0.65rem] font-semibold {alarm
+			class="tabular ml-auto inline-flex h-5 min-w-5 items-center justify-center rounded-full px-1.5 text-[0.7rem] font-bold {alarm
 				? 'bg-destructive text-destructive-foreground'
 				: 'bg-sidebar-accent text-sidebar-accent-foreground'}"
 		>
@@ -218,69 +256,69 @@
 		<button
 			onclick={() => (tab = id)}
 			aria-current={active ? 'page' : undefined}
-			class="flex items-center gap-2.5 rounded-md text-sm transition-colors {compact
+			class="focusable flex items-center gap-2.5 rounded-lg text-sm transition-colors {compact
 				? 'shrink-0 px-3 py-2'
-				: 'w-full px-3 py-2'} {active
-				? 'bg-sidebar-accent text-sidebar-accent-foreground font-medium'
-				: 'text-sidebar-foreground/70 hover:bg-sidebar-accent/60 hover:text-sidebar-foreground'}"
+				: 'w-full px-3 py-2.5'} {active
+				? 'bg-primary text-primary-foreground font-semibold shadow-sm'
+				: 'text-sidebar-foreground/75 hover:bg-sidebar-accent hover:text-sidebar-foreground font-medium'}"
 		>
-			<ScreenIcon class="size-4 shrink-0 {active ? 'text-primary' : ''}" />
+			<ScreenIcon class="size-4 shrink-0" />
 			{s.label}
 			{#if id === 'protection'}{@render navBadge(pending, true)}
 			{:else if id === 'routes'}{@render navBadge(repointed, false)}
+			{:else if id === 'modeles'}{@render navBadge(served, false)}
 			{:else if id === 'coffre'}{@render navBadge(vault?.entries.length ?? 0, false)}{/if}
 		</button>
 	{/each}
 {/snippet}
 
 {#if !session.unlocked}
-	<main class="relative flex min-h-svh items-center justify-center overflow-hidden p-6">
-		<div class="relative w-full max-w-sm">
-			<!-- The seal leans over the top corner of the card, half on the paper
-			     and half on the form, the way a stamp actually lands: over the
-			     sheet, never under it. -->
-			<div
-				class="text-primary/30 dark:text-primary/35 pointer-events-none absolute -top-14 -right-9 z-10 size-36 -rotate-12"
-			>
-				{@render seal('size-full')}
-			</div>
-
-			<Card.Root class="shadow-lifted relative">
+	<main class="flex min-h-svh items-center justify-center p-6">
+		<div class="w-full max-w-sm">
+			<Card.Root class="shadow-lifted overflow-hidden">
+				<div class="bg-sidebar text-primary flex justify-center border-b px-6 py-5">
+					{@render barrier(true, 'h-24')}
+				</div>
 				<!-- The gap lives on the form, not on the card: a single child absorbs
 				     the card's own `flex-col gap`, and the header ends up glued to the
 				     field under it. -->
-				<form onsubmit={unlock} class="flex flex-col gap-6">
+				<form onsubmit={unlock} class="flex flex-col gap-6 pt-6">
 					<Card.Header>
-						<div class="wordmark text-primary">douane</div>
-						<Card.Description class="mt-1 text-xs">
-							contrôle des sorties · le guichet n'ouvre qu'au porteur du jeton
+						<div class="wordmark text-foreground text-xl">douane</div>
+						<Card.Description class="mt-1 text-sm">
+							Le poste de contrôle des clés. Il n'ouvre qu'au porteur du jeton.
 						</Card.Description>
 					</Card.Header>
 
 					<Card.Content class="grid gap-2">
-						<Label for="token">jeton d'administration</Label>
+						<Label for="token">Jeton d'administration</Label>
 						<Input
 							id="token"
 							type="password"
 							bind:value={typed}
-							placeholder="collez le jeton"
+							placeholder="Collez le jeton"
 							autocomplete="off"
 							spellcheck="false"
-							class="font-mono"
 						/>
 						{#if rejected}
-							<p class="text-destructive text-xs">{rejected}</p>
+							<p class="text-destructive text-sm font-medium">{rejected}</p>
 						{/if}
 
-						<Button type="submit" class="mt-2 w-full" disabled={typed.trim().length === 0}>
+						<Button
+							type="submit"
+							size="lg"
+							class="mt-3 w-full"
+							disabled={typed.trim().length === 0}
+						>
 							<KeyRound class="size-4" />
-							ouvrir le guichet
+							Ouvrir le tableau de bord
 						</Button>
 
-						<p class="text-muted-foreground mt-2 text-xs leading-relaxed">
-							Il vit dans le coffre sous <code class="font-mono">douane.admin_token</code>, avec une
-							copie locale dans <code class="font-mono">%APPDATA%\douane\admin_token.key</code>. Il
-							reste dans cet onglet et disparaît à sa fermeture.
+						<p class="text-muted-foreground mt-3 text-xs leading-relaxed">
+							Le jeton vit dans le coffre sous <span class="bg-sunken rounded px-1 py-0.5"
+								>douane.admin_token</span
+							>, avec une copie locale sur la machine. Il reste dans cet onglet et disparaît à sa
+							fermeture.
 						</p>
 					</Card.Content>
 				</form>
@@ -290,20 +328,18 @@
 {:else}
 	{@const screen = SCREENS[tab]}
 	<div class="min-h-svh">
-		<!-- The rail. Always there on a desk-sized screen: the four registers, and
-		     at the bottom the one number the office exists for. -->
+		<!-- The rail. Always there on a desk-sized screen: the five screens, and
+		     at the bottom the one number the whole thing exists for. -->
 		<aside
-			class="bg-sidebar border-sidebar-border fixed inset-y-0 left-0 z-40 hidden w-60 flex-col border-r lg:flex"
+			class="bg-sidebar border-sidebar-border fixed inset-y-0 left-0 z-40 hidden w-64 flex-col border-r lg:flex"
 		>
-			<div class="border-sidebar-border flex items-center gap-3 border-b px-5 py-5">
-				<div class="text-primary/70 size-9 shrink-0">
-					{@render seal('size-full')}
-				</div>
+			<div class="flex items-center gap-3 px-5 pt-5 pb-3">
+				<span class="text-primary shrink-0">
+					{@render barrier(stopped === 0, 'h-9')}
+				</span>
 				<div class="min-w-0">
 					<div class="wordmark text-sidebar-foreground">douane</div>
-					<div class="text-muted-foreground mt-0.5 text-[0.65rem] tracking-wide">
-						contrôle des sorties
-					</div>
+					<div class="text-muted-foreground text-[0.7rem]">contrôle des sorties</div>
 				</div>
 			</div>
 
@@ -311,33 +347,31 @@
 				{@render navItems(false)}
 			</nav>
 
-			<div class="mt-auto">
+			<div class="mt-auto p-3">
 				<!-- The one number worth carrying on every screen: how many values
 				     the broker would recognise on the way out right now. -->
 				<div
-					class="border-sidebar-border mx-3 mb-3 rounded-md border px-3 py-2.5"
-					title="valeurs du coffre que le scrubber reconnaîtrait dans un corps partant"
+					class="bg-card rounded-xl p-3.5 shadow-sm"
+					title="valeurs du coffre que douane reconnaîtrait dans un corps partant"
 				>
-					<div class="flex items-center gap-2">
-						<span class="bg-trust-max relative flex size-1.5 shrink-0 rounded-full">
+					<div class="flex items-baseline gap-2">
+						<span class="ledger text-2xl leading-none">{count(config?.watching ?? 0)}</span>
+						<span class="bg-trust-max relative flex size-2 shrink-0 rounded-full">
 							<span
 								class="bg-trust-max absolute inline-flex size-full animate-ping rounded-full opacity-60"
 							></span>
 						</span>
-						<span class="ledger text-base leading-none">{count(config?.watching ?? 0)}</span>
-						<span class="text-muted-foreground text-[0.7rem] leading-tight"
-							>valeurs surveillées en sortie</span
-						>
 					</div>
+					<p class="text-muted-foreground mt-1 text-xs leading-snug">
+						valeurs surveillées en sortie
+					</p>
 				</div>
 
-				<div
-					class="border-sidebar-border text-muted-foreground flex items-center justify-between border-t px-5 py-3 text-[0.7rem]"
-				>
-					<span>proxy de sortie</span>
-					<span>
+				<div class="text-muted-foreground mt-3 flex items-center justify-between px-1 text-xs">
+					<span>Proxy de sortie</span>
+					<span class="font-medium">
 						{#if config?.egress.listening}
-							à l'écoute · {config.egress.rules} règles
+							à l'écoute
 						{:else}
 							éteint
 						{/if}
@@ -346,44 +380,40 @@
 			</div>
 		</aside>
 
-		<div class="lg:pl-60">
+		<div class="lg:pl-64">
 			<header class="bg-background/85 sticky top-0 z-30 border-b backdrop-blur-md">
-				<div class="flex items-center gap-3 px-4 py-2.5 sm:px-6">
-					<!-- On a phone the rail is gone, so the plaque moves up here. -->
-					<span class="wordmark text-primary lg:hidden">douane</span>
+				<div class="flex items-center gap-3 px-4 py-3 sm:px-6">
+					<!-- On a phone the rail is gone, so the name moves up here. -->
+					<span class="wordmark text-foreground lg:hidden">douane</span>
 
 					<div class="hidden min-w-0 lg:block">
-						<h1 class="text-sm leading-tight font-semibold">{screen.label}</h1>
+						<h1 class="text-base leading-tight font-semibold">{screen.label}</h1>
 						<p class="text-muted-foreground truncate text-xs">{screen.desc}</p>
 					</div>
 
-					<div class="ml-auto flex shrink-0 items-center gap-1.5">
-						<Select.Root type="single" bind:value={hours}>
-							<Select.Trigger class="h-8 w-[9.5rem]">
-								{WINDOWS.find((w) => w.value === hours)?.label}
-							</Select.Trigger>
-							<Select.Content>
-								{#each WINDOWS as w (w.value)}
-									<Select.Item value={w.value} label={w.label}>{w.label}</Select.Item>
-								{/each}
-							</Select.Content>
-						</Select.Root>
+					<div class="ml-auto flex shrink-0 items-center gap-2">
+						{#if tab === 'trafic'}
+							<Select.Root type="single" bind:value={hours}>
+								<Select.Trigger class="h-9 w-[9.5rem]">
+									{WINDOWS.find((w) => w.value === hours)?.label}
+								</Select.Trigger>
+								<Select.Content>
+									{#each WINDOWS as w (w.value)}
+										<Select.Item value={w.value} label={w.label}>{w.label}</Select.Item>
+									{/each}
+								</Select.Content>
+							</Select.Root>
+						{/if}
 
-						<Button
-							variant="ghost"
-							size="icon"
-							class="size-8"
-							onclick={load}
-							disabled={loading}
-							title="recharger"
-						>
+						<Button variant="outline" size="sm" class="h-9" onclick={load} disabled={loading}>
 							<RefreshCw class="size-4 {loading ? 'animate-spin' : ''}" />
+							<span class="hidden sm:inline">Recharger</span>
 						</Button>
 
 						<Button
 							variant="ghost"
 							size="icon"
-							class="size-8"
+							class="size-9"
 							onclick={toggleTheme}
 							title="thème clair ou sombre"
 						>
@@ -392,19 +422,19 @@
 
 						<Button
 							variant="ghost"
-							size="sm"
-							class="h-8"
+							size="icon"
+							class="size-9"
 							onclick={() => session.lock()}
 							title="oublier le jeton dans cet onglet"
 						>
-							fermer
+							<LogOut class="size-4" />
 						</Button>
 					</div>
 				</div>
 
-				<!-- The four registers as a scrolling row, phone only. -->
+				<!-- The screens as a scrolling row, phone only. -->
 				<nav
-					class="bg-sidebar flex gap-1 overflow-x-auto border-t px-2 py-1.5 [scrollbar-width:none] lg:hidden [&::-webkit-scrollbar]:hidden"
+					class="bg-sidebar flex gap-1 overflow-x-auto border-t px-2 py-2 [scrollbar-width:none] lg:hidden [&::-webkit-scrollbar]:hidden"
 				>
 					{@render navItems(true)}
 				</nav>
@@ -413,7 +443,7 @@
 			<main class="mx-auto w-full max-w-[1400px] p-4 sm:p-6">
 				{#if failure}
 					<p
-						class="border-destructive/40 bg-destructive/10 text-destructive mb-4 rounded-lg border px-3 py-2 text-sm"
+						class="border-destructive/40 bg-destructive/10 text-destructive mb-4 rounded-xl border px-4 py-3 text-sm font-medium"
 					>
 						{failure}
 					</p>
@@ -422,8 +452,8 @@
 				<!-- The screen's own name and line, said once, on a phone where the
 				     topbar had no room for it. -->
 				<div class="mb-4 lg:hidden">
-					<h1 class="text-base leading-tight font-semibold">{screen.label}</h1>
-					<p class="text-muted-foreground text-xs">{screen.desc}</p>
+					<h1 class="text-lg leading-tight font-semibold">{screen.label}</h1>
+					<p class="text-muted-foreground text-sm">{screen.desc}</p>
 				</div>
 
 				<!-- Each screen slides in a few pixels. Enough to say the page
@@ -431,9 +461,41 @@
 				{#key tab}
 					<div in:fly={{ y: 8, duration: 220, easing: cubicOut }}>
 						{#if tab === 'protection'}
+							<!-- The verdict, before any number: the boom is up or it is not. -->
+							<Card.Root class="shadow-panel mb-5 overflow-hidden">
+								<div class="flex flex-col gap-5 p-6 sm:flex-row sm:items-center sm:gap-7">
+									<span class="{stopped === 0 ? 'text-trust-max' : 'text-primary'} shrink-0">
+										{@render barrier(stopped === 0, 'h-24')}
+									</span>
+									<div class="min-w-0">
+										<h2 class="text-xl leading-tight font-semibold sm:text-2xl">
+											{#if stopped === 0}
+												Rien n'a été arrêté
+											{:else}
+												<!-- Not "bloquées": most of these are substitutions, where
+												     the call went through with the value replaced by its
+												     name. Saying blocked would misreport the verdict. -->
+												{count(stopped)}
+												{stopped > 1 ? 'fuites arrêtées' : 'fuite arrêtée'}
+											{/if}
+										</h2>
+										<p class="text-muted-foreground mt-1.5 text-sm leading-relaxed">
+											{#if stopped === 0}
+												Aucune valeur du coffre n'a été vue dans un corps partant. Le registre
+												ci-dessous liste tout ce que douane a regardé passer.
+											{:else}
+												Une valeur du coffre partait vers un fournisseur. Elle a été remplacée par
+												son nom ou l'appel a été refusé, selon la règle du niveau de confiance.
+											{/if}
+										</p>
+									</div>
+								</div>
+							</Card.Root>
 							<TabProtection {alerts} {grants} watching={config?.watching ?? 0} reload={load} />
 						{:else if tab === 'trafic'}
 							<TabTraffic {summary} hours={Number(hours)} {calls} {threads} bind:filter={thread} />
+						{:else if tab === 'modeles'}
+							<TabModels {catalog} reload={load} />
 						{:else if tab === 'routes'}
 							<TabRoutes {config} reload={load} />
 						{:else if tab === 'coffre'}

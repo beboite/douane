@@ -461,6 +461,10 @@ struct RouteView {
     base_provider: String,
     base_model: Option<String>,
     overridden: bool,
+    /// True when this route exists because a model was switched on, rather than
+    /// because somebody wrote it in `douane.toml`. It is edited from the models
+    /// screen, not by repointing it here.
+    from_catalog: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -500,7 +504,11 @@ pub async fn config(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
         .routes
         .iter()
         .map(|(name, r)| {
-            let base = &state.base.routes[name];
+            // A route that came from the catalogue has no line in the file, so
+            // there is nothing to revert it to and it is its own base. Indexing
+            // `state.base.routes` here would panic on the first model switched
+            // on, which is a poor way to find that out.
+            let base = state.base.routes.get(name).unwrap_or(r);
             RouteView {
                 name: name.clone(),
                 provider: r.provider.clone(),
@@ -509,6 +517,7 @@ pub async fn config(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
                 base_provider: base.provider.clone(),
                 base_model: base.model.clone(),
                 overridden: base.provider != r.provider || base.model != r.model,
+                from_catalog: !state.base.routes.contains_key(name),
             }
         })
         .collect();
@@ -845,7 +854,13 @@ fn apply(state: &Arc<AppState>, name: &str) -> Response {
     match state.refresh_routes() {
         Ok(()) => {
             let live = state.config();
-            let r = &live.routes[name];
+            let Some(r) = live.routes.get(name) else {
+                // Clearing an override on a route the file no longer has is not
+                // an error: the override outlived a `douane.toml` edit, and
+                // deleting it is exactly the right outcome.
+                return Json(serde_json::json!({ "route": name, "cleared": true }))
+                    .into_response();
+            };
             tracing::info!(route = name, provider = r.provider, "routing changed");
             Json(serde_json::json!({
                 "route": name,
@@ -856,6 +871,264 @@ fn apply(state: &Arc<AppState>, name: &str) -> Response {
         }
         Err(e) => {
             tracing::error!("could not apply the routing change: {e}");
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "the change was stored but could not be applied",
+            )
+        }
+    }
+}
+
+// ------------------------------------------------------------------ models --
+
+/// The catalogue, plus what the merge had to refuse.
+///
+/// `collisions` is not decoration: a row switched on whose route name belongs
+/// to the TOML is serving nothing, and a switch that says "on" over a route
+/// answered by the file would be a lie the dashboard tells every time it is
+/// opened.
+pub async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Some(r) = denied(&state, &headers) {
+        return r;
+    }
+    let models = match state.audit.models() {
+        Ok(m) => m,
+        Err(e) => return db_error(e),
+    };
+    let collisions = state.base.model_collisions(&models);
+    let providers: Vec<_> = state
+        .base
+        .providers
+        .iter()
+        .map(|(name, p)| {
+            serde_json::json!({
+                "name": name,
+                "trust": trust_label(p.trust),
+                "catalog": p.catalog_url().is_some(),
+                "prefix": p.prefix.clone().unwrap_or_else(|| format!("{name}-")),
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "models": models,
+        "collisions": collisions,
+        "providers": providers,
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RefreshQuery {
+    /// Ask one provider rather than all of them.
+    #[serde(default)]
+    provider: Option<String>,
+}
+
+/// Ask each upstream what it sells and fold the answer into the catalogue.
+///
+/// POST because it spends a real request per provider and can change rows.
+/// Nothing here switches a model on: a refresh adds rows and marks the ones
+/// that vanished, and the decision to serve one stays a click by the owner.
+pub async fn refresh_models(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<RefreshQuery>,
+) -> Response {
+    if let Some(r) = denied(&state, &headers) {
+        return r;
+    }
+    let live = state.config();
+    if let Some(name) = &q.provider
+        && !live.providers.contains_key(name)
+    {
+        return json_error(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            &format!("no provider named `{name}`"),
+        );
+    }
+
+    let jobs = live
+        .providers
+        .iter()
+        .filter(|(name, _)| q.provider.as_ref().is_none_or(|want| want == *name))
+        .map(|(name, p)| crate::catalog::fetch(&state, name, p));
+    let results = futures_util::future::join_all(jobs).await;
+
+    // A refresh can retire a route that was serving, so the live table is
+    // rebuilt here rather than at the next write.
+    if let Err(e) = state.refresh_routes() {
+        tracing::error!("the routing table could not be rebuilt after a refresh: {e}");
+    }
+    Json(serde_json::json!({ "refreshed": results })).into_response()
+}
+
+/// What the dashboard sends to create or edit one row by hand.
+#[derive(Debug, Deserialize)]
+pub struct ModelInput {
+    provider: String,
+    upstream_id: String,
+    /// Absent means "name it the usual way", so adding a model by hand takes
+    /// one field in the common case.
+    #[serde(default)]
+    route: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    context_length: Option<u64>,
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// Add a model by hand, for an upstream that publishes no catalogue.
+pub async fn put_model(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(input): Json<ModelInput>,
+) -> Response {
+    if let Some(r) = denied(&state, &headers) {
+        return r;
+    }
+    let Some(provider) = state.base.providers.get(&input.provider) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            &format!("no provider named `{}`", input.provider),
+        );
+    };
+    if input.upstream_id.trim().is_empty() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "a model needs the id its upstream knows it by",
+        );
+    }
+    let prefix = provider
+        .prefix
+        .clone()
+        .unwrap_or_else(|| format!("{}-", input.provider));
+    let route = match input.route.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(r) => r.to_owned(),
+        None => crate::config::route_name_for(&prefix, &input.upstream_id),
+    };
+    if !crate::config::is_usable_route_name(&route) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "a route name is letters, digits, and `-_.[]`: it travels in a URL and in a \
+             command line argument",
+        );
+    }
+    // The file owns its names. Letting a hand-added row take one would repoint
+    // a route somebody wrote on purpose, from a screen that looks like it is
+    // only adding something.
+    if state.base.routes.contains_key(&route) {
+        return json_error(
+            StatusCode::CONFLICT,
+            "invalid_request_error",
+            &format!("`{route}` is already a route in douane.toml: pick another name"),
+        );
+    }
+
+    let entry = crate::catalog::ModelEntry {
+        provider: input.provider,
+        upstream_id: input.upstream_id.trim().to_owned(),
+        route: route.clone(),
+        label: input.label.filter(|s| !s.trim().is_empty()),
+        context_length: input.context_length.filter(|n| *n > 0),
+        enabled: input.enabled,
+        source: crate::catalog::Source::Manual,
+        present: true,
+        first_seen: String::new(),
+        last_seen: String::new(),
+        note: input.note.filter(|s| !s.trim().is_empty()),
+    };
+    if let Err(e) = state.audit.model_put(&entry) {
+        return db_error(e);
+    }
+    apply_models(&state, Json(serde_json::json!({ "route": route })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EnableInput {
+    enabled: bool,
+}
+
+/// Serve this model, or stop serving it. The one click that turns a row of the
+/// catalogue into a route.
+pub async fn set_model_enabled(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(route): Path<String>,
+    Json(input): Json<EnableInput>,
+) -> Response {
+    if let Some(r) = denied(&state, &headers) {
+        return r;
+    }
+    match state.audit.model_set_enabled(&route, input.enabled) {
+        Ok(true) => apply_models(
+            &state,
+            Json(serde_json::json!({ "route": route, "enabled": input.enabled })),
+        ),
+        Ok(false) => json_error(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            &format!("no model named `{route}` in the catalogue"),
+        ),
+        Err(e) => db_error(e),
+    }
+}
+
+/// Every model of one provider at once. The screen is otherwise a hundred
+/// clicks after a first refresh.
+pub async fn set_provider_models_enabled(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(provider): Path<String>,
+    Json(input): Json<EnableInput>,
+) -> Response {
+    if let Some(r) = denied(&state, &headers) {
+        return r;
+    }
+    match state.audit.models_set_enabled_for(&provider, input.enabled) {
+        Ok(n) => apply_models(
+            &state,
+            Json(serde_json::json!({ "provider": provider, "changed": n })),
+        ),
+        Err(e) => db_error(e),
+    }
+}
+
+pub async fn delete_model(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(route): Path<String>,
+) -> Response {
+    if let Some(r) = denied(&state, &headers) {
+        return r;
+    }
+    match state.audit.model_delete(&route) {
+        Ok(true) => apply_models(&state, Json(serde_json::json!({ "deleted": route }))),
+        Ok(false) => json_error(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            &format!("no model named `{route}` in the catalogue"),
+        ),
+        Err(e) => db_error(e),
+    }
+}
+
+/// Rebuild the live table, then answer. Separate from [`apply`] because that
+/// one reports a named route back and a catalogue write can retire the very
+/// route it is reporting on.
+fn apply_models(state: &Arc<AppState>, ok: Json<serde_json::Value>) -> Response {
+    match state.refresh_routes() {
+        Ok(()) => ok.into_response(),
+        Err(e) => {
+            tracing::error!("could not apply the catalogue change: {e}");
             json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "api_error",

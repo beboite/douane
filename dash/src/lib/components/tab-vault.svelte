@@ -4,7 +4,6 @@
 	import { Button, buttonVariants } from '$lib/components/ui/button';
 	import { Input } from '$lib/components/ui/input';
 	import Copy from '@lucide/svelte/icons/copy';
-	import Link2 from '@lucide/svelte/icons/link-2';
 	import Lock from '@lucide/svelte/icons/lock';
 	import Plus from '@lucide/svelte/icons/plus';
 	import Search from '@lucide/svelte/icons/search';
@@ -77,12 +76,14 @@
 		dialogOpen = true;
 	}
 
+	/** Only ever called on a placeholder, which is public by construction. No
+	 *  surface on this page can reach a value, so none of them can copy one. */
 	async function copy(text: string) {
 		try {
 			await navigator.clipboard.writeText(text);
-			toast.success('copié', { description: text });
+			toast.success('Repère copié', { description: text });
 		} catch {
-			toast.error('le presse-papier a refusé');
+			toast.error('Le presse-papier a refusé');
 		}
 	}
 
@@ -95,7 +96,7 @@
 			deleting = null;
 			await reload();
 			toast.success(`${gone} n’est plus en coffre`, {
-				description: `le scrubber surveille ${res.watching} valeurs en sortie`
+				description: `Le scrubber surveille ${res.watching} valeurs en sortie`
 			});
 		} catch (e) {
 			toast.error(`${gone} est toujours là`, { description: (e as Error).message });
@@ -107,115 +108,145 @@
 
 <Panel
 	title="Coffre"
-	note="{count(vault?.entries.length ?? 0)} entrées · {count(
+	note="{count(vault?.entries.length ?? 0)} entrées, {count(
 		vault?.watching ?? 0
-	)} valeurs surveillées en sortie. Aucune ne se relit, ni ici ni ailleurs"
+	)} valeurs surveillées en sortie. Aucune ne se relit, ici comme ailleurs"
 >
 	{#snippet actions()}
-		<div class="flex shrink-0 items-center gap-2">
+		<div class="flex shrink-0 flex-wrap items-center gap-2">
 			<div class="relative">
 				<Search
 					class="text-muted-foreground pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2"
 				/>
 				<Input
 					bind:value={filter}
-					placeholder="filtrer"
-					class="h-8 w-44 pl-8"
+					placeholder="Filtrer"
+					class="h-8 w-40 pl-8 sm:w-48"
 					autocomplete="off"
 					spellcheck="false"
 				/>
 			</div>
-			<Button size="sm" class="h-8" onclick={deposit}>
+			<!-- The reason this screen exists, so it is filled, named by its verb and
+			     the first thing the eye lands on in the header. -->
+			<Button size="sm" class="h-8 px-3" onclick={deposit}>
 				<Plus class="size-3.5" />
-				déposer
+				Déposer une valeur
 			</Button>
 		</div>
 	{/snippet}
 
-	<div class="space-y-6">
+	<div class="space-y-5">
+		{#if groups.length}
+			<!-- The placeholder is the one idea a newcomer has to get, and nothing
+			     else on the page teaches it. Said here once, with an example. -->
+			<p class="text-muted-foreground rounded-xl border p-4 text-xs leading-relaxed">
+				Chaque entrée reçoit un <span class="text-foreground font-semibold">repère</span>, par
+				exemple
+				<span class="bg-sunken text-foreground rounded-md px-1.5 py-0.5 font-medium">
+					__DOUANE_PROXY_PASSWORD__
+				</span>. C’est le nom qu’un agent écrit dans une conversation à la place du secret : il ne vaut
+				rien pour un fournisseur, douane seule sait à quelle valeur il renvoie.
+			</p>
+		{/if}
+
 		{#each groups as [namespace, entries] (namespace)}
 			<section>
-				<div class="mb-2 flex items-baseline gap-2">
-					<h3 class="font-mono text-sm font-semibold">{namespace}</h3>
-					<Badge variant="secondary" class="rounded-full px-1.5 py-0 text-[0.65rem]">
+				<div class="mb-2.5 flex items-center gap-2.5">
+					<h3 class="text-sm font-semibold">{namespace}</h3>
+					<Badge
+						variant="secondary"
+						class="tabular rounded-full px-2 py-0 text-[0.7rem] font-semibold"
+					>
 						{entries.length}
 					</Badge>
 					<div class="bg-border h-px flex-1"></div>
 				</div>
 
-				<ul class="divide-border bg-sunken/50 divide-y overflow-hidden rounded-lg border">
+				<ul class="divide-border bg-sunken/40 divide-y overflow-hidden rounded-xl border">
 					{#each entries as entry (reference(entry))}
 						{@const locked = inUse.has(reference(entry))}
 						{@const sameAs = twinsOf(entry)}
-						<li class="hover:bg-card/70 group flex items-center gap-4 px-3 py-2.5 transition-colors">
-							<!-- Fixed rather than elastic: the placeholder belongs next to the
-							     name it stands for, and a flexible column would push it to the
-							     far side of a wide screen. -->
-							<div class="w-[20rem] min-w-0 shrink-0">
+						<li
+							class="hover:bg-card/70 flex flex-wrap items-center gap-x-4 gap-y-2 px-4 py-3 transition-colors"
+						>
+							<div class="min-w-0 flex-1 basis-[13rem]">
 								<div class="flex flex-wrap items-center gap-x-2 gap-y-1">
-									<span class="font-mono text-sm font-medium">{entry.key}</span>
+									<span class="text-sm font-semibold">{entry.key}</span>
 									{#if locked}
 										<span
-											class="text-muted-foreground inline-flex items-center gap-1 text-[0.65rem]"
-											title="la configuration en cours s’authentifie avec, le broker refuse de la supprimer"
+											class="pill pill-substitute"
+											title="la configuration en cours s’authentifie avec"
 										>
-											<Lock class="size-3" />
 											en service
 										</span>
 									{/if}
 									{#if sameAs.length}
-										<span
-											class="text-trust-mid inline-flex items-center gap-1 text-[0.65rem]"
-											title="même valeur que {sameAs.join(', ')}"
-										>
-											<Link2 class="size-3" />
+										<span class="pill pill-warn" title="même valeur que {sameAs.join(', ')}">
 											même valeur que {sameAs.length === 1 ? sameAs[0] : `${sameAs.length} autres`}
 										</span>
 									{/if}
 								</div>
 								{#if entry.note}
-									<p class="text-muted-foreground mt-0.5 truncate text-xs">{entry.note}</p>
+									<p class="text-muted-foreground mt-1 truncate text-xs">{entry.note}</p>
 								{/if}
 							</div>
 
 							<button
-								class="text-muted-foreground hover:text-foreground hidden min-w-0 flex-1 items-center gap-1.5 truncate font-mono text-xs transition-colors md:inline-flex"
+								class="focusable bg-sunken hover:bg-accent text-muted-foreground hover:text-foreground inline-flex min-w-0 basis-full items-center gap-1.5 rounded-md px-2 py-1 text-xs transition-colors md:flex-1 md:basis-[12rem]"
 								onclick={() => copy(entry.placeholder)}
-								title="copier le repère à donner à un agent à la place de la valeur"
+								title="copier le repère, à donner à un agent à la place de la valeur"
 							>
-								{entry.placeholder}
-								<Copy class="size-3 opacity-0 transition-opacity group-hover:opacity-100" />
+								<span class="truncate">{entry.placeholder}</span>
+								<Copy class="size-3 shrink-0 opacity-60" />
 							</button>
 
 							<div
-								class="text-muted-foreground tabular hidden w-[9.5rem] shrink-0 text-right text-xs md:block"
+								class="text-muted-foreground hidden shrink-0 items-center gap-2 text-xs lg:flex"
 							>
-								<div class="font-mono">{entry.fingerprint.slice(0, 12)}</div>
-								<div class="mt-0.5 opacity-70">
-									{bytes(entry.bytes)} · <span title={entry.updated_at}>{ago(entry.updated_at)}</span>
-								</div>
+								<span
+									class="bg-sunken tabular rounded-md px-2 py-1"
+									title="empreinte de la valeur, jamais la valeur"
+								>
+									{entry.fingerprint.slice(0, 12)}
+								</span>
+								<span class="tabular w-[8.5rem] text-right">
+									{bytes(entry.bytes)} ·
+									<span title={entry.updated_at}>{ago(entry.updated_at)}</span>
+								</span>
 							</div>
 
-							<div class="flex shrink-0 gap-0.5">
+							<div class="ml-auto flex shrink-0 items-center gap-1">
 								<Button
-									size="icon"
+									size="icon-sm"
 									variant="ghost"
-									class="size-7"
-									title="remplacer la valeur ou la note"
+									title="Remplacer la valeur ou la note"
 									onclick={() => replace(entry)}
 								>
 									<PenLine class="size-3.5" />
+									<span class="sr-only">Remplacer</span>
 								</Button>
-								<Button
-									size="icon"
-									variant="ghost"
-									class="size-7 {locked ? '' : 'hover:text-destructive'}"
-									disabled={locked}
-									title={locked ? 'la configuration en cours en dépend' : 'retirer du coffre'}
-									onclick={() => (deleting = entry)}
-								>
-									<Trash2 class="size-3.5" />
-								</Button>
+								<!-- The broker answers 409 on an entry the running config
+								     authenticates with, so the row says why instead of showing a
+								     button that could only fail. -->
+								{#if locked}
+									<span
+										class="text-muted-foreground flex size-7 items-center justify-center"
+										title="la configuration en cours en dépend, elle ne peut pas être retirée"
+									>
+										<Lock class="size-3.5" />
+									</span>
+								{:else}
+									<Button
+										size="icon-sm"
+										variant="ghost"
+										class="hover:text-destructive"
+										title="Retirer du coffre"
+										onclick={() => (deleting = entry)}
+									>
+										<Trash2 class="size-3.5" />
+										<span class="sr-only">Retirer</span>
+									</Button>
+								{/if}
 							</div>
 						</li>
 					{/each}
@@ -224,10 +255,10 @@
 		{:else}
 			<Empty
 				icon={KeyRound}
-				title={filter ? 'rien qui corresponde' : 'le coffre est vide'}
+				title={filter ? 'Rien qui corresponde' : 'Le coffre est vide'}
 				hint={filter
-					? 'le filtre porte sur la référence et sur la note, jamais sur la valeur'
-					: 'déposez une première clé, le scrubber apprendra à la reconnaître en sortie dans la seconde'}
+					? 'Le filtre porte sur le nom et sur la note, jamais sur la valeur'
+					: 'Déposez une première valeur : elle reçoit un repère à donner aux agents, et le scrubber la reconnaît en sortie dans la seconde'}
 			/>
 		{/each}
 	</div>
@@ -250,13 +281,13 @@
 			</AlertDialog.Description>
 		</AlertDialog.Header>
 		<AlertDialog.Footer>
-			<AlertDialog.Cancel>annuler</AlertDialog.Cancel>
+			<AlertDialog.Cancel>Annuler</AlertDialog.Cancel>
 			<AlertDialog.Action
 				class={buttonVariants({ variant: 'destructive' })}
 				disabled={busy}
 				onclick={confirmDelete}
 			>
-				retirer
+				Retirer du coffre
 			</AlertDialog.Action>
 		</AlertDialog.Footer>
 	</AlertDialog.Content>

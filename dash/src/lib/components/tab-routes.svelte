@@ -48,10 +48,10 @@
 	);
 </script>
 
-<div class="space-y-4">
+<div class="space-y-5">
 	<Panel
 		title="Routage"
-		note="un changement prend effet à l'appel suivant. Le TOML n'est jamais réécrit, donc un redémarrage revient au fichier"
+		note="un changement s’applique à l’appel suivant et vit en base. Le fichier n’est jamais réécrit, donc un redémarrage revient au TOML"
 		flush
 	>
 		{#if (config?.routes ?? []).length === 0}
@@ -61,65 +61,66 @@
 				hint="une route donne un nom de modèle à un agent et décide chez qui l’appel part réellement"
 			/>
 		{:else}
-		<Table.Root>
-			<Table.Header>
-				<Table.Row>
-					<Table.Head class="w-[16rem]">le modèle demandé</Table.Head>
-					<Table.Head class="w-[15rem]">part chez</Table.Head>
-					<Table.Head>sous le nom</Table.Head>
-					<Table.Head class="w-[9rem]"></Table.Head>
-				</Table.Row>
-			</Table.Header>
-			<Table.Body>
-				{#each config?.routes ?? [] as route (key(route.name, stamp))}
-					<RouteRow {route} providers={config?.providers ?? []} {reload} />
-				{/each}
-			</Table.Body>
-		</Table.Root>
+			<Table.Root>
+				<Table.Header>
+					<Table.Row>
+						<Table.Head class="w-[18rem] px-5 py-3">Le modèle demandé</Table.Head>
+						<Table.Head class="w-[15rem] px-3 py-3">Part chez</Table.Head>
+						<Table.Head class="px-3 py-3">Sous le nom</Table.Head>
+						<Table.Head class="w-[13rem] px-5 py-3 text-right">Action</Table.Head>
+					</Table.Row>
+				</Table.Header>
+				<Table.Body>
+					{#each config?.routes ?? [] as route (key(route.name, stamp))}
+						<RouteRow {route} providers={config?.providers ?? []} {reload} />
+					{/each}
+				</Table.Body>
+			</Table.Root>
 		{/if}
 	</Panel>
 
-	<div class="grid items-start gap-4 lg:grid-cols-2">
-		<Panel title="Fournisseurs" note="qui reçoit vraiment les conversations, et si sa clé marche encore" flush>
+	<div class="grid items-start gap-5 lg:grid-cols-2">
+		<Panel
+			title="Fournisseurs"
+			note="qui reçoit vraiment les conversations. Le test dépense un petit appel réel par fournisseur"
+			flush
+		>
 			{#snippet actions()}
-				<Button size="sm" variant="outline" class="h-8 shrink-0" disabled={probing} onclick={runProbe}>
-					<Activity class="size-3.5" />
-					{probing ? 'sonde en cours' : 'tester les clés'}
+				<Button size="sm" class="shrink-0" disabled={probing} onclick={runProbe}>
+					<Activity class="size-4" />
+					{probing ? 'test en cours' : 'tester les clés'}
 				</Button>
 			{/snippet}
 			<ul class="divide-border divide-y">
 				{#each config?.providers ?? [] as p (p.name)}
 					{@const probe = probes?.get(p.name)}
-					<li class="px-4 py-2.5">
+					<li class="px-5 py-3">
 						<div class="flex items-center gap-3">
 							<Server class="text-muted-foreground/60 size-4 shrink-0" />
 							<div class="min-w-0 flex-1">
 								<div class="flex items-center gap-2">
-									{#if probe}
-										<span
-											class="size-2 shrink-0 rounded-full {probe.ok
-												? 'bg-trust-max'
-												: 'bg-destructive'}"
-											title={probe.ok ? 'la clé répond' : 'la clé ne répond pas'}
-										></span>
-									{/if}
 									<span class="truncate text-sm font-medium">{p.name}</span>
 									<TrustBadge trust={p.trust} />
 								</div>
-								<div class="text-muted-foreground truncate font-mono text-xs">{p.base_url}</div>
+								<div class="text-muted-foreground truncate text-xs">{p.base_url}</div>
 							</div>
-							<span class="shrink-0 text-xs {probe ? (probe.ok ? 'text-trust-max' : 'text-destructive') : 'text-muted-foreground'}">
-								{#if probe}
-									{probe.ok ? `ok · ${probe.ms} ms` : (probe.status ? `${probe.status}` : 'injoignable')}
-								{:else}
+							<!-- The dot carries the answer, so it says the three states apart: the
+							     key answered, the key did not, or nobody has asked today. -->
+							{#if probe}
+								<span
+									class="pill tabular {probe.ok ? 'pill-ok' : 'pill-block'}"
+									title={probe.ok ? 'la clé a répondu' : 'la clé n’a pas répondu'}
+								>
+									{probe.ok ? `répond en ${probe.ms} ms` : (probe.status ? `erreur ${probe.status}` : 'injoignable')}
+								</span>
+							{:else}
+								<span class="pill pill-quiet" title="aucun test depuis l’ouverture de la page">
 									{p.keyed ? 'clé en coffre' : 'sans clé'}
-								{/if}
-							</span>
+								</span>
+							{/if}
 						</div>
 						{#if probe && !probe.ok && probe.detail}
-							<p class="text-destructive/90 mt-1.5 ml-7 line-clamp-2 font-mono text-xs">
-								{probe.detail}
-							</p>
+							<p class="text-destructive/90 mt-2 ml-7 line-clamp-2 text-xs">{probe.detail}</p>
 						{/if}
 					</li>
 				{/each}
@@ -127,7 +128,7 @@
 		</Panel>
 
 		<Panel title="Clés virtuelles" note="qui a le droit d’appeler, et jusqu’où">
-			<div class="space-y-2.5">
+			<div class="space-y-3">
 				{#each config?.clients ?? [] as c (c.name)}
 					<div class="flex items-center justify-between gap-3 text-sm">
 						<span class="truncate font-medium">{c.name}</span>

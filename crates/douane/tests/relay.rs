@@ -111,6 +111,11 @@ enum Behaviour {
 struct Upstream {
     seen: Mutex<Vec<Seen>>,
     behaviour: Behaviour,
+    /// What this upstream publishes as its catalogue, and how many times it was
+    /// asked. Swappable so one test can watch a model appear and another watch
+    /// one vanish.
+    catalogue: Mutex<serde_json::Value>,
+    catalogue_calls: Mutex<Vec<Option<String>>>,
 }
 
 impl Upstream {
@@ -118,12 +123,16 @@ impl Upstream {
         let up = Arc::new(Self {
             seen: Mutex::new(Vec::new()),
             behaviour,
+            catalogue: Mutex::new(serde_json::json!({"data": []})),
+            catalogue_calls: Mutex::new(Vec::new()),
         });
         let app = axum::Router::new()
             .route("/v1/messages", axum::routing::post(handle))
             // The other dialect's endpoint, so a test can prove douane asked for
             // the right path and not only that it sent the right body.
             .route("/chat/completions", axum::routing::post(handle))
+            .route("/v1/models", axum::routing::get(handle_catalogue))
+            .route("/models", axum::routing::get(handle_catalogue))
             .with_state(up.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -143,6 +152,41 @@ impl Upstream {
     fn calls(&self) -> usize {
         self.seen.lock().unwrap().len()
     }
+
+    /// Publish this catalogue from now on. Takes `(id, display_name, window)`.
+    fn sells(&self, models: &[(&str, Option<&str>, Option<u64>)]) {
+        let data: Vec<serde_json::Value> = models
+            .iter()
+            .map(|(id, label, ctx)| {
+                let mut v = serde_json::json!({"type": "model", "id": id});
+                if let Some(l) = label {
+                    v["display_name"] = serde_json::json!(l);
+                }
+                if let Some(c) = ctx {
+                    v["context_length"] = serde_json::json!(c);
+                }
+                v
+            })
+            .collect();
+        *self.catalogue.lock().unwrap() = serde_json::json!({"data": data, "has_more": false});
+    }
+
+    /// The credential each catalogue request arrived with. A listing scoped to
+    /// a token is worthless if douane asks anonymously.
+    fn catalogue_keys(&self) -> Vec<Option<String>> {
+        self.catalogue_calls.lock().unwrap().clone()
+    }
+}
+
+async fn handle_catalogue(State(up): State<Arc<Upstream>>, headers: HeaderMap) -> Response {
+    up.catalogue_calls.lock().unwrap().push(
+        headers
+            .get("x-api-key")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned),
+    );
+    let body = up.catalogue.lock().unwrap().clone();
+    axum::Json(body).into_response()
 }
 
 async fn handle(
@@ -277,6 +321,9 @@ async fn broker_with(
                 wire: douane::wire::Wire::Anthropic,
                 trust,
                 timeout_secs: 10,
+                prefix: None,
+                models_path: None,
+                catalog: true,
             },
         );
     }
@@ -332,6 +379,10 @@ async fn broker_with(
 fn secrets() -> Vec<(&'static str, &'static str)> {
     vec![
         ("douane.vk_test", "vk-the-virtual-one"),
+        // Two capped callers, for the tests that check a client is only told
+        // about what it may actually reach.
+        ("douane.vk_sensitive", "vk-sensitive-key"),
+        ("douane.vk_narrow", "vk-narrow-key"),
         ("douane.admin", "admin-token-for-the-dashboard"),
         ("primary.api_key", "sk-real-primary-key-value"),
         ("backup.api_key", "sk-real-backup-key-value"),
@@ -1883,4 +1934,465 @@ async fn a_failing_probe_reports_the_upstreams_words_but_never_a_value() {
         assert!(!text.contains(value), "the probe answer carried {value}");
     }
     assert_eq!(answer["probes"][0]["status"], 401);
+}
+
+// -------------------------------------------------------------- catalogue --
+//
+// The claim these prove: douane can learn what an upstream sells without any of
+// it becoming reachable. Discovery fills a table, the owner switches a row on,
+// and only then does a name become a route. Each test below is one of the ways
+// that could go wrong.
+
+/// Admin helper. The catalogue screen is a handful of small calls, so a test
+/// reads better with one.
+async fn admin(
+    b: &Broker,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> (reqwest::StatusCode, serde_json::Value) {
+    let mut req = reqwest::Client::new()
+        .request(method, format!("{}{path}", b.url))
+        .header("x-douane-admin", "admin-token-for-the-dashboard");
+    if let Some(v) = body {
+        req = req.json(&v);
+    }
+    let res = req.send().await.unwrap();
+    let status = res.status();
+    let json = res.json().await.unwrap_or(serde_json::Value::Null);
+    (status, json)
+}
+
+async fn refresh(b: &Broker) -> serde_json::Value {
+    admin(b, reqwest::Method::POST, "/admin/api/models/refresh", None)
+        .await
+        .1
+}
+
+async fn catalogue(b: &Broker) -> serde_json::Value {
+    admin(b, reqwest::Method::GET, "/admin/api/models", None)
+        .await
+        .1
+}
+
+async fn enable(b: &Broker, route: &str, on: bool) -> reqwest::StatusCode {
+    admin(
+        b,
+        reqwest::Method::PUT,
+        &format!("/admin/api/models/{route}/enabled"),
+        Some(serde_json::json!({ "enabled": on })),
+    )
+    .await
+    .0
+}
+
+/// What one client is told it may ask for.
+async fn listing(b: &Broker, key: &str) -> (reqwest::StatusCode, Vec<String>) {
+    let res = reqwest::Client::new()
+        .get(format!("{}/v1/models", b.url))
+        .header("x-api-key", key)
+        .send()
+        .await
+        .unwrap();
+    let status = res.status();
+    let v: serde_json::Value = res.json().await.unwrap_or(serde_json::Value::Null);
+    let ids = v["data"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|m| m["id"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    (status, ids)
+}
+
+#[tokio::test]
+async fn a_discovered_model_is_not_a_route_until_it_is_switched_on() {
+    let (url, up) = Upstream::spawn(Behaviour::Json).await;
+    up.sells(&[(
+        "deepseek-v4-flash",
+        Some("DeepSeek v4 Flash"),
+        Some(1_000_000),
+    )]);
+    let b = broker(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", None, vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+    )
+    .await;
+
+    let out = refresh(&b).await;
+    assert_eq!(out["refreshed"][0]["ok"], true);
+    assert_eq!(out["refreshed"][0]["found"], 1);
+    assert_eq!(out["refreshed"][0]["added"], 1);
+
+    // Discovery is not permission. The model sits in the catalogue switched
+    // off, and asking for it is still a 404 that never reaches the upstream.
+    let cat = catalogue(&b).await;
+    assert_eq!(cat["models"][0]["route"], "primary-deepseek-v4-flash");
+    assert_eq!(cat["models"][0]["enabled"], false);
+    assert_eq!(cat["models"][0]["label"], "DeepSeek v4 Flash");
+    assert_eq!(cat["models"][0]["context_length"], 1_000_000);
+    let res = call(&b, "vk-the-virtual-one", ask("primary-deepseek-v4-flash")).await;
+    assert_eq!(res.status(), 404);
+    assert_eq!(up.calls(), 0);
+
+    // The owner's click is what creates the route.
+    assert_eq!(enable(&b, "primary-deepseek-v4-flash", true).await, 200);
+    let res = call(&b, "vk-the-virtual-one", ask("primary-deepseek-v4-flash")).await;
+    assert_eq!(res.status(), 200);
+    // It left under the id the upstream spells, with the real key.
+    assert_eq!(up.last().body["model"], "deepseek-v4-flash");
+    assert_eq!(
+        up.last().api_key.as_deref(),
+        Some("sk-real-primary-key-value")
+    );
+
+    // And switching it back off retires the route while the row survives.
+    assert_eq!(enable(&b, "primary-deepseek-v4-flash", false).await, 200);
+    let res = call(&b, "vk-the-virtual-one", ask("primary-deepseek-v4-flash")).await;
+    assert_eq!(res.status(), 404);
+}
+
+#[tokio::test]
+async fn the_catalogue_is_asked_with_the_providers_own_credential() {
+    // A listing is usually scoped to the token, so asking anonymously answers
+    // about somebody else's account.
+    let (url, up) = Upstream::spawn(Behaviour::Json).await;
+    up.sells(&[("a-model", None, None)]);
+    let b = broker(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", None, vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+    )
+    .await;
+
+    refresh(&b).await;
+    let keys = up.catalogue_keys();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].as_deref(), Some("sk-real-primary-key-value"));
+}
+
+#[tokio::test]
+async fn the_file_wins_a_collision_and_the_dashboard_says_so() {
+    // An upstream that starts publishing an id matching a hand-written route
+    // must not be able to repoint it, however that row is switched.
+    let (url, up) = Upstream::spawn(Behaviour::Json).await;
+    let (other, other_up) = Upstream::spawn(Behaviour::Json).await;
+    up.sells(&[("haiku", None, None)]);
+    let b = broker_with(
+        vec![("primary", &url, Trust::Low), ("backup", &other, Trust::Low)],
+        vec![("haiku", "backup", Some("the-one-from-the-file"), vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+        |c| {
+            // An empty prefix makes the generated name land exactly on the
+            // route the file owns, which is the collision being tested.
+            c.providers.get_mut("primary").unwrap().prefix = Some(String::new());
+        },
+    )
+    .await;
+
+    refresh(&b).await;
+    assert_eq!(enable(&b, "haiku", true).await, 200);
+
+    // The call still goes where the file said, and the switch that claims
+    // otherwise is reported rather than silently ignored.
+    let res = call(&b, "vk-the-virtual-one", ask("haiku")).await;
+    assert_eq!(res.status(), 200);
+    assert_eq!(other_up.last().body["model"], "the-one-from-the-file");
+    assert_eq!(up.calls(), 0);
+    let cat = catalogue(&b).await;
+    assert!(
+        cat["collisions"]["haiku"]
+            .as_str()
+            .unwrap()
+            .contains("douane.toml")
+    );
+}
+
+#[tokio::test]
+async fn a_refresh_never_switches_a_model_on_or_off() {
+    // The owner's decision survives every sweep in both directions. A refresh
+    // that enabled something would be a broker widening its own surface; one
+    // that disabled something would cut a working route on a listing.
+    let (url, up) = Upstream::spawn(Behaviour::Json).await;
+    up.sells(&[("stays", None, None), ("goes", None, None)]);
+    let b = broker(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", None, vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+    )
+    .await;
+
+    refresh(&b).await;
+    enable(&b, "primary-stays", true).await;
+    enable(&b, "primary-goes", true).await;
+
+    // The upstream drops one and grows another.
+    up.sells(&[("stays", None, None), ("new", None, None)]);
+    let out = refresh(&b).await;
+    assert_eq!(out["refreshed"][0]["added"], 1);
+    assert_eq!(out["refreshed"][0]["missing"], 1);
+
+    let cat = catalogue(&b).await;
+    let row = |r: &str| {
+        cat["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["route"] == r)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    };
+    // Still enabled, no longer listed, and still serving: an upstream that
+    // stops listing a model it still answers on is common, and cutting the
+    // route on that basis would be douane breaking itself.
+    assert_eq!(row("primary-goes")["enabled"], true);
+    assert_eq!(row("primary-goes")["present"], false);
+    assert_eq!(row("primary-stays")["present"], true);
+    // The new one arrived switched off, like every discovery.
+    assert_eq!(row("primary-new")["enabled"], false);
+
+    let res = call(&b, "vk-the-virtual-one", ask("primary-goes")).await;
+    assert_eq!(res.status(), 200);
+    let res = call(&b, "vk-the-virtual-one", ask("primary-new")).await;
+    assert_eq!(res.status(), 404);
+}
+
+#[tokio::test]
+async fn a_model_can_be_added_by_hand_for_an_upstream_with_no_catalogue() {
+    // The case the manual path exists for: a site publishing nothing, or
+    // publishing a listing narrower than what the token can actually reach.
+    let (url, up) = Upstream::spawn(Behaviour::Json).await;
+    let b = broker_with(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", None, vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+        |c| {
+            c.providers.get_mut("primary").unwrap().catalog = false;
+        },
+    )
+    .await;
+
+    // A refresh says so plainly rather than reporting an empty catalogue.
+    let out = refresh(&b).await;
+    assert_eq!(out["refreshed"][0]["ok"], false);
+    assert!(
+        out["refreshed"][0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("by hand")
+    );
+
+    let (status, _) = admin(
+        &b,
+        reqwest::Method::PUT,
+        "/admin/api/models",
+        Some(serde_json::json!({
+            "provider": "primary",
+            "upstream_id": "grok-4.6",
+            "label": "Grok 4.6",
+            "context_length": 500000,
+            "enabled": true,
+        })),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let res = call(&b, "vk-the-virtual-one", ask("primary-grok-4.6")).await;
+    assert_eq!(res.status(), 200);
+    assert_eq!(up.last().body["model"], "grok-4.6");
+
+    let cat = catalogue(&b).await;
+    assert_eq!(cat["models"][0]["source"], "manual");
+    assert_eq!(cat["models"][0]["context_length"], 500_000);
+}
+
+#[tokio::test]
+async fn a_hand_added_model_cannot_take_a_name_the_file_owns() {
+    let (url, _up) = Upstream::spawn(Behaviour::Json).await;
+    let b = broker(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", None, vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+    )
+    .await;
+
+    let (status, body) = admin(
+        &b,
+        reqwest::Method::PUT,
+        "/admin/api/models",
+        Some(serde_json::json!({
+            "provider": "primary",
+            "upstream_id": "whatever",
+            "route": "haiku",
+            "enabled": true,
+        })),
+    )
+    .await;
+    assert_eq!(status, 409);
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("douane.toml")
+    );
+
+    // A name that would not survive a URL or a command line is refused before
+    // it reaches the database.
+    let (status, _) = admin(
+        &b,
+        reqwest::Method::PUT,
+        "/admin/api/models",
+        Some(serde_json::json!({
+            "provider": "primary",
+            "upstream_id": "whatever",
+            "route": "one that/../escapes",
+        })),
+    )
+    .await;
+    assert_eq!(status, 400);
+
+    // And so is a provider that is not in the file.
+    let (status, _) = admin(
+        &b,
+        reqwest::Method::PUT,
+        "/admin/api/models",
+        Some(serde_json::json!({
+            "provider": "ghost",
+            "upstream_id": "whatever",
+        })),
+    )
+    .await;
+    assert_eq!(status, 400);
+}
+
+#[tokio::test]
+async fn the_model_listing_shows_a_client_only_what_it_may_reach() {
+    // The listing is a client's whole view of the broker, so it answers per
+    // client and not per instance: a capped client learning that a reseller
+    // route exists would be a map of every upstream, handed out on any key.
+    let (cheap, cheap_up) = Upstream::spawn(Behaviour::Json).await;
+    let (house, _house_up) = Upstream::spawn(Behaviour::Json).await;
+    cheap_up.sells(&[("flash", Some("Flash"), Some(128_000))]);
+    let b = broker_with(
+        vec![
+            ("primary", &cheap, Trust::Low),
+            ("backup", &house, Trust::Max),
+        ],
+        vec![
+            ("haiku", "primary", None, vec![]),
+            ("qwopus", "backup", None, vec![]),
+        ],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+        |c| {
+            c.clients.insert(
+                "sensitive".to_owned(),
+                douane::config::Client {
+                    key: SecretRef::parse("douane.vk_sensitive").unwrap(),
+                    routes: Vec::new(),
+                    max_trust: Some(Trust::Max),
+                    note: None,
+                },
+            );
+            c.clients.insert(
+                "narrow".to_owned(),
+                douane::config::Client {
+                    key: SecretRef::parse("douane.vk_narrow").unwrap(),
+                    routes: vec!["qwopus".to_owned()],
+                    max_trust: None,
+                    note: None,
+                },
+            );
+        },
+    )
+    .await;
+
+    refresh(&b).await;
+    enable(&b, "primary-flash", true).await;
+
+    let (status, all) = listing(&b, "vk-the-virtual-one").await;
+    assert_eq!(status, 200);
+    assert!(all.contains(&"haiku".to_owned()));
+    assert!(all.contains(&"qwopus".to_owned()));
+    assert!(all.contains(&"primary-flash".to_owned()));
+
+    // Capped at `max`: the reseller routes are not merely refused on use, they
+    // are not listed at all.
+    let (_, capped) = listing(&b, "vk-sensitive-key").await;
+    assert_eq!(capped, vec!["qwopus".to_owned()]);
+
+    // Restricted to one route by name: same answer, different reason.
+    let (_, narrow) = listing(&b, "vk-narrow-key").await;
+    assert_eq!(narrow, vec!["qwopus".to_owned()]);
+
+    // An unknown key gets a refusal, not an empty list.
+    let (status, _) = listing(&b, "vk-not-a-key").await;
+    assert_eq!(status, 401);
+}
+
+#[tokio::test]
+async fn the_listing_carries_what_a_launcher_needs_and_nothing_about_upstreams() {
+    let (url, up) = Upstream::spawn(Behaviour::Json).await;
+    up.sells(&[("flash", Some("Flash"), Some(128_000))]);
+    let b = broker(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", None, vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+    )
+    .await;
+    refresh(&b).await;
+    enable(&b, "primary-flash", true).await;
+
+    let res = reqwest::Client::new()
+        .get(format!("{}/v1/models", b.url))
+        .header("x-api-key", "vk-the-virtual-one")
+        .send()
+        .await
+        .unwrap();
+    let v: serde_json::Value = res.json().await.unwrap();
+    let flash = v["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "primary-flash")
+        .cloned()
+        .unwrap();
+    assert_eq!(flash["display_name"], "Flash");
+    assert_eq!(flash["context_length"], 128_000);
+    // A route written in the file has no catalogue row, so it answers as
+    // itself rather than inventing a label.
+    let plain = v["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "haiku")
+        .cloned()
+        .unwrap();
+    assert_eq!(plain["display_name"], "haiku");
+
+    // Nothing in the answer names an upstream, a base URL or a credential.
+    let text = v.to_string();
+    assert!(!text.contains("http://"), "the listing leaked a base URL");
+    assert!(!text.contains("127.0.0.1"), "the listing leaked a host");
+    for (_, value) in secrets() {
+        assert!(!text.contains(value), "the listing carried {value}");
+    }
 }

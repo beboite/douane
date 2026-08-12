@@ -27,21 +27,18 @@
 
 <Card.Root class={cn('shadow-panel gap-0 overflow-hidden py-0', className)}>
 	<Card.Header
-		class="flex flex-row items-center justify-between gap-4 space-y-0 border-b px-4 py-3 [.border-b]:pb-3"
+		class="flex flex-row flex-wrap items-center justify-between gap-3 space-y-0 border-b px-5 py-4 [.border-b]:pb-4"
 	>
 		<div class="min-w-0">
-			<Card.Title class="text-sm leading-tight font-semibold">{title}</Card.Title>
+			<Card.Title class="text-[0.95rem] leading-tight font-semibold">{title}</Card.Title>
 			{#if note}
-				<Card.Description class="mt-1 text-xs leading-snug">{note}</Card.Description>
+				<Card.Description class="mt-1 text-[0.8rem] leading-snug">{note}</Card.Description>
 			{/if}
 		</div>
 		{@render actions?.()}
 	</Card.Header>
 	<Card.Content
-		class={cn(
-			flush ? 'overflow-x-auto p-0' : 'p-4',
-			cap && `${cap} overflow-y-auto`
-		)}
+		class={cn(flush ? 'overflow-x-auto p-0' : 'p-5', cap && `${cap} overflow-y-auto`)}
 	>
 		{@render children()}
 	</Card.Content>

@@ -65,7 +65,10 @@ impl AppState {
         http: reqwest::Client,
         audit: Audit,
     ) -> anyhow::Result<Self> {
-        let live = RwLock::new(Arc::new(base.with_overrides(&audit.overrides()?)));
+        let live = RwLock::new(Arc::new(
+            base.with_overrides(&audit.overrides()?)
+                .with_models(&audit.models()?),
+        ));
         let scrubber = RwLock::new(Arc::new(Scrubber::build(vault.as_ref(), base.scrub)));
         Ok(Self {
             base,
@@ -84,9 +87,17 @@ impl AppState {
     }
 
     /// Rebuild the live table from the base plus whatever the database now
-    /// holds. Called after the dashboard changes a route.
+    /// holds. Called after the dashboard changes a route or switches a model on.
+    ///
+    /// The order is the guarantee: the file's routes come first, catalogue
+    /// entries are added around them, and an override edits what is already
+    /// there. So a model switched on can add a name, and never take one over.
     pub fn refresh_routes(&self) -> anyhow::Result<()> {
-        let next = Arc::new(self.base.with_overrides(&self.audit.overrides()?));
+        let next = Arc::new(
+            self.base
+                .with_overrides(&self.audit.overrides()?)
+                .with_models(&self.audit.models()?),
+        );
         *self.live.write().unwrap_or_else(|e| e.into_inner()) = next;
         Ok(())
     }
@@ -720,6 +731,87 @@ where
 /// what is configured.
 pub async fn health() -> &'static str {
     "ok\n"
+}
+
+/// What this caller may ask for, in the shape both dialects publish it.
+///
+/// The point is to stop every client carrying its own copy of the routing
+/// table. A launcher used to hold a hand-written list that had to be edited in
+/// step with `douane.toml`, and forgetting either produced `no route for model`
+/// from opposite causes.
+///
+/// **The answer is per client, not per instance.** The caps are the same ones
+/// the relay enforces on a real call: a client restricted to a few routes sees
+/// those routes, and a client capped at a trust level never learns that the
+/// resellers exist. Anything else would turn this into a map of every upstream
+/// the broker knows, handed out on any valid virtual key.
+///
+/// Nothing here names a credential, a base URL or a provider. The route name is
+/// the client's whole vocabulary, which is the same reason the relay answers on
+/// one.
+pub async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let config = state.config();
+
+    let Some(presented) = presented_key(&headers) else {
+        return json_error(
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "no virtual key presented",
+        );
+    };
+    let Some((_, client)) = state.authenticate(&config, &presented) else {
+        return json_error(
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "unknown virtual key",
+        );
+    };
+
+    // Labels and windows for the routes that came from a catalogue. A route
+    // written by hand in the TOML has neither, and answering without them is
+    // right: the file says where a name goes, not what the model is called.
+    let described: std::collections::HashMap<String, crate::catalog::ModelEntry> = state
+        .audit
+        .models()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| (m.route.clone(), m))
+        .collect();
+
+    let mut data = Vec::new();
+    for (name, route) in &config.routes {
+        if !client.routes.is_empty() && !client.routes.iter().any(|r| r == name) {
+            continue;
+        }
+        let Some(provider) = config.providers.get(&route.provider) else {
+            continue;
+        };
+        if let Some(cap) = client.max_trust
+            && provider.trust > cap
+        {
+            continue;
+        }
+        let known = described.get(name);
+        let mut entry = serde_json::json!({
+            "type": "model",
+            "id": name,
+            "display_name": known
+                .and_then(|m| m.label.clone())
+                .unwrap_or_else(|| name.clone()),
+        });
+        // An extension both dialects tolerate, and the reason a launcher can
+        // stop keeping its own table of context windows.
+        if let Some(n) = known.and_then(|m| m.context_length) {
+            entry["context_length"] = serde_json::json!(n);
+        }
+        data.push(entry);
+    }
+
+    axum::Json(serde_json::json!({
+        "data": data,
+        "has_more": false,
+    }))
+    .into_response()
 }
 
 #[cfg(test)]

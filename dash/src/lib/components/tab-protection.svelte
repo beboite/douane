@@ -78,13 +78,13 @@
 		}
 	}
 
-	/* The stamp on each entry of the register. One word, the way a customs
-	   officer answers. */
-	const stamp: Record<string, { label: string; tone: string }> = {
-		block: { label: 'bloqué', tone: 'stamp-block' },
-		substitute: { label: 'substitué', tone: 'stamp-substitute' },
-		warn: { label: 'noté', tone: 'stamp-warn' },
-		allow: { label: 'passé', tone: 'stamp-quiet' }
+	/* The verdict on each entry of the register. One word, read at a glance,
+	   which is the only job a status has. */
+	const verdict: Record<string, { label: string; tone: string }> = {
+		block: { label: 'Bloqué', tone: 'pill-block' },
+		substitute: { label: 'Substitué', tone: 'pill-substitute' },
+		warn: { label: 'Noté', tone: 'pill-warn' },
+		allow: { label: 'Passé', tone: 'pill-quiet' }
 	};
 
 	/* What happened, said as a sentence. The reference or the pattern, never
@@ -104,35 +104,19 @@
 		}
 	}
 
-	const grantStamp: Record<string, { label: string; tone: string }> = {
-		approved: { label: 'accordé', tone: 'stamp-ok' },
-		denied: { label: 'refusé', tone: 'stamp-block' },
-		cancelled: { label: 'retiré', tone: 'stamp-quiet' }
+	const grantVerdict: Record<string, { label: string; tone: string }> = {
+		approved: { label: 'Accordé', tone: 'pill-ok' },
+		denied: { label: 'Refusé', tone: 'pill-block' },
+		cancelled: { label: 'Retiré', tone: 'pill-quiet' }
 	};
 </script>
 
-<div class="space-y-4">
-	<!-- The verdict, stamped. The one thing this page exists to say, said the
-	     way this office says things: R.A.S. when every body left clean, the
-	     interception count in stamp ink when the net caught something. -->
-	<div
-		class="shadow-panel bg-card grid rounded-lg border sm:grid-cols-[minmax(15rem,1.2fr)_2fr]"
-	>
-		<div
-			class="border-border flex flex-col items-start justify-center gap-2.5 border-b px-5 py-6 sm:border-r sm:border-b-0"
-		>
-			{#key stopped}
-				<span class="stamp-hero {stopped > 0 ? 'text-primary' : 'text-trust-max'}">
-					{stopped > 0 ? `${count(stopped)} interception${stopped > 1 ? 's' : ''}` : 'R.A.S.'}
-				</span>
-			{/key}
-			<p class="text-muted-foreground text-xs leading-snug">
-				{stopped > 0
-					? 'des corps partants portaient une valeur du coffre, bloqués ou réécrits avant la sortie'
-					: 'aucun corps parti ne portait de valeur du coffre'}
-			</p>
-		</div>
-		<div class="divide-border grid divide-y sm:grid-cols-3 sm:divide-x sm:divide-y-0">
+<div class="space-y-5">
+	<!-- Three cards, side by side, each carrying one figure. They sit on the
+	     same surface as the panels below so the eye reads one page, not a
+	     header bolted onto a list. -->
+	<div class="grid gap-4 sm:grid-cols-3">
+		<div class="shadow-panel bg-card ring-foreground/10 rounded-xl ring-1">
 			<Metric
 				label="valeurs surveillées"
 				value={watching}
@@ -140,14 +124,20 @@
 				icon={Eye}
 				hint="reconnues dans tout ce qui part"
 			/>
+		</div>
+		<!-- Deliberately not red: a leak that was caught is the broker doing its
+		     job, and an alarm colour here reads as something being wrong. -->
+		<div class="shadow-panel bg-card ring-foreground/10 rounded-xl ring-1">
 			<Metric
 				label="fuites arrêtées"
 				value={stopped}
 				format={count}
 				icon={stopped > 0 ? ShieldAlert : ShieldCheck}
-				tone={stopped > 0 ? 'warn' : 'quiet'}
+				tone={stopped > 0 ? 'accent' : 'quiet'}
 				hint={stopped > 0 ? 'bloquées ou réécrites avant de partir' : 'rien à arrêter'}
 			/>
+		</div>
+		<div class="shadow-panel bg-card ring-foreground/10 rounded-xl ring-1">
 			<Metric
 				label="en attente"
 				value={pending.length}
@@ -162,32 +152,36 @@
 	{#if pending.length > 0}
 		<Panel
 			title="Demandes d’accès"
-			note="accorder livre le nom, jamais la valeur : elle ne bouge que par la rédemption locale"
+			note="Accorder livre le nom de la référence, jamais sa valeur."
 			flush
 		>
 			<ul class="divide-border divide-y">
 				{#each pending as g (g.id)}
-					<li class="px-4 py-3.5" transition:slide={{ duration: 180, easing: cubicOut }}>
-						<div class="flex flex-wrap items-center gap-x-3 gap-y-2">
+					<li class="px-5 py-4" transition:slide={{ duration: 180, easing: cubicOut }}>
+						<div class="flex flex-wrap items-start justify-between gap-x-4 gap-y-3">
 							<div class="min-w-0 flex-1">
-								<div class="flex flex-wrap items-baseline gap-x-2">
+								<div class="flex flex-wrap items-baseline gap-x-2 gap-y-1">
 									<span class="text-sm font-semibold">{g.client}</span>
 									<span class="text-muted-foreground text-xs">demande</span>
-									<code class="bg-muted rounded px-1.5 py-0.5 font-mono text-xs">{g.reference}</code>
+									<span class="bg-muted rounded-md px-2 py-0.5 text-xs font-semibold">
+										{g.reference}
+									</span>
 									<span class="text-muted-foreground text-xs" title={g.at}>{ago(g.at)}</span>
 								</div>
-								<p class="text-muted-foreground mt-1 border-l-2 pl-2.5 text-sm italic">
+								<p class="text-muted-foreground mt-1.5 border-l-2 pl-3 text-sm">
 									{g.reason}
 								</p>
 							</div>
 
-							<div class="flex shrink-0 items-center gap-1.5">
+							<!-- The one place in the app where a click costs something, so the
+							     two answers are spelled out and filled, never an icon. -->
+							<div class="flex shrink-0 flex-wrap items-center gap-2">
 								<Select.Root
 									type="single"
 									value={ttl[g.id] ?? '24'}
 									onValueChange={(v) => (ttl = { ...ttl, [g.id]: v })}
 								>
-									<Select.Trigger class="h-8 w-[7.5rem] text-xs">
+									<Select.Trigger class="w-[7.5rem]" aria-label="Durée de l’accès">
 										{TTLS.find((t) => t.value === (ttl[g.id] ?? '24'))?.label}
 									</Select.Trigger>
 									<Select.Content>
@@ -196,39 +190,44 @@
 										{/each}
 									</Select.Content>
 								</Select.Root>
-								<Button size="sm" class="h-8" disabled={busy === g.id} onclick={() => decide(g, true)}>
-									accorder
+								<Button
+									size="sm"
+									class="h-8 px-4"
+									disabled={busy === g.id}
+									onclick={() => decide(g, true)}
+								>
+									Accorder
 								</Button>
 								<Button
 									size="sm"
-									variant="outline"
-									class="text-destructive h-8"
+									variant="destructive"
+									class="h-8 px-4"
 									disabled={busy === g.id}
 									onclick={() => (refusing = refusing === g.id ? null : g.id)}
 								>
-									refuser
+									Refuser
 								</Button>
 							</div>
 						</div>
 
 						{#if refusing === g.id}
 							<div
-								class="mt-2.5 flex items-center gap-1.5"
+								class="mt-3 flex flex-wrap items-center gap-2"
 								transition:slide={{ duration: 150, easing: cubicOut }}
 							>
 								<Input
 									bind:value={refusalNote}
-									placeholder="un mot pour l’agent (facultatif)"
-									class="h-8 max-w-md text-xs"
+									placeholder="Un mot pour l’agent (facultatif)"
+									class="h-8 max-w-md flex-1"
 								/>
 								<Button
 									size="sm"
 									variant="destructive"
-									class="h-8"
+									class="h-8 px-4"
 									disabled={busy === g.id}
 									onclick={() => decide(g, false)}
 								>
-									confirmer le refus
+									Confirmer le refus
 								</Button>
 							</div>
 						{/if}
@@ -240,31 +239,29 @@
 
 	<Panel
 		title="Registre des interceptions"
-		note="ce qui a été arrêté ou réécrit avant la sortie. Chaque ligne nomme la référence, jamais le texte trouvé"
+		note="Chaque ligne nomme la référence ou le motif, jamais le texte trouvé."
 		flush
 		cap={alerts.length ? 'max-h-[30rem]' : ''}
 	>
 		{#if alerts.length === 0}
 			<Empty
 				icon={ShieldCheck}
-				title="rien à signaler"
-				hint="aucun corps partant ne portait de valeur du coffre, et chaque appel avait le droit de passer"
+				title="Rien à signaler"
+				hint="Aucune requête sortante ne portait de valeur du coffre, et chaque appel avait le droit de passer."
 			/>
 		{:else}
 			<ul class="divide-border divide-y">
 				{#each alerts as a (a.id)}
-					<li class="flex items-center gap-3 px-4 py-2.5">
-						<span class="stamp {stamp[a.action]?.tone ?? 'stamp-quiet'}">
-							{stamp[a.action]?.label ?? a.action}
+					<li class="flex items-center gap-3 px-5 py-3">
+						<span class="pill {verdict[a.action]?.tone ?? 'pill-quiet'}">
+							{verdict[a.action]?.label ?? a.action}
 						</span>
 						<div class="min-w-0 flex-1">
-							<p class="truncate text-sm">
-								<span class="font-mono text-xs">{story(a)}</span>
-							</p>
-							<p class="text-muted-foreground mt-0.5 flex items-center gap-2 text-xs">
+							<p class="truncate text-sm" title={story(a)}>{story(a)}</p>
+							<p class="text-muted-foreground mt-1 flex items-center gap-2 text-xs">
 								{a.client}
 								<TrustBadge trust={a.trust} />
-								<span title={a.at}>{when(a.at)}</span>
+								<span class="tabular" title={a.at}>{when(a.at)}</span>
 							</p>
 						</div>
 					</li>
@@ -276,22 +273,22 @@
 	{#if decided.length > 0}
 		<Panel
 			title="Décisions récentes"
-			note="les demandes déjà tranchées, et si la clé accordée a servi"
+			note="Les demandes déjà tranchées, et si la clé accordée a servi."
 			flush
 		>
 			<ul class="divide-border divide-y">
 				{#each decided as g (g.id)}
-					<li class="flex items-center gap-3 px-4 py-2.5">
-						<span class="stamp {grantStamp[g.status]?.tone ?? 'stamp-quiet'}">
-							{grantStamp[g.status]?.label ?? g.status}
+					<li class="flex items-center gap-3 px-5 py-3">
+						<span class="pill {grantVerdict[g.status]?.tone ?? 'pill-quiet'}">
+							{grantVerdict[g.status]?.label ?? g.status}
 						</span>
 						<div class="min-w-0 flex-1">
 							<p class="truncate text-sm">
 								<span class="font-medium">{g.client}</span>
 								<span class="text-muted-foreground">·</span>
-								<code class="font-mono text-xs">{g.reference}</code>
+								<span class="text-muted-foreground text-xs font-semibold">{g.reference}</span>
 							</p>
-							<p class="text-muted-foreground mt-0.5 truncate text-xs">
+							<p class="text-muted-foreground mt-1 truncate text-xs">
 								{#if g.status === 'approved'}
 									{g.used_at ? `utilisée ${ago(g.used_at)}` : 'jamais utilisée'}
 									{#if g.expires_at}

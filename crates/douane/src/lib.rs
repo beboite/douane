@@ -6,6 +6,7 @@
 //! than assert on the pieces separately and hope they fit together.
 
 pub mod audit;
+pub mod catalog;
 pub mod config;
 pub mod dash;
 pub mod egress;
@@ -31,6 +32,11 @@ use crate::proxy::AppState;
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/messages", post(proxy::messages))
+        // What this caller may ask for. Authenticated by the same virtual keys
+        // as the relay and filtered by the same caps, so a client never learns
+        // that a route it cannot reach exists. This is what lets a launcher
+        // stop keeping a hand-written copy of the routing table.
+        .route("/v1/models", get(proxy::models))
         .route("/health", get(proxy::health))
         // Stateless MCP: one POST per request, no session, Tasks for anything
         // that waits on a human. Guarded by the same virtual keys as the relay.
@@ -60,6 +66,20 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/api/providers/probe", post(dash::probe))
         .route("/admin/api/routes/{name}", put(dash::set_route))
         .route("/admin/api/routes/{name}", delete(dash::clear_route))
+        // The catalogue. Reading it is free; refreshing it spends one request
+        // per upstream, so that one is a POST like the probe is.
+        .route("/admin/api/models", get(dash::models))
+        .route("/admin/api/models", put(dash::put_model))
+        .route("/admin/api/models/refresh", post(dash::refresh_models))
+        .route(
+            "/admin/api/models/{route}/enabled",
+            put(dash::set_model_enabled),
+        )
+        .route("/admin/api/models/{route}", delete(dash::delete_model))
+        .route(
+            "/admin/api/providers/{provider}/models/enabled",
+            put(dash::set_provider_models_enabled),
+        )
         .route("/admin/api/grants", get(dash::grants))
         .route("/admin/api/grants/{id}/decide", post(dash::decide_grant))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(

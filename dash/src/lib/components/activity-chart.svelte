@@ -11,10 +11,9 @@
 	 *  invents a rise where there was one call and a fall where there was one
 	 *  fewer, so a quiet day reads as a mountain range.
 	 *
-	 *  Only quantities that are one number get a height. A cost is a map keyed by
-	 *  currency, so plotting it would mean adding yuan to dollars to get pixels,
-	 *  which is the one thing this project refuses to do anywhere else. Cost
-	 *  appears in the tooltip, per unit, and never as a bar. */
+	 *  One colour for both measures, and it is the accent rather than one of the
+	 *  three trust colours: green, amber and red mean who read the conversation,
+	 *  and a chart borrowing one would turn a busy hour into an alarm. */
 	let {
 		series,
 		measure = $bindable('calls')
@@ -38,25 +37,24 @@
 		tokens: { label: 'tokens', color: 'var(--chart-1)' }
 	} satisfies Chart.ChartConfig);
 
-	const shape = $derived(measure === 'calls' ? count : tokens);
-
 	/* There is no such thing as half an appel. On a quiet window the scale runs
 	   0 to 2 and d3 offers 0,5 and 1,5 as ticks, which read as a measurement
 	   this axis cannot make. Fractions lose their label and keep their grid
 	   line, so the spacing stays even. */
-	const yLabel = $derived((v: number) =>
-		measure === 'calls' && !Number.isInteger(v) ? '' : shape(v)
-	);
+	const yLabel = $derived.by(() => {
+		const shape = measure === 'calls' ? count : tokens;
+		return (v: number) => (measure === 'calls' && !Number.isInteger(v) ? '' : shape(v));
+	});
 </script>
 
-<Chart.Container {config} class="aspect-auto h-[13rem] w-full">
+<Chart.Container {config} class="aspect-auto h-[14rem] w-full">
 	<BarChart
 		data={points}
 		x="at"
 		series={[{ key: measure, label: config[measure].label, color: `var(--color-${measure})` }]}
-		bandPadding={0.25}
+		bandPadding={0.3}
 		props={{
-			bars: { radius: 3, rounded: 'top', strokeWidth: 0 },
+			bars: { radius: 5, rounded: 'top', strokeWidth: 0 },
 			xAxis: { ticks: 6, format: (v: Date) => axisLabel(v.toISOString(), width) },
 			yAxis: { ticks: 4, format: yLabel },
 			grid: { class: 'stroke-grid' },

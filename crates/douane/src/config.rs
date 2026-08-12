@@ -111,6 +111,22 @@ pub struct Provider {
     /// once the first byte has arrived.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    /// What a route generated from this provider's catalogue is called:
+    /// `<prefix><upstream id>`. Three resellers sell the same model, so a bare
+    /// model name could only ever reach one of them, and the prefix is what
+    /// keeps `opus-5` on this site distinguishable from `opus-5` on the next.
+    /// Defaults to the provider's own name followed by a dash.
+    #[serde(default)]
+    pub prefix: Option<String>,
+    /// Where this upstream publishes what it sells. Absent means the dialect's
+    /// usual path ([`crate::wire::Wire::models_path`]); an absolute URL is used
+    /// as written, for the sites that publish a catalogue somewhere else
+    /// entirely. `catalog = false` on the provider turns the listing off for an
+    /// upstream that has none, and its models are then added by hand.
+    #[serde(default)]
+    pub models_path: Option<String>,
+    #[serde(default = "yes")]
+    pub catalog: bool,
 }
 
 fn default_auth_header() -> String {
@@ -129,6 +145,56 @@ impl Provider {
             key.to_owned()
         }
     }
+
+    /// The full URL of this provider's catalogue, or `None` when it has none.
+    pub fn catalog_url(&self) -> Option<String> {
+        if !self.catalog {
+            return None;
+        }
+        Some(match self.models_path.as_deref() {
+            Some(p) if p.starts_with("http://") || p.starts_with("https://") => p.to_owned(),
+            Some(p) => format!("{}{}", self.base_url.trim_end_matches('/'), p),
+            None => format!(
+                "{}{}",
+                self.base_url.trim_end_matches('/'),
+                self.wire.models_path()
+            ),
+        })
+    }
+}
+
+/// What a discovered model is called on this side.
+///
+/// Route names are the broker's own vocabulary, so an upstream id that would
+/// make a confusing or unusable one is rewritten rather than trusted: an id
+/// travels in a URL path in the dashboard and in a `--model` argument on the
+/// client, and neither survives a slash or a space.
+pub fn route_name_for(prefix: &str, upstream_id: &str) -> String {
+    // The id is slugged on its own and only then joined to the prefix. Doing
+    // both in one pass lets a prefix ending in a separator meet an id starting
+    // with one and produce `cx--weird`.
+    let mut slug = String::with_capacity(upstream_id.len());
+    let mut last_dash = false;
+    for c in upstream_id.chars() {
+        if c.is_ascii_alphanumeric() || c == '.' {
+            slug.push(c.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            slug.push('-');
+            last_dash = true;
+        }
+    }
+    format!("{prefix}{}", slug.trim_matches('-'))
+}
+
+/// Whether a name may be used as a route. The same rule the generated form
+/// obeys, applied to what a human types into the dashboard.
+pub fn is_usable_route_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '[' | ']'))
 }
 
 /// What happens when a client asks for a given model name.

@@ -5,130 +5,137 @@
    party for nothing, fonts included: a font request tells whoever serves it the
    time of every visit and the address it came from.
 
-   IBM Plex, because this is a customs office: a typeface drawn for forms,
-   ledgers and machine bureaucracy, not a startup landing page. The mono cut
-   carries every number and every reference; the sans carries the sentences. */
-@import "@fontsource-variable/ibm-plex-sans";
-@import "@fontsource/ibm-plex-mono/400.css";
-@import "@fontsource/ibm-plex-mono/500.css";
-@import "@fontsource/ibm-plex-mono/600.css";
+   Two faces, two jobs, no monospace anywhere. Bricolage Grotesque carries the
+   headline figures and the screen titles: it has personality without being
+   decorative, and its digits are wide enough to read across a room. Figtree
+   carries every sentence, label and button, because it is friendly at 13px,
+   which is where most of this page lives. Numbers line up through
+   `tabular-nums` rather than through a typewriter face: alignment was the only
+   thing the monospace was buying, and it cost legibility on every word next to
+   it. */
+@import "@fontsource-variable/figtree";
+@import "@fontsource-variable/bricolage-grotesque";
 
 @custom-variant dark (&:is(.dark *));
 
-/* Ink on paper. The whole page is a customs ledger: a blued paper ground, one
-   stamp-ink blue for everything that acts, and the three trust colours kept
-   free to mean what they mean. Red, amber and green are statuses here, so the
-   accent could never borrow one without turning a button into an alarm. */
-:root {
-	/* Forms have corners. Half the old roundness: a fiche, not a bubble. */
-	--radius: 0.5rem;
+/* A border post that is glad to see you.
 
-	--background: oklch(0.966 0.007 254);
-	--foreground: oklch(0.215 0.03 264);
-	--card: oklch(0.993 0.002 254);
-	--card-foreground: oklch(0.215 0.03 264);
-	--popover: oklch(0.993 0.002 254);
-	--popover-foreground: oklch(0.215 0.03 264);
-	/* Stamp ink: the dark blue of a hand stamp pressed twice. */
-	--primary: oklch(0.43 0.115 262);
-	--primary-foreground: oklch(0.985 0.005 254);
-	--secondary: oklch(0.94 0.012 256);
-	--secondary-foreground: oklch(0.3 0.03 262);
-	--muted: oklch(0.94 0.012 256);
-	--muted-foreground: oklch(0.49 0.024 260);
-	--accent: oklch(0.925 0.018 258);
-	--accent-foreground: oklch(0.3 0.055 262);
-	--destructive: oklch(0.577 0.245 27.3);
-	--destructive-foreground: oklch(0.985 0.005 254);
-	--border: oklch(0.88 0.013 256);
-	--input: oklch(0.88 0.013 256);
-	--ring: oklch(0.43 0.115 262);
+   The page is calm and light, one confident violet-blue for everything that
+   acts, and the three trust colours kept free to mean what they mean. Red,
+   amber and green are statuses here, so the accent could never borrow one
+   without turning a button into an alarm. */
+:root {
+	/* Generous. A control you want people to press should not have corners
+	   like a form field from 1998. */
+	--radius: 0.875rem;
+
+	--background: oklch(0.976 0.005 250);
+	--foreground: oklch(0.235 0.028 268);
+	--card: oklch(1 0 0);
+	--card-foreground: oklch(0.235 0.028 268);
+	--popover: oklch(1 0 0);
+	--popover-foreground: oklch(0.235 0.028 268);
+	/* The one colour that acts. Everything clickable and consequential is this
+	   violet-blue, and nothing else is. */
+	--primary: oklch(0.53 0.175 277);
+	--primary-foreground: oklch(0.99 0.003 250);
+	--secondary: oklch(0.945 0.011 262);
+	--secondary-foreground: oklch(0.32 0.035 272);
+	--muted: oklch(0.955 0.008 258);
+	--muted-foreground: oklch(0.505 0.022 265);
+	--accent: oklch(0.945 0.022 275);
+	--accent-foreground: oklch(0.36 0.09 277);
+	--destructive: oklch(0.575 0.225 25);
+	--destructive-foreground: oklch(0.99 0.003 250);
+	--border: oklch(0.9 0.01 262);
+	--input: oklch(0.885 0.012 262);
+	--ring: oklch(0.53 0.175 277);
 
 	/* One step below the card, for a row nested inside one. */
-	--sunken: oklch(0.955 0.008 255);
-	--elevation: 0 1px 2px oklch(0.25 0.05 262 / 7%), 0 1px 1px oklch(0.25 0.05 262 / 4%);
-	--elevation-lifted: 0 4px 16px oklch(0.25 0.05 262 / 9%), 0 1px 2px oklch(0.25 0.05 262 / 5%);
-	--grid: oklch(0.885 0.012 256);
+	--sunken: oklch(0.968 0.007 258);
+	--elevation: 0 1px 2px oklch(0.3 0.05 272 / 6%), 0 4px 12px oklch(0.3 0.05 272 / 5%);
+	--elevation-lifted: 0 2px 4px oklch(0.3 0.05 272 / 6%), 0 12px 32px oklch(0.3 0.05 272 / 10%);
+	--grid: oklch(0.9 0.01 262);
 
-	--chart-1: oklch(0.55 0.12 258);
+	--chart-1: oklch(0.58 0.16 277);
 	--chart-2: oklch(0.64 0.12 165);
 	--chart-3: oklch(0.72 0.14 85);
-	--chart-4: oklch(0.58 0.17 300);
+	--chart-4: oklch(0.6 0.17 320);
 	--chart-5: oklch(0.63 0.17 15);
 
 	/* Trust is the axis the whole project turns on, so it gets its own three
 	   colours and they never move. Green is a machine the user owns, amber a
 	   vendor with a contract, red a reseller that reads everything. */
-	--trust-max: oklch(0.58 0.13 155);
-	--trust-mid: oklch(0.66 0.15 75);
-	--trust-low: oklch(0.6 0.2 25);
+	--trust-max: oklch(0.56 0.135 155);
+	--trust-mid: oklch(0.64 0.145 72);
+	--trust-low: oklch(0.585 0.2 25);
 
-	/* The rail the whole app hangs off. A shade of paper darker than the page,
-	   so the content reads as the sheet on the desk. */
-	--sidebar: oklch(0.942 0.01 256);
-	--sidebar-foreground: oklch(0.215 0.03 264);
-	--sidebar-primary: oklch(0.43 0.115 262);
-	--sidebar-primary-foreground: oklch(0.985 0.005 254);
-	--sidebar-accent: oklch(0.905 0.015 258);
-	--sidebar-accent-foreground: oklch(0.28 0.04 262);
-	--sidebar-border: oklch(0.872 0.013 256);
-	--sidebar-ring: oklch(0.43 0.115 262);
+	/* The rail. Slightly deeper than the page so the content reads as the
+	   thing you are working on. */
+	--sidebar: oklch(0.945 0.012 265);
+	--sidebar-foreground: oklch(0.235 0.028 268);
+	--sidebar-primary: oklch(0.53 0.175 277);
+	--sidebar-primary-foreground: oklch(0.99 0.003 250);
+	--sidebar-accent: oklch(0.915 0.018 272);
+	--sidebar-accent-foreground: oklch(0.3 0.05 275);
+	--sidebar-border: oklch(0.888 0.012 265);
+	--sidebar-ring: oklch(0.53 0.175 277);
 }
 
-/* The night shift. Same office, lights off: blue-black ink rather than a
-   neutral grey, and the stamp ink lightened just enough to read. */
+/* The night shift. Same post, lights down: a blue-black ground and the accent
+   lifted until it reads without glaring. */
 .dark {
-	--background: oklch(0.152 0.02 263);
-	--foreground: oklch(0.955 0.006 250);
-	--card: oklch(0.192 0.022 263);
-	--card-foreground: oklch(0.955 0.006 250);
-	--popover: oklch(0.225 0.024 263);
-	--popover-foreground: oklch(0.955 0.006 250);
-	--primary: oklch(0.77 0.105 250);
-	--primary-foreground: oklch(0.17 0.035 262);
-	--secondary: oklch(0.25 0.022 262);
-	--secondary-foreground: oklch(0.955 0.006 250);
-	--muted: oklch(0.25 0.022 262);
-	--muted-foreground: oklch(0.7 0.02 255);
-	--accent: oklch(0.285 0.03 260);
-	--accent-foreground: oklch(0.93 0.02 252);
-	--destructive: oklch(0.704 0.191 22.2);
-	--destructive-foreground: oklch(0.17 0.035 262);
-	--border: oklch(1 0 0 / 10%);
-	--input: oklch(1 0 0 / 14%);
-	--ring: oklch(0.77 0.105 250);
+	--background: oklch(0.168 0.018 270);
+	--foreground: oklch(0.96 0.005 260);
+	--card: oklch(0.212 0.021 270);
+	--card-foreground: oklch(0.96 0.005 260);
+	--popover: oklch(0.24 0.023 270);
+	--popover-foreground: oklch(0.96 0.005 260);
+	--primary: oklch(0.745 0.145 280);
+	--primary-foreground: oklch(0.18 0.035 275);
+	--secondary: oklch(0.268 0.022 270);
+	--secondary-foreground: oklch(0.96 0.005 260);
+	--muted: oklch(0.262 0.02 268);
+	--muted-foreground: oklch(0.715 0.02 262);
+	--accent: oklch(0.305 0.035 275);
+	--accent-foreground: oklch(0.94 0.02 268);
+	--destructive: oklch(0.7 0.19 22);
+	--destructive-foreground: oklch(0.18 0.035 275);
+	--border: oklch(1 0 0 / 11%);
+	--input: oklch(1 0 0 / 15%);
+	--ring: oklch(0.745 0.145 280);
 
-	--sunken: oklch(0.175 0.02 263);
+	--sunken: oklch(0.19 0.019 270);
 	--elevation: 0 1px 2px oklch(0 0 0 / 40%);
-	--elevation-lifted: 0 8px 28px oklch(0 0 0 / 45%), 0 1px 2px oklch(0 0 0 / 35%);
-	--grid: oklch(1 0 0 / 7%);
+	--elevation-lifted: 0 12px 32px oklch(0 0 0 / 45%), 0 1px 2px oklch(0 0 0 / 35%);
+	--grid: oklch(1 0 0 / 8%);
 
-	--chart-1: oklch(0.7 0.115 252);
+	--chart-1: oklch(0.72 0.15 280);
 	--chart-2: oklch(0.72 0.12 165);
 	--chart-3: oklch(0.8 0.14 85);
-	--chart-4: oklch(0.68 0.17 300);
+	--chart-4: oklch(0.7 0.17 320);
 	--chart-5: oklch(0.72 0.17 15);
 
 	--trust-max: oklch(0.72 0.15 155);
-	--trust-mid: oklch(0.78 0.15 78);
+	--trust-mid: oklch(0.79 0.15 78);
 	--trust-low: oklch(0.7 0.19 25);
 
-	--sidebar: oklch(0.128 0.018 264);
-	--sidebar-foreground: oklch(0.95 0.006 250);
-	--sidebar-primary: oklch(0.77 0.105 250);
-	--sidebar-primary-foreground: oklch(0.17 0.035 262);
-	--sidebar-accent: oklch(0.205 0.024 263);
-	--sidebar-accent-foreground: oklch(0.95 0.006 250);
-	--sidebar-border: oklch(1 0 0 / 8%);
-	--sidebar-ring: oklch(0.77 0.105 250);
+	--sidebar: oklch(0.145 0.017 272);
+	--sidebar-foreground: oklch(0.95 0.005 260);
+	--sidebar-primary: oklch(0.745 0.145 280);
+	--sidebar-primary-foreground: oklch(0.18 0.035 275);
+	--sidebar-accent: oklch(0.235 0.025 272);
+	--sidebar-accent-foreground: oklch(0.95 0.005 260);
+	--sidebar-border: oklch(1 0 0 / 9%);
+	--sidebar-ring: oklch(0.745 0.145 280);
 }
 
 @theme inline {
-	--font-sans: "IBM Plex Sans Variable", ui-sans-serif, system-ui, sans-serif;
-	--font-mono: "IBM Plex Mono", ui-monospace, monospace;
+	--font-sans: "Figtree Variable", ui-sans-serif, system-ui, sans-serif;
+	--font-display: "Bricolage Grotesque Variable", "Figtree Variable", sans-serif;
 
-	--radius-sm: calc(var(--radius) - 4px);
-	--radius-md: calc(var(--radius) - 2px);
+	--radius-sm: calc(var(--radius) - 6px);
+	--radius-md: calc(var(--radius) - 4px);
 	--radius-lg: var(--radius);
 	--radius-xl: calc(var(--radius) + 4px);
 
@@ -184,109 +191,81 @@
 	body {
 		@apply bg-background text-foreground;
 	}
-	/* Every number in this dashboard is compared against the one above it, so
-	   digits keep the same width whatever they are. */
+	/* Every number here is read against the one above it, so digits keep the
+	   same width whatever they are. This is what the monospace face used to be
+	   for, at none of its cost. */
 	.tabular {
 		font-variant-numeric: tabular-nums;
 	}
 }
 
 @layer components {
-	/* The one label style in the app. Small, wide, quiet: it names the number
-	   under it and then gets out of the way. */
+	/* The one label style in the app. It names the thing under it and then gets
+	   out of the way. */
 	.eyebrow {
-		@apply text-muted-foreground text-[0.68rem] font-medium tracking-[0.1em] uppercase;
+		@apply text-muted-foreground text-[0.7rem] font-semibold tracking-[0.06em] uppercase;
 	}
 
 	/* A row that reacts to being pointed at. Used everywhere a click does
 	   something, and nowhere it does not, so hover is a promise. */
 	.rowlink {
-		@apply hover:bg-accent/40 cursor-pointer transition-colors;
+		@apply hover:bg-accent/50 cursor-pointer transition-colors;
 	}
 
-	/* A headline figure, set in the ledger hand: the mono cut, semibold,
-	   digits aligned. The sans never carries a number this size. */
+	/* A headline figure. Display face, heavy, digits aligned: the number is the
+	   thing on these screens, so it is allowed to be the loudest thing on them. */
 	.ledger {
-		@apply font-mono font-semibold tracking-tight;
+		font-family: var(--font-display);
+		font-weight: 700;
+		letter-spacing: -0.02em;
 		font-variant-numeric: tabular-nums;
 	}
 
-	/* The name of the office, letterspaced the way it is engraved on the
-	   plaque. Mono, because the plaque is set in the same hand as the ledger. */
+	/* The name over the door. */
 	.wordmark {
-		@apply font-mono text-sm font-semibold tracking-[0.32em] uppercase;
+		font-family: var(--font-display);
+		@apply text-[1.05rem] font-bold tracking-tight lowercase;
 	}
 
-	/* The customs stamp: one word, inked, slightly off the horizontal the way a
-	   hand stamp lands. It marks every entry of every register, and nothing
-	   else in the app is allowed to tilt. */
-	.stamp {
-		display: inline-block;
-		flex-shrink: 0;
-		width: 5.5rem;
-		text-align: center;
-		padding: 0.15rem 0.4rem;
-		border: 1.5px solid currentcolor;
-		border-radius: 0.25rem;
-		font-family: var(--font-mono);
-		font-size: 0.62rem;
-		font-weight: 600;
-		letter-spacing: 0.09em;
-		text-transform: uppercase;
-		transform: rotate(-2deg);
-		opacity: 0.9;
+	/* A status, said in one breath: a coloured dot and a word. Replaces the
+	   rubber stamps, which looked like a costume and could not be read at a
+	   glance, which is the only job a status has. */
+	.pill {
+		@apply inline-flex flex-shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1
+			text-[0.72rem] font-semibold whitespace-nowrap;
+		background: color-mix(in oklab, currentcolor 12%, transparent);
 	}
-	.stamp-block {
+	.pill::before {
+		content: "";
+		@apply size-1.5 flex-shrink-0 rounded-full;
+		background: currentcolor;
+	}
+	.pill-block {
 		color: var(--destructive);
 	}
-	.stamp-substitute {
+	.pill-substitute {
 		color: var(--primary);
 	}
-	.stamp-warn {
+	.pill-warn {
 		color: var(--trust-mid);
 	}
-	.stamp-ok {
+	.pill-ok {
 		color: var(--trust-max);
 	}
-	.stamp-quiet {
-		color: var(--muted-foreground);
-		transform: none;
-		border-style: dashed;
-		border-width: 1px;
+	.pill-quiet {
+		@apply text-muted-foreground;
 	}
 
-	/* The big verdict on the Protection screen: the same stamp scaled up to
-	   headline size. It lands once, with the short thunk of a stamp hitting
-	   paper, and then holds still. */
-	.stamp-hero {
-		display: inline-block;
-		padding: 0.3rem 0.9rem;
-		border: 3px solid currentcolor;
-		border-radius: 0.375rem;
-		font-family: var(--font-mono);
-		font-size: clamp(1.4rem, 3vw, 2rem);
-		font-weight: 600;
-		letter-spacing: 0.12em;
-		text-transform: uppercase;
-		line-height: 1.15;
-		transform: rotate(-3deg);
-		animation: stamp-land 0.35s cubic-bezier(0.2, 1.4, 0.4, 1) both;
-	}
-	@keyframes stamp-land {
-		from {
-			transform: rotate(-3deg) scale(1.6);
-			opacity: 0;
-		}
-		to {
-			transform: rotate(-3deg) scale(1);
-			opacity: 1;
-		}
+	/* Keyboard focus, stated once and inherited everywhere. A dashboard that
+	   can be driven from the keyboard has to show where the keyboard is. */
+	.focusable {
+		@apply focus-visible:ring-ring/60 focus-visible:ring-2 focus-visible:ring-offset-2
+			focus-visible:ring-offset-background focus-visible:outline-none;
 	}
 }
 
 /* Someone who asked their system for less movement gets less movement. The
-   numbers still land, they just stop counting up to get there, and the stamps
-   sit straight. */
+   barrier still shows its state, it just stops swinging to get there. */
 @media (prefers-reduced-motion: reduce) {
 	*,
 	*::before,
@@ -294,9 +273,5 @@
 		animation-duration: 0.01ms !important;
 		animation-iteration-count: 1 !important;
 		transition-duration: 0.01ms !important;
-	}
-	.stamp,
-	.stamp-hero {
-		transform: none;
 	}
 }

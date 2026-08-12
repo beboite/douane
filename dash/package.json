@@ -31,8 +31,8 @@
 		"vite": "^8.0.16"
 	},
 	"dependencies": {
-		"@fontsource-variable/ibm-plex-sans": "^5.3.0",
-		"@fontsource/ibm-plex-mono": "^5.3.0",
+		"@fontsource-variable/bricolage-grotesque": "^5.3.0",
+		"@fontsource-variable/figtree": "^5.3.0",
 		"bits-ui": "^2.18.1",
 		"clsx": "^2.1.1",
 		"layerchart": "^2.0.4",

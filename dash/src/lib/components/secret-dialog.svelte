@@ -45,6 +45,10 @@
 	);
 	const reference = $derived(`${namespace.trim() || 'espace'}.${key.trim() || 'clé'}`);
 
+	const upper = (s: string, fallback: string) =>
+		s.trim().toUpperCase().replace(/[^A-Z0-9]/g, '_') || fallback;
+	const placeholder = $derived(`__DOUANE_${upper(namespace, 'ESPACE')}_${upper(key, 'CLE')}__`);
+
 	async function submit(event: SubmitEvent) {
 		event.preventDefault();
 		if (!valid || busy) return;
@@ -57,7 +61,7 @@
 						? { note: note.trim() || null }
 						: null;
 			if (!body) {
-				toast.error('un dépôt sans valeur ne dépose rien');
+				toast.error('Un dépôt sans valeur ne dépose rien');
 				return;
 			}
 			const res = await api.putSecret(session.token, namespace.trim(), key.trim(), body);
@@ -67,10 +71,10 @@
 			await reload();
 			open = false;
 			toast.success(`${res.entry.namespace}.${res.entry.key} est en coffre`, {
-				description: `le scrubber surveille ${res.watching} valeurs en sortie`
+				description: `Le scrubber surveille ${res.watching} valeurs en sortie`
 			});
 		} catch (e) {
-			toast.error('rien n’a été écrit', { description: (e as Error).message });
+			toast.error('Rien n’a été écrit', { description: (e as Error).message });
 		} finally {
 			busy = false;
 		}
@@ -82,18 +86,18 @@
 		<form onsubmit={submit}>
 			<Dialog.Header>
 				<Dialog.Title>
-					{existing ? 'Remplacer une valeur' : 'Déposer un secret'}
+					{existing ? 'Remplacer une valeur' : 'Déposer une valeur'}
 				</Dialog.Title>
 				<Dialog.Description>
-					Le coffre ne rend jamais une valeur. Une fois déposée, elle ressort chez le fournisseur et
-					nulle part ailleurs, et se remplace sans jamais se relire.
+					Le coffre ne rend jamais une valeur. Elle entre ici, elle ressort chez le fournisseur, et
+					nulle part ailleurs : elle se remplace, elle ne se relit pas.
 				</Dialog.Description>
 			</Dialog.Header>
 
-			<div class="grid gap-4 py-4">
+			<div class="grid gap-4 py-5">
 				<div class="grid grid-cols-2 gap-3">
 					<div class="grid gap-2">
-						<Label for="ns">espace</Label>
+						<Label for="ns">Espace</Label>
 						<Input
 							id="ns"
 							bind:value={namespace}
@@ -104,7 +108,7 @@
 						/>
 					</div>
 					<div class="grid gap-2">
-						<Label for="key">clé</Label>
+						<Label for="key">Clé</Label>
 						<Input
 							id="key"
 							bind:value={key}
@@ -117,68 +121,79 @@
 				</div>
 
 				{#if namespace.includes('.')}
-					<p class="text-destructive text-xs">
-						un espace ne peut pas contenir de point : la référence se coupe au premier, donc
-						<code>a.b.c</code> se lirait comme l’espace <code>a</code>.
+					<p class="text-destructive text-xs leading-relaxed">
+						Un espace ne peut pas contenir de point : la référence se coupe au premier, donc
+						<span class="bg-sunken rounded px-1 py-0.5 font-medium">a.b.c</span>
+						se lirait comme l’espace <span class="bg-sunken rounded px-1 py-0.5 font-medium">a</span
+						>.
 					</p>
 				{/if}
 
 				<div class="grid gap-2">
 					<div class="flex items-center justify-between">
 						<Label for="value">
-							valeur
+							Valeur
 							{#if existing}<span class="text-muted-foreground font-normal">
 									· vide pour ne changer que la note</span
 								>{/if}
 						</Label>
+						<!-- Shows what is being typed into this field, nothing else: a value
+						     already in the vault has no way back out to any screen. -->
 						<Button
 							type="button"
 							variant="ghost"
-							size="sm"
-							class="h-6 px-2 text-xs"
+							size="xs"
 							onclick={() => (reveal = !reveal)}
 						>
-							{#if reveal}<EyeOff class="size-3.5" />masquer{:else}<Eye class="size-3.5" />montrer{/if}
+							{#if reveal}<EyeOff class="size-3.5" />Masquer la saisie{:else}<Eye
+									class="size-3.5"
+								/>Voir la saisie{/if}
 						</Button>
 					</div>
 					<Input
 						id="value"
 						type={reveal ? 'text' : 'password'}
 						bind:value
-						placeholder="collez la valeur"
+						placeholder="Collez la valeur"
 						autocomplete="off"
 						spellcheck="false"
-						class="font-mono"
 					/>
 				</div>
 
 				<div class="grid gap-2">
-					<Label for="note">note</Label>
+					<Label for="note">Note</Label>
 					<Textarea
 						id="note"
 						bind:value={note}
 						rows={2}
-						placeholder="à quoi elle sert, où la retrouver"
+						placeholder="À quoi elle sert, où la retrouver"
 						class="resize-none"
 					/>
 				</div>
 
-				<p class="text-muted-foreground text-xs">
-					sera référencée <code class="text-foreground font-mono">{reference}</code>, et remplaçable
-					dans un prompt par
-					<code class="text-foreground font-mono">
-						__DOUANE_{namespace.trim().toUpperCase().replace(/[^A-Z0-9]/g, '_') || 'ESPACE'}_{key
-							.trim()
-							.toUpperCase()
-							.replace(/[^A-Z0-9]/g, '_') || 'CLE'}__
-					</code>
-				</p>
+				<!-- The two names this deposit creates, shown while it is being typed:
+				     the reference names the entry, the placeholder is what leaves the
+				     building. Neither is the value. -->
+				<div class="bg-sunken grid gap-2 rounded-xl p-4 text-xs">
+					<div class="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+						<span class="text-muted-foreground">Référencée</span>
+						<span class="bg-background rounded-md px-1.5 py-0.5 font-semibold">{reference}</span>
+					</div>
+					<div class="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+						<span class="text-muted-foreground">Repère</span>
+						<span class="bg-background rounded-md px-1.5 py-0.5 font-semibold">{placeholder}</span>
+					</div>
+					<p class="text-muted-foreground leading-relaxed">
+						Le repère est le nom que l’agent écrit à la place du secret dans une conversation. Il ne
+						vaut rien pour un fournisseur, douane seule sait à quelle valeur il renvoie.
+					</p>
+				</div>
 			</div>
 
 			<Dialog.Footer>
-				<Button type="button" variant="ghost" onclick={() => (open = false)}>annuler</Button>
+				<Button type="button" variant="outline" onclick={() => (open = false)}>Annuler</Button>
 				<Button type="submit" disabled={!valid || busy}>
-					{existing ? 'remplacer' : 'déposer'}
+					{existing ? 'Remplacer la valeur' : 'Déposer la valeur'}
 				</Button>
 			</Dialog.Footer>
 		</form>

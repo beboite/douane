@@ -21,18 +21,20 @@
 	const Icon = $derived(icon);
 </script>
 
-<!-- An empty register is drawn as an empty case on the form: a dashed frame,
-     nothing inside it, and one line saying why. -->
-<div class="p-4">
+<!-- An empty screen is an invitation, not a grey rectangle: a soft panel, the
+     icon in a circle, and one line saying what would fill it. -->
+<div class="p-5">
 	<div
-		class="border-border/80 text-muted-foreground flex flex-col items-center justify-center gap-2 rounded-md border border-dashed text-center {tight
-			? 'py-7'
-			: 'py-12'}"
+		class="bg-sunken text-muted-foreground flex flex-col items-center justify-center gap-2.5 rounded-xl text-center {tight
+			? 'py-8'
+			: 'py-14'}"
 	>
-		<Icon class="text-muted-foreground/60 size-4" />
-		<p class="text-foreground/80 text-sm font-medium">{title}</p>
+		<span class="bg-background flex size-9 items-center justify-center rounded-full shadow-sm">
+			<Icon class="text-muted-foreground size-4" />
+		</span>
+		<p class="text-foreground text-sm font-semibold">{title}</p>
 		{#if hint}
-			<p class="max-w-xs text-xs leading-relaxed">{hint}</p>
+			<p class="max-w-sm px-4 text-[0.8rem] leading-relaxed">{hint}</p>
 		{/if}
 	</div>
 </div>

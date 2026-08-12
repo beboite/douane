@@ -26,11 +26,35 @@ admin_key = { namespace = "douane", key = "admin_token" }
 # ---------------------------------------------------------------- providers --
 # `trust` is not about model quality. It is about who reads the conversation
 # afterwards.
+#
+# Every provider also carries a catalogue. douane asks each upstream what it
+# sells (`/v1/models`, or `/models` on an OpenAI-shaped one) and keeps the
+# answer in the database, so a new model at a reseller no longer means editing
+# this file. Nothing found that way is served until it is switched on from the
+# dashboard: discovery fills a list, and only a click turns a line of it into a
+# route. Three optional fields steer it:
+#
+#   prefix       what a generated route is called, `<prefix><upstream id>`.
+#                Defaults to the provider's name and a dash. Three resellers
+#                sell the same model, so a bare model name could only ever
+#                reach one of them.
+#   models_path  a different path, or a full URL, for a site that publishes its
+#                catalogue somewhere else.
+#   catalog      `false` for an upstream that publishes nothing. Its models are
+#                then added by hand, on the same screen.
+#
+# The file always wins: a discovered model whose route name is already written
+# below is refused rather than merged, so nothing an upstream publishes can
+# quietly repoint a route written here on purpose.
 
 # Nothing leaves the LAN. The only upstream that gets the real context.
 [providers.local]
 base_url = "http://10.0.0.10:8080"
 trust = "max"
+# A llama.cpp server answers `/v1/models` with whatever single model it has
+# loaded, which is rarely worth a sweep. Off, and the one route below is
+# written by hand.
+catalog = false
 
 # A vendor with a contract and a reputation to lose.
 [providers.anthropic]
@@ -52,11 +76,20 @@ trust = "mid"
 base_url = "https://api.deepseek.com/anthropic"
 key = { namespace = "deepseek", key = "api_key" }
 trust = "low"
+# Its catalogue is worth reading: this is the kind of upstream that grows a new
+# model every few weeks. Routes generated from it read `ds-<the model's id>`.
+prefix = "ds-"
 
 # ------------------------------------------------------------------- routes --
 # The indirection is the feature. Claude Code only ever emits three model tiers,
 # so this table is how a cheap upstream gets to serve subagents without the
 # agent knowing or caring. Change it here, no session restart.
+#
+# Write a route here when the name matters: an alias an agent is pinned to
+# (`haiku`), a fallback chain, or a name whose exact spelling a client depends
+# on. Everything else is better switched on from the catalogue, where it needs
+# no edit and no restart. Clients see the union of both through
+# `GET /v1/models`, filtered by what each one is allowed to reach.
 
 [routes.opus]
 provider = "anthropic"

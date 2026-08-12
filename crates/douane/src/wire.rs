@@ -52,6 +52,16 @@ impl Wire {
             Self::Openai => "/chat/completions",
         }
     }
+
+    /// Where this dialect publishes its catalogue, appended to `base_url` the
+    /// same way [`Self::path`] is. Both dialects answer the same envelope
+    /// (`{"data": [{"id": ...}]}`), which is why one parser reads either.
+    pub fn models_path(self) -> &'static str {
+        match self {
+            Self::Anthropic => "/v1/models",
+            Self::Openai => "/models",
+        }
+    }
 }
 
 /// A request douane will not translate rather than translate wrongly.

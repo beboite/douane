@@ -117,6 +117,58 @@ export type RouteView = {
 	base_provider: string;
 	base_model: string | null;
 	overridden: boolean;
+	/** True when this route exists because a model was switched on, rather than
+	 *  because it was written in douane.toml. Those are edited on the models
+	 *  screen, so this page shows them and does not offer to repoint them. */
+	from_catalog: boolean;
+};
+
+/** One model an upstream sells. A row here is a fact about the provider;
+ *  `enabled` is the owner's decision, and only that turns it into a route. */
+export type ModelEntry = {
+	provider: string;
+	upstream_id: string;
+	route: string;
+	label: string | null;
+	context_length: number | null;
+	enabled: boolean;
+	source: 'probed' | 'manual';
+	/** False once a refresh no longer finds it upstream. It keeps serving if it
+	 *  was on: an upstream that stops listing a model it still answers on is
+	 *  common, and cutting the route on that basis would break a working setup. */
+	present: boolean;
+	first_seen: string;
+	last_seen: string;
+	note: string | null;
+};
+
+export type CatalogProvider = {
+	name: string;
+	trust: Trust;
+	/** Whether this upstream publishes a catalogue at all. When it does not,
+	 *  models are added by hand. */
+	catalog: boolean;
+	prefix: string;
+};
+
+export type CatalogView = {
+	models: ModelEntry[];
+	/** Rows switched on whose route name is already served by douane.toml, which
+	 *  the file always wins. Shown rather than silently ignored. */
+	collisions: Record<string, string>;
+	providers: CatalogProvider[];
+};
+
+/** What one provider answered when asked for its catalogue. */
+export type RefreshResult = {
+	provider: string;
+	ok: boolean;
+	found: number;
+	added: number;
+	missing: number;
+	status: number | null;
+	ms: number;
+	detail: string | null;
 };
 
 export type ClientView = {
@@ -256,6 +308,50 @@ export const api = {
 
 	clearRoute: (token: string, name: string) =>
 		request<unknown>(token, `/routes/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+
+	models: (token: string) => request<CatalogView>(token, '/models'),
+
+	/** Ask the upstreams what they sell. POST because it spends one real request
+	 *  per provider. Nothing it finds is served until it is switched on. */
+	refreshModels: (token: string, provider?: string) =>
+		request<{ refreshed: RefreshResult[] }>(
+			token,
+			`/models/refresh${provider ? `?provider=${encodeURIComponent(provider)}` : ''}`,
+			{ method: 'POST' }
+		),
+
+	setModelEnabled: (token: string, route: string, enabled: boolean) =>
+		request<{ route: string; enabled: boolean }>(
+			token,
+			`/models/${encodeURIComponent(route)}/enabled`,
+			{ method: 'PUT', body: JSON.stringify({ enabled }) }
+		),
+
+	setProviderModelsEnabled: (token: string, provider: string, enabled: boolean) =>
+		request<{ provider: string; changed: number }>(
+			token,
+			`/providers/${encodeURIComponent(provider)}/models/enabled`,
+			{ method: 'PUT', body: JSON.stringify({ enabled }) }
+		),
+
+	/** Add a model by hand, for an upstream that publishes no catalogue. */
+	putModel: (
+		token: string,
+		body: {
+			provider: string;
+			upstream_id: string;
+			route?: string;
+			label?: string | null;
+			context_length?: number | null;
+			enabled?: boolean;
+			note?: string | null;
+		}
+	) => request<{ route: string }>(token, '/models', { method: 'PUT', body: JSON.stringify(body) }),
+
+	deleteModel: (token: string, route: string) =>
+		request<{ deleted: string }>(token, `/models/${encodeURIComponent(route)}`, {
+			method: 'DELETE'
+		}),
 
 	/** Deposit or replace a credential. Omit `value` to rewrite the note alone,
 	 *  which is the only way to annotate an entry without the browser having to

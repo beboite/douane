@@ -22,10 +22,16 @@
 
 	const ratio = $derived(write > 0 ? read / write : null);
 
+	/* Said in words rather than as `×∞`, which reads like a division that went
+	   wrong. Nothing was written on this window, so every read came off a prefix
+	   the upstream already held. */
 	const shown = $derived(
 		ratio === null
-			? '×∞'
-			: '×' + new Intl.NumberFormat('fr-FR', { maximumFractionDigits: ratio < 10 ? 1 : 0 }).format(ratio)
+			? 'que des relectures'
+			: '×' +
+					new Intl.NumberFormat('fr-FR', { maximumFractionDigits: ratio < 10 ? 1 : 0 }).format(
+						ratio
+					)
 	);
 
 	/* A prefix an upstream actually holds is read back on every turn of the
@@ -46,11 +52,17 @@
 	);
 </script>
 
+<!-- A ratio worth acting on gets the shape of a status, the rest stays a quiet
+     number: a pill on every row would say nothing, a pill on the two routes that
+     rewrite the context says exactly which ones to move. -->
 {#if read > 0 || write > 0}
-	<span
-		class="tabular shrink-0 text-xs {poor ? 'text-trust-low font-medium' : 'text-muted-foreground'}"
-		{title}
-	>
-		{compact ? '' : 'cache '}{shown}
-	</span>
+	{#if poor}
+		<span class="pill pill-warn tabular" {title}>
+			{compact ? '' : 'cache '}{shown}
+		</span>
+	{:else}
+		<span class="tabular text-muted-foreground shrink-0 text-xs" {title}>
+			{compact || ratio === null ? '' : 'cache '}{shown}
+		</span>
+	{/if}
 {/if}

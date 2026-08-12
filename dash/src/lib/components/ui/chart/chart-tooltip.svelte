@@ -167,7 +167,9 @@
 								</span>
 							</div>
 							{#if item.value !== undefined}
-								<span class="font-mono font-medium text-foreground tabular-nums">
+								<!-- No monospace anywhere in this dashboard: tabular figures
+								     are what a column of numbers actually needs. -->
+								<span class="font-semibold text-foreground tabular-nums">
 									{item.value.toLocaleString()}
 								</span>
 							{/if}

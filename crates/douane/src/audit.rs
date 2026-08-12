@@ -19,10 +19,11 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Mutex;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension as _};
 use serde::Serialize;
 use time::OffsetDateTime;
 
+use crate::catalog::{ModelEntry, Source};
 use crate::config::RouteOverride;
 use crate::usage::Usage;
 
@@ -181,6 +182,26 @@ impl Audit {
                 used_at    TEXT
             );
             CREATE INDEX IF NOT EXISTS grants_status ON grants(status);
+
+            -- What each upstream sells. Read from the provider's own catalogue
+            -- or typed in by hand, and served to nobody until `enabled` says
+            -- so: discovery adds rows, never routes. `route` is the primary key
+            -- because it is what a client asks for, so two providers cannot
+            -- claim the same name.
+            CREATE TABLE IF NOT EXISTS models (
+                route          TEXT PRIMARY KEY,
+                provider       TEXT    NOT NULL,
+                upstream_id    TEXT    NOT NULL,
+                label          TEXT,
+                context_length INTEGER,
+                enabled        INTEGER NOT NULL DEFAULT 0,
+                source         TEXT    NOT NULL,
+                present        INTEGER NOT NULL DEFAULT 1,
+                first_seen     TEXT    NOT NULL,
+                last_seen      TEXT    NOT NULL,
+                note           TEXT
+            );
+            CREATE INDEX IF NOT EXISTS models_provider ON models(provider);
             "#,
         )
         // A database written before the pricing removal still carries `cost`
@@ -282,6 +303,194 @@ impl Audit {
         let n = self
             .lock()
             .execute("DELETE FROM route_overrides WHERE route=?1", [route])?;
+        Ok(n > 0)
+    }
+
+    // -------------------------------------------------------------- models --
+
+    /// The whole catalogue, ordered so a provider's models sit together.
+    pub fn models(&self) -> rusqlite::Result<Vec<ModelEntry>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT route, provider, upstream_id, label, context_length, enabled, source,
+                    present, first_seen, last_seen, note
+             FROM models ORDER BY provider, route",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ModelEntry {
+                route: r.get(0)?,
+                provider: r.get(1)?,
+                upstream_id: r.get(2)?,
+                label: r.get(3)?,
+                context_length: r.get::<_, Option<i64>>(4)?.map(|n| n as u64),
+                enabled: r.get::<_, i64>(5)? != 0,
+                source: Source::parse(&r.get::<_, String>(6)?),
+                present: r.get::<_, i64>(7)? != 0,
+                first_seen: r.get(8)?,
+                last_seen: r.get(9)?,
+                note: r.get(10)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Record what one provider's catalogue just answered.
+    ///
+    /// Returns `(added, missing)`. Three rules, all of them about not throwing
+    /// away a decision:
+    ///
+    /// - A row that already exists keeps `enabled`, its `route` and its note. A
+    ///   refresh must never switch a model on, and must never switch one off.
+    /// - A row no longer listed is marked `present = 0` rather than deleted, so
+    ///   the dashboard can say "the reseller dropped this" instead of silently
+    ///   losing the line. An enabled one keeps serving: an upstream that stops
+    ///   listing a model it still answers on is common, and cutting a working
+    ///   route on the strength of a listing would be the broker breaking itself.
+    /// - Manual rows are never touched by a refresh at all. Nothing upstream
+    ///   confirms them, so nothing upstream may retire them.
+    pub fn models_seen(
+        &self,
+        provider: &str,
+        found: &[(String, crate::catalog::Discovered)],
+    ) -> rusqlite::Result<(usize, usize)> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let now = now();
+        let mut added = 0usize;
+
+        for (route, d) in found {
+            let existing: Option<String> = tx
+                .query_row(
+                    "SELECT route FROM models WHERE provider = ?1 AND upstream_id = ?2",
+                    rusqlite::params![provider, d.upstream_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match existing {
+                // Found again: refresh what the upstream owns (label, window,
+                // presence) and touch nothing the owner owns.
+                Some(route) => {
+                    tx.execute(
+                        "UPDATE models SET label = COALESCE(?2, label),
+                                           context_length = COALESCE(?3, context_length),
+                                           present = 1, last_seen = ?4
+                         WHERE route = ?1",
+                        rusqlite::params![route, d.label, d.context_length.map(|n| n as i64), now],
+                    )?;
+                }
+                None => {
+                    // A generated name can collide with a row from another
+                    // provider. Suffixing keeps both rather than dropping one,
+                    // and the owner can rename either from the dashboard.
+                    let base = route.as_str();
+                    let mut route = base.to_owned();
+                    let mut n = 1;
+                    while tx
+                        .query_row("SELECT 1 FROM models WHERE route = ?1", [&route], |r| {
+                            r.get::<_, i64>(0)
+                        })
+                        .optional()?
+                        .is_some()
+                    {
+                        n += 1;
+                        route = format!("{base}-{n}");
+                    }
+                    tx.execute(
+                        "INSERT INTO models (route, provider, upstream_id, label, context_length,
+                                             enabled, source, present, first_seen, last_seen)
+                         VALUES (?1,?2,?3,?4,?5,0,'probed',1,?6,?6)",
+                        rusqlite::params![
+                            route,
+                            provider,
+                            d.upstream_id,
+                            d.label,
+                            d.context_length.map(|n| n as i64),
+                            now,
+                        ],
+                    )?;
+                    added += 1;
+                }
+            }
+        }
+
+        // Everything probed for this provider that this sweep did not name.
+        // Computed here rather than as a `NOT IN (...)` built by hand: an id
+        // comes from an upstream, and no string from an upstream is ever
+        // interpolated into SQL in this project.
+        let listed: std::collections::HashSet<&str> =
+            found.iter().map(|(_, d)| d.upstream_id.as_str()).collect();
+        let mut gone: Vec<String> = Vec::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT route, upstream_id FROM models
+                 WHERE provider = ?1 AND source = 'probed' AND present = 1",
+            )?;
+            let rows = stmt.query_map([provider], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (route, upstream_id) = row?;
+                if !listed.contains(upstream_id.as_str()) {
+                    gone.push(route);
+                }
+            }
+        }
+        for route in &gone {
+            tx.execute("UPDATE models SET present = 0 WHERE route = ?1", [route])?;
+        }
+
+        tx.commit()?;
+        Ok((added, gone.len()))
+    }
+
+    /// Add or replace one row by hand. The path for a site that publishes no
+    /// catalogue, and the only way a `manual` row is ever created.
+    pub fn model_put(&self, m: &ModelEntry) -> rusqlite::Result<()> {
+        let now = now();
+        self.lock().execute(
+            "INSERT INTO models (route, provider, upstream_id, label, context_length,
+                                 enabled, source, present, first_seen, last_seen, note)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,1,?8,?8,?9)
+             ON CONFLICT(route) DO UPDATE SET provider=?2, upstream_id=?3, label=?4,
+                                              context_length=?5, enabled=?6, last_seen=?8, note=?9",
+            rusqlite::params![
+                m.route,
+                m.provider,
+                m.upstream_id,
+                m.label,
+                m.context_length.map(|n| n as i64),
+                m.enabled as i64,
+                m.source.as_str(),
+                now,
+                m.note,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The one-click path: serve this, or stop serving it.
+    pub fn model_set_enabled(&self, route: &str, enabled: bool) -> rusqlite::Result<bool> {
+        let n = self.lock().execute(
+            "UPDATE models SET enabled = ?2 WHERE route = ?1",
+            rusqlite::params![route, enabled as i64],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Switch a whole provider's catalogue on or off at once. Returns how many
+    /// rows changed, so the dashboard can report the sweep rather than guess.
+    pub fn models_set_enabled_for(&self, provider: &str, enabled: bool) -> rusqlite::Result<usize> {
+        let n = self.lock().execute(
+            "UPDATE models SET enabled = ?2 WHERE provider = ?1 AND (present = 1 OR ?2 = 0)",
+            rusqlite::params![provider, enabled as i64],
+        )?;
+        Ok(n)
+    }
+
+    pub fn model_delete(&self, route: &str) -> rusqlite::Result<bool> {
+        let n = self
+            .lock()
+            .execute("DELETE FROM models WHERE route = ?1", [route])?;
         Ok(n > 0)
     }
 
