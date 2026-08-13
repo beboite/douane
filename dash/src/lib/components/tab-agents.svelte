@@ -6,19 +6,22 @@
 	import Moon from '@lucide/svelte/icons/moon';
 	import Empty from './empty.svelte';
 	import TrustBadge from './trust-badge.svelte';
-	import type { CatalogView, LiveAgent, LiveView } from '$lib/api';
+	import type { CatalogView, ConfigView, LiveAgent, LiveView } from '$lib/api';
 	import { count, delay, harness, lasted, short, tokens } from '$lib/format';
 
 	let {
 		live,
 		catalog,
+		config,
 		seconds = $bindable(),
 		openThread
 	}: {
 		live: LiveView | null;
-		/** Only for the names: a route serves under a technical id and the
-		 *  catalogue is where the readable one lives. */
+		/** Both are here for the names alone: a route serves under a technical id,
+		 *  and the readable one lives in the file for a hand-written route and in
+		 *  the catalogue for a switched-on one. */
 		catalog: CatalogView | null;
+		config: ConfigView | null;
 		/** How long an agent stays on screen after its last call. */
 		seconds: number;
 		/** Send a conversation to the traffic screen, filtered on it. */
@@ -54,12 +57,17 @@
 
 	const agents = $derived(live?.agents ?? []);
 	const working = $derived(agents.filter((a) => a.in_flight > 0).length);
+	/* The file outranks the catalogue on a name it also declares, which is the
+	   same order `GET /v1/models` answers in. */
 	const labels = $derived(
-		new Map((catalog?.models ?? []).filter((m) => m.label).map((m) => [m.route, m.label as string]))
+		new Map([
+			...(catalog?.models ?? []).filter((m) => m.label).map((m) => [m.route, m.label as string]),
+			...(config?.routes ?? []).filter((r) => r.label).map((r) => [r.name, r.label as string])
+		] as [string, string][])
 	);
 
-	/** What to call the model: the readable name when the catalogue has one, the
-	 *  route otherwise. Never the upstream id, which is the same model under the
+	/** What to call the model: the readable name when there is one, the route
+	 *  otherwise. Never the upstream id, which is the same model under the
 	 *  reseller's own spelling. */
 	function modelName(a: LiveAgent): string {
 		return labels.get(a.route) ?? a.route;
@@ -150,7 +158,13 @@
 								{tag(a)}
 							</span>
 							<div class="min-w-0 flex-1">
-								<div class="truncate text-[0.95rem] leading-tight font-semibold">
+								<!-- The name on screen is the readable one; the route it
+								     answers under is one hover away, which is what a filter or
+								     a config edit needs. -->
+								<div
+									class="truncate text-[0.95rem] leading-tight font-semibold"
+									title="route {a.route} · {a.model_sent}"
+								>
 									{modelName(a)}
 								</div>
 								<div class="text-muted-foreground mt-1 flex items-center gap-1.5 text-xs">
@@ -202,8 +216,12 @@
 								<span aria-hidden="true">·</span>
 								<span title={a.user_agent}>{harness(a.user_agent)}</span>
 							{/if}
-							<span aria-hidden="true">·</span>
-							<span>depuis {lasted(a.first_at, a.last_at) || 'moins d’une seconde'}</span>
+							<!-- Only once there is a stretch to measure. A single call has
+							     been going for zero seconds, which says nothing. -->
+							{#if a.calls > 1}
+								<span aria-hidden="true">·</span>
+								<span>depuis {lasted(a.first_at, a.last_at)}</span>
+							{/if}
 						</div>
 
 						{#if a.thread_fingerprint}

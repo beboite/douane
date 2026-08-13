@@ -495,6 +495,9 @@ struct RouteView {
     name: String,
     provider: String,
     model: Option<String>,
+    /// The readable name, when the file gives one. The live screen shows it
+    /// instead of the route id, which is a technical name nobody chose to read.
+    label: Option<String>,
     fallback: Vec<String>,
     /// What the TOML says, when an override is currently pointing this route
     /// somewhere else. The dashboard shows both so nobody has to open the file
@@ -554,6 +557,7 @@ pub async fn config(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
                 name: name.clone(),
                 provider: r.provider.clone(),
                 model: r.model.clone(),
+                label: r.label.clone(),
                 fallback: r.fallback.clone(),
                 base_provider: base.provider.clone(),
                 base_model: base.model.clone(),

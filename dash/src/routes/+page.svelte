@@ -538,7 +538,7 @@
 				{#key tab}
 					<div in:fly={{ y: 8, duration: 220, easing: cubicOut }}>
 						{#if tab === 'agents'}
-							<TabAgents {live} {catalog} bind:seconds={idle} {openThread} />
+							<TabAgents {live} {catalog} {config} bind:seconds={idle} {openThread} />
 						{:else if tab === 'protection'}
 							<!-- The verdict, before any number: the boom is up or it is not. -->
 							<Card.Root class="shadow-panel mb-5 overflow-hidden">

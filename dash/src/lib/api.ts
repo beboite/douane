@@ -154,6 +154,8 @@ export type RouteView = {
 	name: string;
 	provider: string;
 	model: string | null;
+	/** The readable name the file gives this route, when it gives one. */
+	label: string | null;
 	fallback: string[];
 	base_provider: string;
 	base_model: string | null;
