@@ -2467,6 +2467,10 @@ async fn a_discovered_row_can_be_corrected_and_the_correction_survives_a_sweep()
     assert_eq!(status, 200);
     assert_eq!(enable(&b, "k3", true).await, 200);
 
+    // Even a sweep where the upstream does have something to say about the
+    // name: what the owner typed is why it was typed, and putting the
+    // reseller's version back would undo it every six hours.
+    up.sells(&[("kimi-k3", Some("MoonshotAI: Kimi K3"), Some(1_000_000))]);
     refresh(&b).await;
     let cat = catalogue(&b).await;
     let row = cat["models"]

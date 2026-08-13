@@ -393,9 +393,15 @@ impl Audit {
                     // something: a site whose dialect page is down for an hour
                     // must not erase what it said yesterday.
                     let kinds = d.endpoints.join(",");
+                    // **The upstream fills a blank, it never overwrites.** The
+                    // owner corrects a name or a window from the dashboard
+                    // precisely because the reseller's own is wrong or
+                    // unreadable, and a sweep that put its version back would
+                    // undo that silently every six hours. Clearing the field
+                    // is how a row goes back to inheriting.
                     tx.execute(
-                        "UPDATE models SET label = COALESCE(?2, label),
-                                           context_length = COALESCE(?3, context_length),
+                        "UPDATE models SET label = COALESCE(label, ?2),
+                                           context_length = COALESCE(context_length, ?3),
                                            endpoints = CASE WHEN ?5 = '' THEN endpoints ELSE ?5 END,
                                            present = 1, last_seen = ?4
                          WHERE route = ?1",
