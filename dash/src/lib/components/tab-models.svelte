@@ -58,6 +58,19 @@
 		return all(provider).filter((m) => m.blocked?.kind === 'wrong_dialect');
 	}
 
+	/** The file already serves this model, under this name or another. The row
+	    installs nothing, the model answers anyway, so the switch reads as on:
+	    what holds it is douane.toml, which is also why it cannot be flipped
+	    from here. */
+	function servedByFile(m: ModelEntry): boolean {
+		return m.blocked?.kind === 'already_in_file';
+	}
+
+	/** Reachable through douane right now, whoever holds it. */
+	function live(m: ModelEntry): boolean {
+		return servedByFile(m) || (m.enabled && !m.blocked);
+	}
+
 	function rowsFor(provider: string): ModelEntry[] {
 		const q = `${query.trim()} ${narrow[provider]?.trim() ?? ''}`.trim().toLowerCase();
 		let rows = all(provider);
@@ -71,7 +84,7 @@
 		}
 		/* Served first: on a provider with three hundred rows, the handful that
 		   actually answer calls is the only part worth seeing by default. */
-		return [...rows.filter((m) => m.enabled), ...rows.filter((m) => !m.enabled)];
+		return [...rows.filter(live), ...rows.filter((m) => !live(m))];
 	}
 
 	function searching(provider: string): boolean {
@@ -331,7 +344,7 @@
 			{@const rows = rowsFor(p.name)}
 			{@const visible = shown(p.name)}
 			{@const mine = all(p.name)}
-			{@const served = mine.filter((m) => m.enabled && !m.blocked).length}
+			{@const served = mine.filter(live).length}
 			{@const reachable = mine.filter((m) => m.blocked?.kind !== 'wrong_dialect').length}
 			{@const elsewhere_count = elsewhere(p.name).length}
 			{@const twin = siblings(p)}
@@ -413,9 +426,13 @@
 						{#each visible as m (m.route)}
 							<li class="flex items-center gap-3 py-3">
 								<Switch
-									checked={m.enabled}
-									disabled={busy.has(m.route) || m.blocked?.kind === 'wrong_dialect'}
+									checked={m.enabled || servedByFile(m)}
+									disabled={busy.has(m.route) ||
+										servedByFile(m) ||
+										m.blocked?.kind === 'wrong_dialect'}
 									onCheckedChange={(v) => setEnabled(m, v)}
+									title={servedByFile(m) ? (why(m) ?? '') : ''}
+									class={servedByFile(m) ? 'data-disabled:opacity-100' : ''}
 									aria-label="servir {m.route}"
 								/>
 								<div class="min-w-0 flex-1">
@@ -434,10 +451,10 @@
 										{/if}
 										{#if m.blocked}
 											<span
-												class="pill {m.blocked.kind === 'already_in_file' ? 'pill-quiet' : 'pill-warn'}"
+												class="pill {servedByFile(m) ? 'pill-quiet' : 'pill-warn'}"
 												title={why(m) ?? ''}
 											>
-												{m.blocked.kind === 'already_in_file' ? 'déjà dans le fichier' : why(m)}
+												{servedByFile(m) ? 'servi par le fichier' : why(m)}
 											</span>
 										{/if}
 									</div>
