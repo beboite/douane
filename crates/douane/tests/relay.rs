@@ -379,6 +379,8 @@ async fn broker_with(
                 provider: provider.to_owned(),
                 model: model.map(str::to_owned),
                 fallback: fallback.into_iter().map(str::to_owned).collect(),
+                label: None,
+                context_length: None,
             },
         );
     }
@@ -732,6 +734,8 @@ async fn a_route_a_client_is_not_listed_for_says_so_when_nothing_else_serves() {
                     provider: "primary".to_owned(),
                     model: None,
                     fallback: Vec::new(),
+                    label: None,
+                    context_length: None,
                 },
             );
         },
@@ -2273,6 +2277,46 @@ async fn serving_everything_a_provider_sells_skips_what_it_cannot_reach() {
     let (_, ids) = listing(&b, "vk-the-virtual-one").await;
     assert!(ids.contains(&"primary-claude-opus-5".to_owned()));
     assert!(!ids.contains(&"primary-gpt-5.6-terra".to_owned()));
+}
+
+#[tokio::test]
+async fn a_hand_written_route_carries_its_own_name_and_window() {
+    // Otherwise a launcher keeps a table of exactly these two fields and drifts
+    // from the file. The file also outranks the catalogue on both: a curated
+    // route is named by its author, not by the reseller underneath.
+    let (url, up) = Upstream::spawn(Behaviour::Json).await;
+    up.sells(&[("claude-opus-5", Some("Opus 5 (reseller)"), Some(200_000))]);
+    let b = broker_with(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", Some("claude-opus-5"), vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+        |c| {
+            let r = c.routes.get_mut("haiku").unwrap();
+            r.label = Some("Opus 5 (1M)".to_owned());
+            r.context_length = Some(1_000_000);
+        },
+    )
+    .await;
+    refresh(&b).await;
+
+    let res = reqwest::Client::new()
+        .get(format!("{}/v1/models", b.url))
+        .header("x-api-key", "vk-the-virtual-one")
+        .send()
+        .await
+        .unwrap();
+    let v: serde_json::Value = res.json().await.unwrap();
+    let row = v["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "haiku")
+        .cloned()
+        .unwrap();
+    assert_eq!(row["display_name"], "Opus 5 (1M)");
+    assert_eq!(row["context_length"], 1_000_000);
 }
 
 #[tokio::test]

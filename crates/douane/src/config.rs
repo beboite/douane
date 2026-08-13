@@ -264,6 +264,16 @@ pub struct Route {
     /// Tried in order if the primary fails. Each entry names another route.
     #[serde(default)]
     pub fallback: Vec<String>,
+    /// What to call this route on screen, and the window a harness should size
+    /// itself from. Both travel to clients through `GET /v1/models`, which is
+    /// the whole reason they exist here: a launcher that has to name a route
+    /// nicely, or open a session at the right length, would otherwise keep its
+    /// own table of exactly these two fields and drift from this file. A
+    /// discovered model carries them in the catalogue instead.
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub context_length: Option<u64>,
 }
 
 /// A change to one route, made from the dashboard and stored in the database.

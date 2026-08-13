@@ -817,16 +817,21 @@ pub async fn models(
             continue;
         }
         let known = described.get(name);
+        // The file first, the catalogue second. A route written by hand is the
+        // curated one, and what its author called it outranks what a reseller
+        // calls the model underneath.
         let mut entry = serde_json::json!({
             "type": "model",
             "id": name,
-            "display_name": known
-                .and_then(|m| m.label.clone())
+            "display_name": route
+                .label
+                .clone()
+                .or_else(|| known.and_then(|m| m.label.clone()))
                 .unwrap_or_else(|| name.clone()),
         });
         // An extension both dialects tolerate, and the reason a launcher can
         // stop keeping its own table of context windows.
-        if let Some(n) = known.and_then(|m| m.context_length) {
+        if let Some(n) = route.context_length.or(known.and_then(|m| m.context_length)) {
             entry["context_length"] = serde_json::json!(n);
         }
         data.push(entry);

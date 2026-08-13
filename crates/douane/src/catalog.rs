@@ -110,6 +110,8 @@ impl ModelEntry {
                     provider: self.provider.clone(),
                     model: Some(self.upstream_id.clone()),
                     fallback: Vec::new(),
+                    label: self.label.clone(),
+                    context_length: self.context_length,
                 },
             )
         })
@@ -666,6 +668,8 @@ mod tests {
                 provider: "local".into(),
                 model: Some("house".into()),
                 fallback: Vec::new(),
+                label: None,
+                context_length: None,
             },
         );
         let models = vec![
