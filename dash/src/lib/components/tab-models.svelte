@@ -6,6 +6,7 @@
 	import { Switch } from '$lib/components/ui/switch';
 	import * as Dialog from '$lib/components/ui/dialog';
 	import Boxes from '@lucide/svelte/icons/boxes';
+	import Pencil from '@lucide/svelte/icons/pencil';
 	import Plus from '@lucide/svelte/icons/plus';
 	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
 	import Search from '@lucide/svelte/icons/search';
@@ -14,16 +15,20 @@
 	import Empty from './empty.svelte';
 	import Panel from './panel.svelte';
 	import TrustBadge from './trust-badge.svelte';
-	import { api, type CatalogView, type ModelEntry } from '$lib/api';
+	import { api, type CatalogProvider, type CatalogView, type ModelEntry } from '$lib/api';
 	import { session } from '$lib/session.svelte';
 
 	let { catalog, reload }: { catalog: CatalogView | null; reload: () => Promise<void> } = $props();
 
+	/** The search that runs over every provider at once. */
 	let query = $state('');
-	/* Providers whose full list is open. A reseller on an auto group sells
-	   hundreds of ids, so a screen that printed all of them would be unusable on
-	   the one provider that needs it most. */
+	/** One search box per provider, because a reseller with five hundred ids is
+	    the only place this screen is ever hard to use. */
+	let narrow = $state<Record<string, string>>({});
+	/** Providers whose full list is open, and those showing what they cannot
+	    serve on this surface. */
 	let opened = $state(new Set<string>());
+	let others = $state(new Set<string>());
 	let busy = $state(new Set<string>());
 	let refreshing = $state<string | null>(null);
 
@@ -31,37 +36,59 @@
 	const PREVIEW = 8;
 
 	const providers = $derived(catalog?.providers ?? []);
-	const collisions = $derived(Object.entries(catalog?.collisions ?? {}));
+	/** Everything switched on that serves nothing, minus the case that is not a
+	    problem: the file serving the same model under the same name. */
+	const problems = $derived(
+		Object.entries(catalog?.collisions ?? {}).filter(([, c]) => c.kind !== 'already_in_file')
+	);
+
+	/** Two providers on one host are one subscription sold on two surfaces. */
+	function siblings(p: CatalogProvider): CatalogProvider[] {
+		return providers.filter((o) => o.name !== p.name && o.host === p.host);
+	}
+
+	function all(provider: string): ModelEntry[] {
+		return (catalog?.models ?? []).filter((m) => m.provider === provider);
+	}
+
+	/** What this provider cannot serve at all: the ids it sells on its other
+	    surface. Kept out of the way rather than deleted, because "openlux has
+	    grok, just not here" is the answer people are looking for. */
+	function elsewhere(provider: string): ModelEntry[] {
+		return all(provider).filter((m) => m.blocked?.kind === 'wrong_dialect');
+	}
 
 	function rowsFor(provider: string): ModelEntry[] {
-		const all = (catalog?.models ?? []).filter((m) => m.provider === provider);
-		const q = query.trim().toLowerCase();
+		const q = `${query.trim()} ${narrow[provider]?.trim() ?? ''}`.trim().toLowerCase();
+		let rows = all(provider);
+		if (!others.has(provider)) rows = rows.filter((m) => m.blocked?.kind !== 'wrong_dialect');
 		if (q) {
-			return all.filter(
-				(m) =>
-					m.route.toLowerCase().includes(q) ||
-					m.upstream_id.toLowerCase().includes(q) ||
-					(m.label ?? '').toLowerCase().includes(q)
-			);
+			const words = q.split(/\s+/);
+			return rows.filter((m) => {
+				const hay = `${m.route} ${m.upstream_id} ${m.label ?? ''}`.toLowerCase();
+				return words.every((w) => hay.includes(w));
+			});
 		}
 		/* Served first: on a provider with three hundred rows, the handful that
 		   actually answer calls is the only part worth seeing by default. */
-		const served = all.filter((m) => m.enabled);
-		const rest = all.filter((m) => !m.enabled);
-		return [...served, ...rest];
+		return [...rows.filter((m) => m.enabled), ...rows.filter((m) => !m.enabled)];
+	}
+
+	function searching(provider: string): boolean {
+		return Boolean(query.trim() || narrow[provider]?.trim());
 	}
 
 	function shown(provider: string): ModelEntry[] {
 		const rows = rowsFor(provider);
-		if (query.trim() || opened.has(provider)) return rows;
+		if (searching(provider) || opened.has(provider)) return rows;
 		return rows.slice(0, PREVIEW);
 	}
 
-	function toggleOpen(provider: string) {
-		const next = new Set(opened);
-		if (next.has(provider)) next.delete(provider);
-		else next.add(provider);
-		opened = next;
+	function toggle(set: Set<string>, key: string): Set<string> {
+		const next = new Set(set);
+		if (next.has(key)) next.delete(key);
+		else next.add(key);
+		return next;
 	}
 
 	function mark(route: string, on: boolean) {
@@ -69,6 +96,24 @@
 		if (on) next.add(route);
 		else next.delete(route);
 		busy = next;
+	}
+
+	/** What a row's refusal means, in the language of this screen. */
+	function why(m: ModelEntry): string | null {
+		switch (m.blocked?.kind) {
+			case 'wrong_dialect':
+				return m.endpoints.length
+					? `répond en ${m.endpoints.join(', ')}, pas ici`
+					: 'répond sur une autre surface';
+			case 'conflict':
+				return `douane.toml donne déjà ce nom à ${m.blocked.other}`;
+			case 'no_provider':
+				return 'ce fournisseur a quitté douane.toml';
+			case 'already_in_file':
+				return 'déjà servi par douane.toml';
+			default:
+				return null;
+		}
 	}
 
 	async function setEnabled(m: ModelEntry, enabled: boolean) {
@@ -87,13 +132,22 @@
 	async function setAll(provider: string, enabled: boolean) {
 		mark(provider, true);
 		try {
-			const { changed } = await api.setProviderModelsEnabled(session.token, provider, enabled);
-			await reload();
-			toast.success(
-				changed === 0
-					? 'rien à changer'
-					: `${changed} modèle${changed > 1 ? 's' : ''} ${enabled ? 'servis' : 'coupés'}`
+			const { changed, skipped } = await api.setProviderModelsEnabled(
+				session.token,
+				provider,
+				enabled
 			);
+			await reload();
+			if (changed === 0) {
+				toast.success('rien à changer');
+			} else {
+				const head = `${changed} modèle${changed > 1 ? 's' : ''} ${enabled ? 'servi' : 'coupé'}${changed > 1 ? 's' : ''}`;
+				toast.success(
+					enabled && skipped
+						? `${head}, ${skipped} laissé${skipped > 1 ? 's' : ''} de côté : ce fournisseur ne les sert pas ici`
+						: head
+				);
+			}
 		} catch (e) {
 			toast.error(e instanceof Error ? e.message : 'le changement a échoué');
 		} finally {
@@ -141,34 +195,58 @@
 		}
 	}
 
-	/* ------------------------------------------------------- adding by hand -- */
+	/* ------------------------------------------- adding and correcting rows -- */
 
 	let adding = $state<string | null>(null);
+	let editing = $state<ModelEntry | null>(null);
 	let form = $state({ upstream_id: '', label: '', route: '', context_length: '', enabled: true });
 	let saving = $state(false);
 
 	function openAdd(provider: string) {
 		form = { upstream_id: '', label: '', route: '', context_length: '', enabled: true };
+		editing = null;
 		adding = provider;
 	}
 
+	function openEdit(m: ModelEntry) {
+		form = {
+			upstream_id: m.upstream_id,
+			label: m.label ?? '',
+			route: m.route,
+			context_length: m.context_length ? String(m.context_length) : '',
+			enabled: m.enabled
+		};
+		adding = null;
+		editing = m;
+	}
+
 	async function save() {
-		if (!adding || !form.upstream_id.trim()) return;
 		saving = true;
 		try {
-			const { route } = await api.putModel(session.token, {
-				provider: adding,
-				upstream_id: form.upstream_id.trim(),
-				route: form.route.trim() || undefined,
-				label: form.label.trim() || null,
-				context_length: form.context_length ? Number(form.context_length) : null,
-				enabled: form.enabled
-			});
-			await reload();
-			adding = null;
-			toast.success(`${route} ajouté`);
+			if (editing) {
+				await api.editModel(session.token, editing.route, {
+					label: form.label.trim(),
+					context_length: form.context_length ? Number(form.context_length) : 0,
+					route: form.route.trim() || editing.route
+				});
+				await reload();
+				toast.success(`${form.route.trim() || editing.route} corrigé`);
+				editing = null;
+			} else if (adding && form.upstream_id.trim()) {
+				const { route } = await api.putModel(session.token, {
+					provider: adding,
+					upstream_id: form.upstream_id.trim(),
+					route: form.route.trim() || undefined,
+					label: form.label.trim() || null,
+					context_length: form.context_length ? Number(form.context_length) : null,
+					enabled: form.enabled
+				});
+				await reload();
+				toast.success(`${route} ajouté`);
+				adding = null;
+			}
 		} catch (e) {
-			toast.error(e instanceof Error ? e.message : 'l’ajout a échoué');
+			toast.error(e instanceof Error ? e.message : 'l’enregistrement a échoué');
 		} finally {
 			saving = false;
 		}
@@ -191,9 +269,9 @@
 			/>
 			<Input
 				bind:value={query}
-				placeholder="Chercher un modèle"
+				placeholder="Chercher un modèle chez tous les fournisseurs"
 				class="h-10 pl-9"
-				aria-label="Chercher un modèle"
+				aria-label="Chercher un modèle chez tous les fournisseurs"
 			/>
 		</div>
 		<Button size="lg" onclick={() => refresh()} disabled={refreshing !== null}>
@@ -202,20 +280,29 @@
 		</Button>
 	</div>
 
-	{#if collisions.length}
+	{#if problems.length}
 		<div
 			class="border-trust-mid/40 bg-trust-mid/10 text-trust-mid flex items-start gap-3 rounded-xl border p-4"
 		>
 			<TriangleAlert class="mt-0.5 size-4 shrink-0" />
 			<div class="min-w-0 text-sm">
 				<p class="font-semibold">
-					{collisions.length} modèle{collisions.length > 1 ? 's' : ''} activé{collisions.length > 1
+					{problems.length} modèle{problems.length > 1 ? 's' : ''} activé{problems.length > 1
 						? 's'
-						: ''} ne ser{collisions.length > 1 ? 'vent' : 't'} rien
+						: ''} ne ser{problems.length > 1 ? 'vent' : 't'} rien
 				</p>
 				<ul class="text-foreground/80 mt-1 space-y-0.5 text-[0.8rem]">
-					{#each collisions as [route, why] (route)}
-						<li><span class="font-semibold">{route}</span> : {why}</li>
+					{#each problems as [route, c] (route)}
+						<li>
+							<span class="font-semibold">{route}</span> :
+							{#if c.kind === 'wrong_dialect'}
+								ce fournisseur vend ce modèle sur son autre surface
+							{:else if c.kind === 'conflict'}
+								douane.toml donne déjà ce nom à {c.other}
+							{:else}
+								son fournisseur a quitté douane.toml
+							{/if}
+						</li>
 					{/each}
 				</ul>
 			</div>
@@ -238,28 +325,30 @@
 		{#each providers as p (p.name)}
 			{@const rows = rowsFor(p.name)}
 			{@const visible = shown(p.name)}
-			{@const served = (catalog.models ?? []).filter((m) => m.provider === p.name && m.enabled)
-				.length}
-			{@const total = (catalog.models ?? []).filter((m) => m.provider === p.name).length}
+			{@const mine = all(p.name)}
+			{@const served = mine.filter((m) => m.enabled && !m.blocked).length}
+			{@const reachable = mine.filter((m) => m.blocked?.kind !== 'wrong_dialect').length}
+			{@const elsewhere_count = elsewhere(p.name).length}
+			{@const twin = siblings(p)}
 			<Panel
 				title={p.name}
-				note={total === 0
+				note={mine.length === 0
 					? p.catalog
 						? 'aucun modèle connu, relisez le catalogue'
 						: 'ce fournisseur ne publie pas de liste, ajoutez ses modèles à la main'
-					: `${served} servi${served > 1 ? 's' : ''} sur ${total} connu${total > 1 ? 's' : ''}`}
+					: `${served} servi${served > 1 ? 's' : ''} sur ${reachable} joignable${reachable > 1 ? 's' : ''}`}
 			>
 				{#snippet actions()}
 					<div class="flex flex-wrap items-center gap-2">
 						<TrustBadge trust={p.trust} />
-						{#if total > 0}
+						{#if reachable > 0}
 							<Button
 								variant="outline"
 								size="sm"
 								disabled={busy.has(p.name)}
-								onclick={() => setAll(p.name, served < total)}
+								onclick={() => setAll(p.name, served < reachable)}
 							>
-								{served < total ? 'Tout servir' : 'Tout couper'}
+								{served < reachable ? 'Tout servir' : 'Tout couper'}
 							</Button>
 						{/if}
 						{#if p.catalog}
@@ -280,12 +369,35 @@
 					</div>
 				{/snippet}
 
+				{#if twin.length}
+					<p class="text-muted-foreground -mt-1 mb-3 text-xs">
+						Même abonnement que {twin.map((t) => t.name).join(', ')}, autre dialecte : cette
+						surface parle {p.wire === 'openai' ? 'OpenAI' : 'Anthropic'}, et chaque modèle ne
+						répond que sur la sienne.
+					</p>
+				{/if}
+
+				{#if mine.length > PREVIEW}
+					<div class="relative mb-3">
+						<Search
+							class="text-muted-foreground pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2"
+						/>
+						<Input
+							value={narrow[p.name] ?? ''}
+							oninput={(e) => (narrow = { ...narrow, [p.name]: e.currentTarget.value })}
+							placeholder="Filtrer les {mine.length} modèles de {p.name}"
+							class="h-9 pl-9"
+							aria-label="Filtrer les modèles de {p.name}"
+						/>
+					</div>
+				{/if}
+
 				{#if rows.length === 0}
 					<Empty
 						icon={Boxes}
 						tight
-						title={query.trim() ? 'aucun modèle ne correspond' : 'rien dans la liste'}
-						hint={query.trim()
+						title={searching(p.name) ? 'aucun modèle ne correspond' : 'rien dans la liste'}
+						hint={searching(p.name)
 							? 'la recherche porte sur le nom de route, l’identifiant du fournisseur et le libellé'
 							: p.catalog
 								? 'relisez le catalogue pour demander à ce fournisseur ce qu’il vend'
@@ -297,7 +409,7 @@
 							<li class="flex items-center gap-3 py-3">
 								<Switch
 									checked={m.enabled}
-									disabled={busy.has(m.route)}
+									disabled={busy.has(m.route) || m.blocked?.kind === 'wrong_dialect'}
 									onCheckedChange={(v) => setEnabled(m, v)}
 									aria-label="servir {m.route}"
 								/>
@@ -315,6 +427,14 @@
 												disparu
 											</span>
 										{/if}
+										{#if m.blocked}
+											<span
+												class="pill {m.blocked.kind === 'already_in_file' ? 'pill-quiet' : 'pill-warn'}"
+												title={why(m) ?? ''}
+											>
+												{m.blocked.kind === 'already_in_file' ? 'déjà dans le fichier' : why(m)}
+											</span>
+										{/if}
 									</div>
 									<p class="text-muted-foreground mt-0.5 truncate text-xs">
 										<span class="tabular">{m.route}</span>
@@ -326,6 +446,16 @@
 										{/if}
 									</p>
 								</div>
+								<Button
+									variant="ghost"
+									size="icon"
+									class="text-muted-foreground hover:text-foreground size-8 shrink-0"
+									title="corriger {m.route}"
+									disabled={busy.has(m.route)}
+									onclick={() => openEdit(m)}
+								>
+									<Pencil class="size-4" />
+								</Button>
 								{#if m.source === 'manual'}
 									<Button
 										variant="ghost"
@@ -342,12 +472,12 @@
 						{/each}
 					</ul>
 
-					{#if !query.trim() && rows.length > PREVIEW}
+					{#if !searching(p.name) && rows.length > PREVIEW}
 						<Button
 							variant="ghost"
 							size="sm"
 							class="text-muted-foreground mt-2 w-full"
-							onclick={() => toggleOpen(p.name)}
+							onclick={() => (opened = toggle(opened, p.name))}
 						>
 							{opened.has(p.name)
 								? 'Replier'
@@ -355,25 +485,58 @@
 						</Button>
 					{/if}
 				{/if}
+
+				{#if elsewhere_count}
+					<Button
+						variant="ghost"
+						size="sm"
+						class="text-muted-foreground mt-1 w-full"
+						onclick={() => (others = toggle(others, p.name))}
+					>
+						{others.has(p.name)
+							? 'Masquer les modèles de l’autre surface'
+							: `${elsewhere_count} modèle${elsewhere_count > 1 ? 's' : ''} vendu${elsewhere_count > 1 ? 's' : ''} sur l’autre surface`}
+					</Button>
+				{/if}
 			</Panel>
 		{/each}
 	{/if}
 </div>
 
-<Dialog.Root open={adding !== null} onOpenChange={(v) => (adding = v ? adding : null)}>
+<Dialog.Root
+	open={adding !== null || editing !== null}
+	onOpenChange={(v) => {
+		if (!v) {
+			adding = null;
+			editing = null;
+		}
+	}}
+>
 	<Dialog.Content class="sm:max-w-lg">
 		<Dialog.Header>
-			<Dialog.Title>Ajouter un modèle sur {adding}</Dialog.Title>
+			<Dialog.Title>
+				{editing ? `Corriger ${editing.route}` : `Ajouter un modèle sur ${adding}`}
+			</Dialog.Title>
 			<Dialog.Description>
-				Pour un fournisseur qui ne publie pas de liste, ou un modèle qu’il vend sans l’annoncer.
-				L’identifiant doit être écrit exactement comme le fournisseur l’attend.
+				{#if editing}
+					Le nom affiché et la fenêtre de contexte voyagent jusqu’aux agents, qui n’ont donc plus
+					à en garder une copie. Une relecture du catalogue ne les écrase pas.
+				{:else}
+					Pour un fournisseur qui ne publie pas de liste, ou un modèle qu’il vend sans
+					l’annoncer. L’identifiant doit être écrit exactement comme le fournisseur l’attend.
+				{/if}
 			</Dialog.Description>
 		</Dialog.Header>
 
 		<div class="space-y-4 py-2">
 			<div class="space-y-2">
 				<Label for="upstream">Identifiant chez le fournisseur</Label>
-				<Input id="upstream" bind:value={form.upstream_id} placeholder="grok-4.6" />
+				<Input
+					id="upstream"
+					bind:value={form.upstream_id}
+					placeholder="grok-4.6"
+					disabled={editing !== null}
+				/>
 			</div>
 			<div class="grid gap-4 sm:grid-cols-2">
 				<div class="space-y-2">
@@ -382,7 +545,12 @@
 				</div>
 				<div class="space-y-2">
 					<Label for="ctx">Fenêtre de contexte</Label>
-					<Input id="ctx" bind:value={form.context_length} inputmode="numeric" placeholder="500000" />
+					<Input
+						id="ctx"
+						bind:value={form.context_length}
+						inputmode="numeric"
+						placeholder="500000"
+					/>
 				</div>
 			</div>
 			<div class="space-y-2">
@@ -390,22 +558,36 @@
 				<Input
 					id="route"
 					bind:value={form.route}
-					placeholder={adding ? `${providers.find((p) => p.name === adding)?.prefix ?? ''}grok-4.6` : ''}
+					placeholder={adding
+						? `${providers.find((p) => p.name === adding)?.prefix ?? ''}grok-4.6`
+						: ''}
 				/>
 				<p class="text-muted-foreground text-xs">
 					Ce que les agents demanderont. Laissez vide pour le nom habituel : le préfixe du
 					fournisseur suivi de l’identifiant.
 				</p>
 			</div>
-			<label class="flex items-center gap-3 text-sm">
-				<Switch bind:checked={form.enabled} aria-label="servir tout de suite" />
-				Servir tout de suite
-			</label>
+			{#if !editing}
+				<label class="flex items-center gap-3 text-sm">
+					<Switch bind:checked={form.enabled} aria-label="servir tout de suite" />
+					Servir tout de suite
+				</label>
+			{/if}
 		</div>
 
 		<Dialog.Footer>
-			<Button variant="outline" onclick={() => (adding = null)}>Annuler</Button>
-			<Button onclick={save} disabled={saving || !form.upstream_id.trim()}>Ajouter</Button>
+			<Button
+				variant="outline"
+				onclick={() => {
+					adding = null;
+					editing = null;
+				}}
+			>
+				Annuler
+			</Button>
+			<Button onclick={save} disabled={saving || (!editing && !form.upstream_id.trim())}>
+				{editing ? 'Enregistrer' : 'Ajouter'}
+			</Button>
 		</Dialog.Footer>
 	</Dialog.Content>
 </Dialog.Root>

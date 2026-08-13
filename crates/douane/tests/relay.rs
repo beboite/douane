@@ -116,6 +116,10 @@ struct Upstream {
     /// one vanish.
     catalogue: Mutex<serde_json::Value>,
     catalogue_calls: Mutex<Vec<Option<String>>>,
+    /// The public page saying which dialect each id answers in, absent until a
+    /// test publishes one. A 404 here is the common case in the wild.
+    dialects: Mutex<Option<serde_json::Value>>,
+    dialect_calls: Mutex<Vec<Option<String>>>,
 }
 
 impl Upstream {
@@ -125,6 +129,8 @@ impl Upstream {
             behaviour,
             catalogue: Mutex::new(serde_json::json!({"data": []})),
             catalogue_calls: Mutex::new(Vec::new()),
+            dialects: Mutex::new(None),
+            dialect_calls: Mutex::new(Vec::new()),
         });
         let app = axum::Router::new()
             .route("/v1/messages", axum::routing::post(handle))
@@ -133,6 +139,7 @@ impl Upstream {
             .route("/chat/completions", axum::routing::post(handle))
             .route("/v1/models", axum::routing::get(handle_catalogue))
             .route("/models", axum::routing::get(handle_catalogue))
+            .route("/api/pricing", axum::routing::get(handle_dialects))
             .with_state(up.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -171,6 +178,30 @@ impl Upstream {
         *self.catalogue.lock().unwrap() = serde_json::json!({"data": data, "has_more": false});
     }
 
+    /// Publish the dialect table. Takes `(id, endpoint types)`.
+    fn speaks(&self, models: &[(&str, &[&str])]) {
+        let data: Vec<serde_json::Value> = models
+            .iter()
+            .map(|(id, kinds)| {
+                serde_json::json!({
+                    "model_name": id,
+                    "supported_endpoint_types": kinds,
+                    // The page is also a price list, and douane must read none
+                    // of this.
+                    "model_ratio": 3.5,
+                    "quota_type": 0,
+                })
+            })
+            .collect();
+        *self.dialects.lock().unwrap() = Some(serde_json::json!({"data": data}));
+    }
+
+    /// What each dialect request carried, if anything. It must carry nothing:
+    /// the page is public and a request with no key cannot leak one.
+    fn dialect_keys(&self) -> Vec<Option<String>> {
+        self.dialect_calls.lock().unwrap().clone()
+    }
+
     /// The credential each catalogue request arrived with. A listing scoped to
     /// a token is worthless if douane asks anonymously.
     fn catalogue_keys(&self) -> Vec<Option<String>> {
@@ -187,6 +218,19 @@ async fn handle_catalogue(State(up): State<Arc<Upstream>>, headers: HeaderMap) -
     );
     let body = up.catalogue.lock().unwrap().clone();
     axum::Json(body).into_response()
+}
+
+async fn handle_dialects(State(up): State<Arc<Upstream>>, headers: HeaderMap) -> Response {
+    up.dialect_calls.lock().unwrap().push(
+        headers
+            .get("x-api-key")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned),
+    );
+    match up.dialects.lock().unwrap().clone() {
+        Some(body) => axum::Json(body).into_response(),
+        None => (axum::http::StatusCode::NOT_FOUND, "no such page").into_response(),
+    }
 }
 
 async fn handle(
@@ -324,6 +368,7 @@ async fn broker_with(
                 prefix: None,
                 models_path: None,
                 catalog: true,
+                dialects_path: None,
             },
         );
     }
@@ -2109,12 +2154,277 @@ async fn the_file_wins_a_collision_and_the_dashboard_says_so() {
     assert_eq!(other_up.last().body["model"], "the-one-from-the-file");
     assert_eq!(up.calls(), 0);
     let cat = catalogue(&b).await;
+    assert_eq!(cat["collisions"]["haiku"]["kind"], "conflict");
     assert!(
-        cat["collisions"]["haiku"]
+        cat["collisions"]["haiku"]["detail"]
             .as_str()
             .unwrap()
             .contains("douane.toml")
     );
+}
+
+#[tokio::test]
+async fn the_file_serving_the_same_model_is_not_a_conflict() {
+    // The dashboard used to shout about this: a hand-written route and a
+    // discovered row naming the same model on the same provider is the file
+    // and the upstream agreeing, and the model answers. Reporting it the same
+    // way as a real clash is how a screen teaches people to ignore it.
+    let (url, up) = Upstream::spawn(Behaviour::Json).await;
+    up.sells(&[("kimi-k3", None, None)]);
+    let b = broker(
+        vec![("primary", &url, Trust::Low)],
+        vec![("primary-kimi-k3", "primary", Some("kimi-k3"), vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+    )
+    .await;
+
+    refresh(&b).await;
+    assert_eq!(enable(&b, "primary-kimi-k3", true).await, 200);
+
+    let cat = catalogue(&b).await;
+    assert_eq!(cat["collisions"]["primary-kimi-k3"]["kind"], "already_in_file");
+    // And it is not a broken route: the call goes through.
+    let res = call(&b, "vk-the-virtual-one", ask("primary-kimi-k3")).await;
+    assert_eq!(res.status(), 200);
+    assert_eq!(up.last().body["model"], "kimi-k3");
+}
+
+#[tokio::test]
+async fn a_model_sold_on_another_surface_is_not_served_here() {
+    // One account, two surfaces, one catalogue listing every id on both. The
+    // ids that answer in the other dialect must not become routes here: they
+    // would look served and fail at call time.
+    let (url, up) = Upstream::spawn(Behaviour::Json).await;
+    up.sells(&[("claude-opus-5", None, None), ("gpt-5.6-terra", None, None)]);
+    up.speaks(&[
+        ("claude-opus-5", &["anthropic", "openai"]),
+        ("gpt-5.6-terra", &["openai", "openai-response"]),
+    ]);
+    let b = broker(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", None, vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+    )
+    .await;
+
+    let out = refresh(&b).await;
+    assert_eq!(out["refreshed"][0]["found"], 2);
+    assert_eq!(out["refreshed"][0]["speaks"], 1);
+    // The page is public, and douane asks for it with nothing attached.
+    assert_eq!(up.dialect_keys(), vec![None]);
+
+    // Both switched on by hand: the one that cannot answer here is refused,
+    // and the refusal says which dialect it wanted.
+    assert_eq!(enable(&b, "primary-claude-opus-5", true).await, 200);
+    assert_eq!(enable(&b, "primary-gpt-5.6-terra", true).await, 200);
+    let cat = catalogue(&b).await;
+    assert_eq!(
+        cat["collisions"]["primary-gpt-5.6-terra"]["kind"],
+        "wrong_dialect"
+    );
+    assert!(cat["collisions"]["primary-claude-opus-5"].is_null());
+
+    let before = up.calls();
+    let res = call(&b, "vk-the-virtual-one", ask("primary-gpt-5.6-terra")).await;
+    assert_eq!(res.status(), 404);
+    assert_eq!(up.calls(), before, "the refused model reached the upstream");
+    let res = call(&b, "vk-the-virtual-one", ask("primary-claude-opus-5")).await;
+    assert_eq!(res.status(), 200);
+}
+
+#[tokio::test]
+async fn serving_everything_a_provider_sells_skips_what_it_cannot_reach() {
+    let (url, up) = Upstream::spawn(Behaviour::Json).await;
+    up.sells(&[
+        ("claude-opus-5", None, None),
+        ("gpt-5.6-terra", None, None),
+        ("sora-video", None, None),
+    ]);
+    up.speaks(&[
+        ("claude-opus-5", &["anthropic", "openai"]),
+        ("gpt-5.6-terra", &["openai"]),
+        ("sora-video", &["Unified video format"]),
+    ]);
+    let b = broker(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", None, vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+    )
+    .await;
+    refresh(&b).await;
+
+    let (status, body) = admin(
+        &b,
+        reqwest::Method::PUT,
+        "/admin/api/providers/primary/models/enabled",
+        Some(serde_json::json!({ "enabled": true })),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["changed"], 1);
+    assert_eq!(body["skipped"], 2);
+
+    let (_, ids) = listing(&b, "vk-the-virtual-one").await;
+    assert!(ids.contains(&"primary-claude-opus-5".to_owned()));
+    assert!(!ids.contains(&"primary-gpt-5.6-terra".to_owned()));
+}
+
+#[tokio::test]
+async fn a_client_can_ask_for_one_upstreams_names_and_no_more() {
+    // A launcher's menu has one entry per subscription, so it has to know which
+    // names belong to which. The filter can only ever narrow: a client capped
+    // to one provider learns nothing about the other by naming it.
+    let (url, up) = Upstream::spawn(Behaviour::Json).await;
+    let (other, _) = Upstream::spawn(Behaviour::Json).await;
+    up.sells(&[("kimi-k3", None, None)]);
+    let b = broker_with(
+        vec![("primary", &url, Trust::Low), ("backup", &other, Trust::Low)],
+        vec![
+            ("haiku", "primary", None, vec![]),
+            ("spare", "backup", None, vec![]),
+        ],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+        |c| {
+            c.clients.insert(
+                "narrow".to_owned(),
+                douane::config::Client {
+                    key: SecretRef::parse("douane.vk_narrow").unwrap(),
+                    routes: vec!["spare".to_owned()],
+                    max_trust: None,
+                    note: None,
+                },
+            );
+        },
+    )
+    .await;
+    refresh(&b).await;
+    enable(&b, "primary-kimi-k3", true).await;
+
+    let listing_for = |key: &'static str, q: &'static str| {
+        let url = b.url.clone();
+        async move {
+            let res = reqwest::Client::new()
+                .get(format!("{url}/v1/models{q}"))
+                .header("x-api-key", key)
+                .send()
+                .await
+                .unwrap();
+            let v: serde_json::Value = res.json().await.unwrap();
+            v["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|m| m["id"].as_str().map(str::to_owned))
+                .collect::<Vec<_>>()
+        }
+    };
+
+    let all = listing_for("vk-the-virtual-one", "").await;
+    assert!(all.contains(&"haiku".to_owned()) && all.contains(&"spare".to_owned()));
+    let one = listing_for("vk-the-virtual-one", "?provider=primary").await;
+    assert_eq!(one, vec!["haiku".to_owned(), "primary-kimi-k3".to_owned()]);
+    let two = listing_for("vk-the-virtual-one", "?provider=primary,backup").await;
+    assert_eq!(two.len(), 3);
+    // The cap still wins: naming the provider a client may not reach answers
+    // nothing rather than answering more.
+    assert!(
+        listing_for("vk-narrow-key", "?provider=primary")
+            .await
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_discovered_row_can_be_corrected_and_the_correction_survives_a_sweep() {
+    // The window and the display name are exactly what a launcher used to keep
+    // its own table for, and these listings publish neither.
+    let (url, up) = Upstream::spawn(Behaviour::Json).await;
+    up.sells(&[("kimi-k3", None, None)]);
+    let b = broker(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", None, vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+    )
+    .await;
+    refresh(&b).await;
+
+    let (status, _) = admin(
+        &b,
+        reqwest::Method::PATCH,
+        "/admin/api/models/primary-kimi-k3",
+        Some(serde_json::json!({
+            "label": "Kimi K3",
+            "context_length": 256000,
+            "route": "k3"
+        })),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(enable(&b, "k3", true).await, 200);
+
+    refresh(&b).await;
+    let cat = catalogue(&b).await;
+    let row = cat["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["route"] == "k3")
+        .cloned()
+        .unwrap();
+    assert_eq!(row["label"], "Kimi K3");
+    assert_eq!(row["context_length"], 256_000);
+    assert_eq!(row["enabled"], true);
+
+    // And the client is told both, so it stops carrying its own copy.
+    let res = reqwest::Client::new()
+        .get(format!("{}/v1/models", b.url))
+        .header("x-api-key", "vk-the-virtual-one")
+        .send()
+        .await
+        .unwrap();
+    let v: serde_json::Value = res.json().await.unwrap();
+    let listed = v["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "k3")
+        .cloned()
+        .unwrap();
+    assert_eq!(listed["display_name"], "Kimi K3");
+    assert_eq!(listed["context_length"], 256_000);
+}
+
+#[tokio::test]
+async fn a_dialect_page_that_is_not_there_refuses_nothing() {
+    // Most sites publish none. Silence must never read as a refusal, or the
+    // catalogue would empty itself on every provider that has no such page.
+    let (url, up) = Upstream::spawn(Behaviour::Json).await;
+    up.sells(&[("gpt-5.6-terra", None, None)]);
+    let b = broker(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", None, vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+    )
+    .await;
+
+    let out = refresh(&b).await;
+    assert_eq!(out["refreshed"][0]["ok"], true);
+    assert_eq!(out["refreshed"][0]["speaks"], 1);
+    assert_eq!(enable(&b, "primary-gpt-5.6-terra", true).await, 200);
+    let res = call(&b, "vk-the-virtual-one", ask("primary-gpt-5.6-terra")).await;
+    assert_eq!(res.status(), 200);
 }
 
 #[tokio::test]

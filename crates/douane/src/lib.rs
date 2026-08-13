@@ -20,7 +20,7 @@ pub mod wire;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, patch, post, put};
 
 use crate::proxy::AppState;
 
@@ -76,6 +76,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             put(dash::set_model_enabled),
         )
         .route("/admin/api/models/{route}", delete(dash::delete_model))
+        .route("/admin/api/models/{route}", patch(dash::edit_model))
         .route(
             "/admin/api/providers/{provider}/models/enabled",
             put(dash::set_provider_models_enabled),

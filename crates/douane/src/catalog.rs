@@ -93,6 +93,11 @@ pub struct ModelEntry {
     pub first_seen: String,
     pub last_seen: String,
     pub note: Option<String>,
+    /// The dialects the upstream says this model answers in (`anthropic`,
+    /// `openai`, `gemini`, and a few that are not chat at all). Empty means the
+    /// upstream never said, and silence is never read as a refusal.
+    #[serde(default)]
+    pub endpoints: Vec<String>,
 }
 
 impl ModelEntry {
@@ -123,7 +128,7 @@ impl Config {
     pub fn with_models(&self, models: &[ModelEntry]) -> Self {
         let mut out = self.clone();
         for m in models {
-            if self.routes.contains_key(&m.route) || !self.providers.contains_key(&m.provider) {
+            if self.refuse(m).is_some() {
                 continue;
             }
             if let Some((name, route)) = m.as_route() {
@@ -133,26 +138,103 @@ impl Config {
         out
     }
 
+    /// Why this entry cannot become a route, or `None` when it can.
+    ///
+    /// The dialect case is the one that is not about names: one reseller
+    /// account is often sold on two surfaces, both listing the same ids, while
+    /// a given id answers on exactly one of them. Installing the other one
+    /// produces a route that exists, looks served, and fails at call time.
+    /// **A hand-added row is exempt**, because the owner typing an id is a
+    /// stronger statement than a price page.
+    pub fn refuse(&self, m: &ModelEntry) -> Option<Collision> {
+        if let Some(file) = self.routes.get(&m.route) {
+            let same = file.provider == m.provider
+                && file.model.as_deref().unwrap_or(&m.route) == m.upstream_id;
+            return Some(Collision {
+                kind: if same {
+                    CollisionKind::AlreadyInFile
+                } else {
+                    CollisionKind::Conflict
+                },
+                detail: if same {
+                    format!("`{}` is served by douane.toml already", m.route)
+                } else {
+                    format!(
+                        "`{}` is a route in douane.toml on `{}`: the file wins",
+                        m.route, file.provider
+                    )
+                },
+                other: Some(file.provider.clone()),
+            });
+        }
+        let Some(p) = self.providers.get(&m.provider) else {
+            return Some(Collision {
+                kind: CollisionKind::NoProvider,
+                detail: format!("provider `{}` is not in douane.toml", m.provider),
+                other: None,
+            });
+        };
+        if m.source == Source::Probed && !p.wire.speaks(&m.endpoints) {
+            return Some(Collision {
+                kind: CollisionKind::WrongDialect,
+                detail: format!(
+                    "`{}` answers in {} here, and this provider speaks {}",
+                    m.upstream_id,
+                    m.endpoints.join(", "),
+                    p.wire.label()
+                ),
+                other: None,
+            });
+        }
+        None
+    }
+
     /// Enabled entries the merge above had to drop, with the reason. The
     /// dashboard shows these: a switch that is on while the route it names is
     /// served by the file is a lie worth surfacing.
-    pub fn model_collisions(&self, models: &[ModelEntry]) -> BTreeMap<String, String> {
+    pub fn model_collisions(&self, models: &[ModelEntry]) -> BTreeMap<String, Collision> {
         let mut out = BTreeMap::new();
         for m in models.iter().filter(|m| m.enabled) {
-            if self.routes.contains_key(&m.route) {
-                out.insert(
-                    m.route.clone(),
-                    format!("`{}` is already a route in douane.toml", m.route),
-                );
-            } else if !self.providers.contains_key(&m.provider) {
-                out.insert(
-                    m.route.clone(),
-                    format!("provider `{}` is not in douane.toml", m.provider),
-                );
+            if let Some(c) = self.refuse(m) {
+                out.insert(m.route.clone(), c);
             }
         }
         out
     }
+}
+
+/// Why an enabled catalogue row installs no route.
+///
+/// Four different facts, and the dashboard has to tell them apart: one of them
+/// is not a problem at all, and printing four warnings where one belongs is how
+/// a screen teaches people to ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollisionKind {
+    /// The file serves this exact model under this exact name. Nothing is
+    /// broken: the row is redundant, the model answers.
+    AlreadyInFile,
+    /// The name is taken in the file by something else. The file wins, and the
+    /// switch is a lie until the row is renamed.
+    Conflict,
+    /// The provider left `douane.toml` while its models stayed in the table.
+    NoProvider,
+    /// The upstream sells this id on another surface than the one this
+    /// provider talks to.
+    WrongDialect,
+}
+
+/// One refusal, with enough in it for a screen to say why in its own words.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Collision {
+    pub kind: CollisionKind,
+    /// The English sentence, for the API and the logs. The dashboard writes
+    /// its own from `kind`.
+    pub detail: String,
+    /// The provider the file points that name at, when the name is the
+    /// problem.
+    #[serde(default)]
+    pub other: Option<String>,
 }
 
 /// What a provider's catalogue answered.
@@ -161,6 +243,9 @@ pub struct Discovered {
     pub upstream_id: String,
     pub label: Option<String>,
     pub context_length: Option<u64>,
+    /// What the upstream says this id answers in. Usually empty here: the
+    /// listing rarely carries it, and [`fetch_dialects`] fills it in after.
+    pub endpoints: Vec<String>,
 }
 
 /// The outcome of asking one provider what it sells.
@@ -171,6 +256,11 @@ pub struct RefreshResult {
     /// How many ids the upstream listed. Zero with `ok` is a real answer: some
     /// tokens are scoped to nothing.
     pub found: usize,
+    /// How many of those this surface can actually reach. Equal to `found`
+    /// when the upstream publishes no dialect table, which is the same thing
+    /// as "douane has no reason to doubt any of them".
+    #[serde(default)]
+    pub speaks: usize,
     /// Rows this refresh created, so the dashboard can say what is new without
     /// diffing two listings itself.
     pub added: usize,
@@ -225,9 +315,85 @@ pub fn parse_catalogue(body: &[u8]) -> Result<Vec<Discovered>, String> {
             upstream_id: id,
             label,
             context_length,
+            endpoints: endpoint_types(item),
         });
     }
     Ok(out)
+}
+
+/// The dialects one entry advertises, under any of the names the family of
+/// resellers uses for that field.
+fn endpoint_types(item: &serde_json::Value) -> Vec<String> {
+    ["supported_endpoint_types", "supported_endpoints", "endpoints"]
+        .iter()
+        .find_map(|k| item.get(*k).and_then(|x| x.as_array()))
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str())
+                .filter(|s| !s.is_empty() && s.len() <= 40)
+                .map(|s| s.to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Read the page saying which dialect each model answers in.
+///
+/// Same envelope as the catalogue, keyed by `model_name`, which is the shape
+/// the new-api family publishes. **Nothing else on that page is read**: it is
+/// also a price list, and douane computes no cost, ever.
+pub fn parse_dialects(body: &[u8]) -> Result<BTreeMap<String, Vec<String>>, String> {
+    let v: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| format!("the model table is not JSON: {e}"))?;
+    let items = v
+        .get("data")
+        .or_else(|| v.get("models"))
+        .or(Some(&v))
+        .and_then(|x| x.as_array())
+        .ok_or_else(|| "the model table has no `data` array".to_owned())?;
+    let mut out = BTreeMap::new();
+    for item in items {
+        let Some(id) = item
+            .get("model_name")
+            .or_else(|| item.get("id"))
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty() && s.len() <= 200)
+        else {
+            continue;
+        };
+        let kinds = endpoint_types(item);
+        if !kinds.is_empty() {
+            out.insert(id.to_owned(), kinds);
+        }
+    }
+    Ok(out)
+}
+
+/// Ask a provider which dialect each of its models speaks.
+///
+/// **Without a credential.** This page is public on every site that has one,
+/// and a request that carries no key cannot leak one. A site that answers 404,
+/// or answers something unreadable, simply teaches douane nothing: the models
+/// stay servable, which is exactly how it worked before this existed.
+async fn fetch_dialects(state: &AppState, provider: &Provider) -> BTreeMap<String, Vec<String>> {
+    let Some(url) = provider.dialects_url() else {
+        return BTreeMap::new();
+    };
+    let response = state
+        .http
+        .get(&url)
+        .header("user-agent", "claude-cli/2.1.220 (external, cli)")
+        .timeout(std::time::Duration::from_secs(CATALOG_TIMEOUT_SECS))
+        .send()
+        .await;
+    let Ok(response) = response else {
+        return BTreeMap::new();
+    };
+    if !response.status().is_success() {
+        return BTreeMap::new();
+    }
+    let body = response.bytes().await.unwrap_or_default();
+    parse_dialects(&body).unwrap_or_default()
 }
 
 /// Ask one provider what it sells.
@@ -242,6 +408,7 @@ pub async fn fetch(state: &AppState, name: &str, provider: &Provider) -> Refresh
         provider: name.to_owned(),
         ok: false,
         found: 0,
+        speaks: 0,
         added: 0,
         missing: 0,
         status: None,
@@ -310,7 +477,7 @@ pub async fn fetch(state: &AppState, name: &str, provider: &Provider) -> Refresh
         return out;
     }
 
-    let found = match parse_catalogue(&body) {
+    let mut found = match parse_catalogue(&body) {
         Ok(f) => f,
         Err(e) => {
             out.detail = Some(format!("{e} ({})", short_and_clean(state, &body)));
@@ -321,6 +488,24 @@ pub async fn fetch(state: &AppState, name: &str, provider: &Provider) -> Refresh
 
     out.ok = true;
     out.found = found.len();
+
+    // Which of those ids this surface can actually reach. Read after the
+    // listing rather than before, so a site without the page costs nothing and
+    // a site with it costs one unauthenticated GET per sweep.
+    let dialects = fetch_dialects(state, provider).await;
+    if !dialects.is_empty() {
+        for d in &mut found {
+            if let Some(kinds) = dialects.get(&d.upstream_id) {
+                d.endpoints = kinds.clone();
+            }
+        }
+        out.speaks = found
+            .iter()
+            .filter(|d| provider.wire.speaks(&d.endpoints))
+            .count();
+    } else {
+        out.speaks = found.len();
+    }
 
     let prefix = provider
         .prefix
@@ -375,6 +560,7 @@ mod tests {
             prefix: None,
             models_path: None,
             catalog: true,
+            dialects_path: None,
         }
     }
 
@@ -391,6 +577,7 @@ mod tests {
             first_seen: "2026-08-13T00:00:00Z".to_owned(),
             last_seen: "2026-08-13T00:00:00Z".to_owned(),
             note: None,
+            endpoints: Vec::new(),
         }
     }
 
@@ -490,8 +677,79 @@ mod tests {
         assert!(!live.routes.contains_key("ghost-a"));
         let clashes = c.model_collisions(&models);
         assert_eq!(clashes.len(), 2);
-        assert!(clashes["crof-a"].contains("douane.toml"));
-        assert!(clashes["ghost-a"].contains("provider `ghost`"));
+        assert_eq!(clashes["crof-a"].kind, CollisionKind::Conflict);
+        assert_eq!(clashes["ghost-a"].kind, CollisionKind::NoProvider);
+    }
+
+    #[test]
+    fn the_dialect_table_is_read_for_dialects_and_for_nothing_else() {
+        let body = br#"{"data":[
+            {"model_name":"claude-opus-5","supported_endpoint_types":["anthropic","openai"],
+             "model_ratio":3.5,"quota_type":0},
+            {"model_name":"gpt-5.6-terra","supported_endpoint_types":["openai"]},
+            {"model_name":"mystery"}
+        ]}"#;
+        let got = parse_dialects(body).unwrap();
+        assert_eq!(got["claude-opus-5"], vec!["anthropic", "openai"]);
+        // An entry saying nothing is absent rather than empty: "said nothing"
+        // and "said none" would otherwise be the same row.
+        assert!(!got.contains_key("mystery"));
+
+        let anthropic = crate::wire::Wire::Anthropic;
+        let openai = crate::wire::Wire::Openai;
+        assert!(anthropic.speaks(&got["claude-opus-5"]));
+        assert!(!anthropic.speaks(&got["gpt-5.6-terra"]));
+        assert!(openai.speaks(&got["gpt-5.6-terra"]));
+        // Silence is not a refusal.
+        assert!(anthropic.speaks(&[]));
+        // The Responses API is not the one douane posts to.
+        assert!(!openai.speaks(&["openai-response".to_owned()]));
+        // And what is not chat at all is served by neither.
+        assert!(!openai.speaks(&["Unified video format".to_owned()]));
+    }
+
+    #[test]
+    fn a_model_on_the_other_surface_is_refused_and_a_hand_added_one_is_not() {
+        let mut c = Config {
+            server: Default::default(),
+            providers: BTreeMap::new(),
+            routes: BTreeMap::new(),
+            clients: BTreeMap::new(),
+            scrub: Default::default(),
+            egress: Default::default(),
+        };
+        c.providers
+            .insert("ol".into(), provider("https://api.openlux.ai"));
+        let mut gpt = entry("ol", "ol-gpt", "gpt-5.6-terra", true);
+        gpt.endpoints = vec!["openai".into()];
+        let mut typed = entry("ol", "ol-typed", "gpt-5.6-terra", true);
+        typed.endpoints = vec!["openai".into()];
+        typed.source = Source::Manual;
+        let models = vec![gpt, typed];
+
+        let live = c.with_models(&models);
+        assert!(!live.routes.contains_key("ol-gpt"));
+        assert!(live.routes.contains_key("ol-typed"));
+        assert_eq!(
+            c.model_collisions(&models)["ol-gpt"].kind,
+            CollisionKind::WrongDialect
+        );
+    }
+
+    #[test]
+    fn the_dialect_page_hangs_off_the_host_and_not_off_the_base_url() {
+        let mut p = provider("https://api.openlux.ai/v1");
+        assert_eq!(
+            p.dialects_url().as_deref(),
+            Some("https://api.openlux.ai/api/pricing")
+        );
+        p.dialects_path = Some(String::new());
+        assert!(p.dialects_url().is_none());
+        p.dialects_path = Some("/api/models".into());
+        assert_eq!(
+            p.dialects_url().as_deref(),
+            Some("https://api.openlux.ai/api/models")
+        );
     }
 
     #[test]

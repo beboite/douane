@@ -62,6 +62,32 @@ impl Wire {
             Self::Openai => "/models",
         }
     }
+
+    /// What this dialect is called where an upstream names it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::Openai => "openai",
+        }
+    }
+
+    /// Whether a model advertising these endpoint types can be reached through
+    /// this dialect. An empty list means the upstream said nothing, and
+    /// silence is not a refusal: the model stays servable.
+    ///
+    /// `openai-response` does not count as OpenAI here. It is the Responses
+    /// API, and douane's OpenAI path posts to `/chat/completions`, so a model
+    /// offering only that one answers 404 on every call douane knows how to
+    /// make.
+    pub fn speaks(self, endpoints: &[String]) -> bool {
+        if endpoints.is_empty() {
+            return true;
+        }
+        endpoints.iter().any(|e| match self {
+            Self::Anthropic => e.eq_ignore_ascii_case("anthropic"),
+            Self::Openai => e.eq_ignore_ascii_case("openai"),
+        })
+    }
 }
 
 /// A request douane will not translate rather than translate wrongly.

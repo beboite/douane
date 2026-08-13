@@ -140,6 +140,24 @@ export type ModelEntry = {
 	first_seen: string;
 	last_seen: string;
 	note: string | null;
+	/** The dialects the upstream says this id answers in. Empty means it never
+	 *  said, and silence is never read as a refusal. */
+	endpoints: string[];
+	/** Why this row installs no route, or null when it does. Computed by the
+	 *  broker so the switch can refuse before it is clicked. */
+	blocked: Collision | null;
+};
+
+/** Why an enabled row serves nothing. `already_in_file` is the one that is not
+ *  a problem: the file and the catalogue agree and the model answers. */
+export type CollisionKind = 'already_in_file' | 'conflict' | 'no_provider' | 'wrong_dialect';
+
+export type Collision = {
+	kind: CollisionKind;
+	/** The broker's own words, in English. The screen writes its own. */
+	detail: string;
+	/** Who the file points that name at, when the name is the problem. */
+	other: string | null;
 };
 
 export type CatalogProvider = {
@@ -149,13 +167,17 @@ export type CatalogProvider = {
 	 *  models are added by hand. */
 	catalog: boolean;
 	prefix: string;
+	/** Which dialect this surface speaks. Two providers on one host are one
+	 *  subscription sold twice, and each id answers on one of them. */
+	wire: 'anthropic' | 'openai';
+	host: string;
 };
 
 export type CatalogView = {
 	models: ModelEntry[];
 	/** Rows switched on whose route name is already served by douane.toml, which
 	 *  the file always wins. Shown rather than silently ignored. */
-	collisions: Record<string, string>;
+	collisions: Record<string, Collision>;
 	providers: CatalogProvider[];
 };
 
@@ -164,6 +186,8 @@ export type RefreshResult = {
 	provider: string;
 	ok: boolean;
 	found: number;
+	/** How many of those this surface can actually reach. */
+	speaks: number;
 	added: number;
 	missing: number;
 	status: number | null;
@@ -328,7 +352,7 @@ export const api = {
 		),
 
 	setProviderModelsEnabled: (token: string, provider: string, enabled: boolean) =>
-		request<{ provider: string; changed: number }>(
+		request<{ provider: string; changed: number; skipped: number }>(
 			token,
 			`/providers/${encodeURIComponent(provider)}/models/enabled`,
 			{ method: 'PUT', body: JSON.stringify({ enabled }) }
@@ -347,6 +371,18 @@ export const api = {
 			note?: string | null;
 		}
 	) => request<{ route: string }>(token, '/models', { method: 'PUT', body: JSON.stringify(body) }),
+
+	/** Correct a discovered row: the name on screen, the window a harness sizes
+	 *  itself from, the name agents type. */
+	editModel: (
+		token: string,
+		route: string,
+		body: { label?: string; context_length?: number; note?: string; route?: string }
+	) =>
+		request<{ route: string }>(token, `/models/${encodeURIComponent(route)}`, {
+			method: 'PATCH',
+			body: JSON.stringify(body)
+		}),
 
 	deleteModel: (token: string, route: string) =>
 		request<{ deleted: string }>(token, `/models/${encodeURIComponent(route)}`, {

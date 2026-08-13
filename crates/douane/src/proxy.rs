@@ -749,7 +749,23 @@ pub async fn health() -> &'static str {
 /// Nothing here names a credential, a base URL or a provider. The route name is
 /// the client's whole vocabulary, which is the same reason the relay answers on
 /// one.
-pub async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+///
+/// `?provider=a,b` narrows the answer to those upstreams, for a launcher whose
+/// menu has one entry per subscription and needs to know which names belong to
+/// which. It is a filter and never a disclosure: the caller has to already know
+/// the name to type it, the answer still carries no provider, and it applies
+/// after the client's own caps, so it can only ever return less.
+#[derive(Debug, serde::Deserialize)]
+pub struct ModelsQuery {
+    #[serde(default)]
+    provider: Option<String>,
+}
+
+pub async fn models(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<ModelsQuery>,
+) -> Response {
     let config = state.config();
 
     let Some(presented) = presented_key(&headers) else {
@@ -778,6 +794,12 @@ pub async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
         .map(|m| (m.route.clone(), m))
         .collect();
 
+    let wanted: Vec<&str> = q
+        .provider
+        .as_deref()
+        .map(|s| s.split(',').map(str::trim).filter(|p| !p.is_empty()).collect())
+        .unwrap_or_default();
+
     let mut data = Vec::new();
     for (name, route) in &config.routes {
         if !client.routes.is_empty() && !client.routes.iter().any(|r| r == name) {
@@ -789,6 +811,9 @@ pub async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
         if let Some(cap) = client.max_trust
             && provider.trust > cap
         {
+            continue;
+        }
+        if !wanted.is_empty() && !wanted.iter().any(|p| *p == route.provider) {
             continue;
         }
         let known = described.get(name);

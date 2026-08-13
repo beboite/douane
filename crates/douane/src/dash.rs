@@ -907,11 +907,32 @@ pub async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
                 "trust": trust_label(p.trust),
                 "catalog": p.catalog_url().is_some(),
                 "prefix": p.prefix.clone().unwrap_or_else(|| format!("{name}-")),
+                "wire": p.wire,
+                // Two providers on one host are one subscription sold twice,
+                // and the screen says so rather than printing the same three
+                // hundred ids under two headings with no explanation.
+                "host": crate::config::host_of(&p.base_url),
             })
         })
         .collect();
+    // Each row carries why it cannot be served, computed here rather than
+    // guessed on the client: the rule lives in one place, and the switch has to
+    // be able to refuse before it is clicked, not after.
+    let rows: Vec<_> = models
+        .iter()
+        .map(|m| {
+            let mut v = serde_json::to_value(m).unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(o) = v.as_object_mut() {
+                o.insert(
+                    "blocked".to_owned(),
+                    serde_json::to_value(state.base.refuse(m)).unwrap_or(serde_json::Value::Null),
+                );
+            }
+            v
+        })
+        .collect();
     Json(serde_json::json!({
-        "models": models,
+        "models": rows,
         "collisions": collisions,
         "providers": providers,
     }))
@@ -1045,11 +1066,95 @@ pub async fn put_model(
         first_seen: String::new(),
         last_seen: String::new(),
         note: input.note.filter(|s| !s.trim().is_empty()),
+        // A hand-added row asserts nothing about dialects, and is exempt from
+        // the check anyway: the owner typing an id outranks a price page.
+        endpoints: Vec::new(),
     };
     if let Err(e) = state.audit.model_put(&entry) {
         return db_error(e);
     }
     apply_models(&state, Json(serde_json::json!({ "route": route })))
+}
+
+/// What the dashboard sends to correct one row. Every field is optional and an
+/// absent one is left alone; an empty string clears, and a zero window clears.
+#[derive(Debug, Deserialize)]
+pub struct ModelEdit {
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    context_length: Option<u64>,
+    #[serde(default)]
+    note: Option<String>,
+    /// Rename. The name agents type, so it obeys the same rules a generated one
+    /// does and cannot take a name the file owns.
+    #[serde(default)]
+    route: Option<String>,
+}
+
+/// Correct a discovered row: what it is called, the window it advertises, the
+/// name agents ask for.
+pub async fn edit_model(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(route): Path<String>,
+    Json(input): Json<ModelEdit>,
+) -> Response {
+    if let Some(r) = denied(&state, &headers) {
+        return r;
+    }
+    let renamed = input
+        .route
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty() && *r != route);
+    if let Some(r) = renamed {
+        if !crate::config::is_usable_route_name(r) {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "a route name is letters, digits, and `-_.[]`: it travels in a URL and in a \
+                 command line argument",
+            );
+        }
+        if state.base.routes.contains_key(r) {
+            return json_error(
+                StatusCode::CONFLICT,
+                "invalid_request_error",
+                &format!("`{r}` is already a route in douane.toml: pick another name"),
+            );
+        }
+        match state.audit.models() {
+            Ok(models) => {
+                if models.iter().any(|m| m.route == r) {
+                    return json_error(
+                        StatusCode::CONFLICT,
+                        "invalid_request_error",
+                        &format!("`{r}` is already a model in the catalogue"),
+                    );
+                }
+            }
+            Err(e) => return db_error(e),
+        }
+    }
+    match state.audit.model_edit(
+        &route,
+        input.label.as_deref(),
+        input.context_length,
+        input.note.as_deref(),
+        renamed,
+    ) {
+        Ok(true) => apply_models(
+            &state,
+            Json(serde_json::json!({ "route": renamed.unwrap_or(&route) })),
+        ),
+        Ok(false) => json_error(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            &format!("no model named `{route}` in the catalogue"),
+        ),
+        Err(e) => db_error(e),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1084,6 +1189,11 @@ pub async fn set_model_enabled(
 
 /// Every model of one provider at once. The screen is otherwise a hundred
 /// clicks after a first refresh.
+///
+/// **Switching a provider on skips what it cannot serve**: the models it lists
+/// but sells on another surface, the ones it has stopped listing, and the names
+/// the TOML already owns. Switching off spares nothing, because "stop serving
+/// all of this" has to mean all of it.
 pub async fn set_provider_models_enabled(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1093,10 +1203,33 @@ pub async fn set_provider_models_enabled(
     if let Some(r) = denied(&state, &headers) {
         return r;
     }
-    match state.audit.models_set_enabled_for(&provider, input.enabled) {
+    let models = match state.audit.models() {
+        Ok(m) => m,
+        Err(e) => return db_error(e),
+    };
+    let base = &state.base;
+    let routes: Vec<String> = models
+        .iter()
+        .filter(|m| m.provider == provider)
+        .filter(|m| {
+            if !input.enabled {
+                return true;
+            }
+            let mut candidate = (*m).clone();
+            candidate.enabled = true;
+            m.present && base.refuse(&candidate).is_none()
+        })
+        .map(|m| m.route.clone())
+        .collect();
+    let skipped = models.iter().filter(|m| m.provider == provider).count() - routes.len();
+    match state.audit.models_set_enabled_many(&routes, input.enabled) {
         Ok(n) => apply_models(
             &state,
-            Json(serde_json::json!({ "provider": provider, "changed": n })),
+            Json(serde_json::json!({
+                "provider": provider,
+                "changed": n,
+                "skipped": skipped,
+            })),
         ),
         Err(e) => db_error(e),
     }

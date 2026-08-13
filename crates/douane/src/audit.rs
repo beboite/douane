@@ -112,6 +112,18 @@ impl Audit {
     }
 
     fn migrate(&self) -> rusqlite::Result<()> {
+        self.tables()?;
+        // A `models` table written before douane knew about dialects has no
+        // `endpoints` column. Adding it is the whole migration, and the error
+        // this raises the second time is the column already being there.
+        let _ = self.lock().execute(
+            "ALTER TABLE models ADD COLUMN endpoints TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        Ok(())
+    }
+
+    fn tables(&self) -> rusqlite::Result<()> {
         self.lock().execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS calls (
@@ -199,7 +211,10 @@ impl Audit {
                 present        INTEGER NOT NULL DEFAULT 1,
                 first_seen     TEXT    NOT NULL,
                 last_seen      TEXT    NOT NULL,
-                note           TEXT
+                note           TEXT,
+                -- Which dialects the upstream says this id answers in, comma
+                -- separated. Empty means it never said.
+                endpoints      TEXT    NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS models_provider ON models(provider);
             "#,
@@ -307,13 +322,16 @@ impl Audit {
     }
 
     // -------------------------------------------------------------- models --
+    // `endpoints` is stored comma separated rather than as a table of its own:
+    // it is a fact the upstream restates on every sweep, never joined against,
+    // and a row of it is three short words.
 
     /// The whole catalogue, ordered so a provider's models sit together.
     pub fn models(&self) -> rusqlite::Result<Vec<ModelEntry>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT route, provider, upstream_id, label, context_length, enabled, source,
-                    present, first_seen, last_seen, note
+                    present, first_seen, last_seen, note, endpoints
              FROM models ORDER BY provider, route",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -329,6 +347,7 @@ impl Audit {
                 first_seen: r.get(8)?,
                 last_seen: r.get(9)?,
                 note: r.get(10)?,
+                endpoints: split_endpoints(&r.get::<_, String>(11)?),
             })
         })?;
         rows.collect()
@@ -370,12 +389,23 @@ impl Audit {
                 // Found again: refresh what the upstream owns (label, window,
                 // presence) and touch nothing the owner owns.
                 Some(route) => {
+                    // `endpoints` is written only when this sweep learned
+                    // something: a site whose dialect page is down for an hour
+                    // must not erase what it said yesterday.
+                    let kinds = d.endpoints.join(",");
                     tx.execute(
                         "UPDATE models SET label = COALESCE(?2, label),
                                            context_length = COALESCE(?3, context_length),
+                                           endpoints = CASE WHEN ?5 = '' THEN endpoints ELSE ?5 END,
                                            present = 1, last_seen = ?4
                          WHERE route = ?1",
-                        rusqlite::params![route, d.label, d.context_length.map(|n| n as i64), now],
+                        rusqlite::params![
+                            route,
+                            d.label,
+                            d.context_length.map(|n| n as i64),
+                            now,
+                            kinds
+                        ],
                     )?;
                 }
                 None => {
@@ -397,8 +427,9 @@ impl Audit {
                     }
                     tx.execute(
                         "INSERT INTO models (route, provider, upstream_id, label, context_length,
-                                             enabled, source, present, first_seen, last_seen)
-                         VALUES (?1,?2,?3,?4,?5,0,'probed',1,?6,?6)",
+                                             enabled, source, present, first_seen, last_seen,
+                                             endpoints)
+                         VALUES (?1,?2,?3,?4,?5,0,'probed',1,?6,?6,?7)",
                         rusqlite::params![
                             route,
                             provider,
@@ -406,6 +437,7 @@ impl Audit {
                             d.label,
                             d.context_length.map(|n| n as i64),
                             now,
+                            d.endpoints.join(","),
                         ],
                     )?;
                     added += 1;
@@ -468,6 +500,56 @@ impl Audit {
         Ok(())
     }
 
+    /// Correct what an upstream did not say, or said badly: the name on screen,
+    /// the window a harness sizes itself from, the route agents type.
+    ///
+    /// A probed row is editable for one reason: those three are the whole
+    /// reason a launcher used to keep its own table, and a listing that carries
+    /// none of them would send that table straight back into the client. An
+    /// edit survives every refresh that teaches nothing new, which is nearly
+    /// all of them: a sweep only writes a label or a window when the upstream
+    /// published one, and these listings almost never do.
+    pub fn model_edit(
+        &self,
+        route: &str,
+        label: Option<&str>,
+        context_length: Option<u64>,
+        note: Option<&str>,
+        new_route: Option<&str>,
+    ) -> rusqlite::Result<bool> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let mut touched = 0usize;
+        if let Some(l) = label {
+            touched += tx.execute(
+                "UPDATE models SET label = ?2 WHERE route = ?1",
+                rusqlite::params![route, (!l.trim().is_empty()).then_some(l.trim())],
+            )?;
+        }
+        if let Some(n) = context_length {
+            touched += tx.execute(
+                "UPDATE models SET context_length = ?2 WHERE route = ?1",
+                rusqlite::params![route, (n > 0).then_some(n as i64)],
+            )?;
+        }
+        if let Some(t) = note {
+            touched += tx.execute(
+                "UPDATE models SET note = ?2 WHERE route = ?1",
+                rusqlite::params![route, (!t.trim().is_empty()).then_some(t.trim())],
+            )?;
+        }
+        if let Some(r) = new_route
+            && r != route
+        {
+            touched += tx.execute(
+                "UPDATE models SET route = ?2 WHERE route = ?1",
+                rusqlite::params![route, r],
+            )?;
+        }
+        tx.commit()?;
+        Ok(touched > 0)
+    }
+
     /// The one-click path: serve this, or stop serving it.
     pub fn model_set_enabled(&self, route: &str, enabled: bool) -> rusqlite::Result<bool> {
         let n = self.lock().execute(
@@ -477,14 +559,26 @@ impl Audit {
         Ok(n > 0)
     }
 
-    /// Switch a whole provider's catalogue on or off at once. Returns how many
-    /// rows changed, so the dashboard can report the sweep rather than guess.
-    pub fn models_set_enabled_for(&self, provider: &str, enabled: bool) -> rusqlite::Result<usize> {
-        let n = self.lock().execute(
-            "UPDATE models SET enabled = ?2 WHERE provider = ?1 AND (present = 1 OR ?2 = 0)",
-            rusqlite::params![provider, enabled as i64],
-        )?;
-        Ok(n)
+    /// Switch a named set of rows at once, the "serve all of this provider"
+    /// button. The caller picks the rows rather than passing a provider name,
+    /// because which of a provider's models are worth switching on is a
+    /// question about dialects and the log knows nothing about those.
+    pub fn models_set_enabled_many(
+        &self,
+        routes: &[String],
+        enabled: bool,
+    ) -> rusqlite::Result<usize> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let mut changed = 0usize;
+        for route in routes {
+            changed += tx.execute(
+                "UPDATE models SET enabled = ?2 WHERE route = ?1 AND enabled != ?2",
+                rusqlite::params![route, enabled as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed)
     }
 
     pub fn model_delete(&self, route: &str) -> rusqlite::Result<bool> {
@@ -827,6 +921,15 @@ impl Audit {
         })?;
         rows.collect()
     }
+}
+
+/// The stored form of a model's dialects back into a list.
+fn split_endpoints(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn now() -> String {

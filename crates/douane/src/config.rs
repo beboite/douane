@@ -127,7 +127,23 @@ pub struct Provider {
     pub models_path: Option<String>,
     #[serde(default = "yes")]
     pub catalog: bool,
+    /// Where this upstream says which dialect each of its models speaks. The
+    /// new-api family, which is most of these resellers, publishes it on a
+    /// public price page that needs no credential, and it is the only place
+    /// that fact exists: one account can be sold on two surfaces, both listing
+    /// the same ids, while a given id answers on exactly one of them.
+    ///
+    /// Relative to the host, not to `base_url`, because a provider whose
+    /// `base_url` carries a version segment publishes this page at the root
+    /// anyway. An empty string turns the lookup off.
+    #[serde(default)]
+    pub dialects_path: Option<String>,
 }
+
+/// Where the new-api family publishes its model table. Tried once per refresh,
+/// without a credential; a 404 simply means douane learns nothing and serves
+/// everything the listing named.
+pub const DEFAULT_DIALECTS_PATH: &str = "/api/pricing";
 
 fn default_auth_header() -> String {
     "x-api-key".to_owned()
@@ -160,6 +176,42 @@ impl Provider {
                 self.wire.models_path()
             ),
         })
+    }
+
+    /// The full URL of the page saying which dialect each model speaks, or
+    /// `None` when this provider has none.
+    pub fn dialects_url(&self) -> Option<String> {
+        if !self.catalog {
+            return None;
+        }
+        Some(match self.dialects_path.as_deref() {
+            Some(p) if p.trim().is_empty() => return None,
+            Some(p) if p.starts_with("http://") || p.starts_with("https://") => p.to_owned(),
+            Some(p) => format!("{}{}", origin_of(&self.base_url), p),
+            None => format!("{}{}", origin_of(&self.base_url), DEFAULT_DIALECTS_PATH),
+        })
+    }
+}
+
+/// The host a base URL points at. Two providers sharing one is one
+/// subscription sold on two surfaces, which is worth saying on screen.
+pub fn host_of(base_url: &str) -> String {
+    let origin = origin_of(base_url);
+    match origin.find("://") {
+        Some(i) => origin[i + 3..].to_owned(),
+        None => origin,
+    }
+}
+
+/// Scheme and host of a base URL, with whatever path it carries dropped.
+fn origin_of(base_url: &str) -> String {
+    let url = base_url.trim_end_matches('/');
+    match url.find("://") {
+        Some(i) => match url[i + 3..].find('/') {
+            Some(j) => url[..i + 3 + j].to_owned(),
+            None => url.to_owned(),
+        },
+        None => url.to_owned(),
     }
 }
 
