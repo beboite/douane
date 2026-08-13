@@ -702,13 +702,19 @@ pub async fn probe(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Re
     let live = state.config();
 
     let jobs = live.providers.iter().map(|(name, p)| {
-        // The first route pointing here decides which model the probe asks for,
-        // exactly as a real call through that route would.
-        let route = live
-            .routes
-            .iter()
-            .find(|(_, r)| &r.provider == name)
-            .map(|(rn, r)| (rn.clone(), r.model.clone().unwrap_or_else(|| rn.clone())));
+        // A route pointing here decides which model the probe asks for, exactly
+        // as a real call through that route would. **The file's routes come
+        // first**: those were written on purpose and are known to work, while
+        // the first discovered one is whatever sorts earliest, so switching a
+        // model on could silently move the probe onto an id the upstream
+        // answers badly and make a working key look dead.
+        let pick = |from: &crate::config::Config| {
+            from.routes
+                .iter()
+                .find(|(_, r)| &r.provider == name)
+                .map(|(rn, r)| (rn.clone(), r.model.clone().unwrap_or_else(|| rn.clone())))
+        };
+        let route = pick(&state.base).or_else(|| pick(&live));
         probe_one(&state, name, p, route)
     });
 
