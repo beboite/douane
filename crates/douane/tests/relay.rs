@@ -2233,10 +2233,6 @@ async fn a_model_sold_on_another_surface_is_not_served_here() {
     // would look served and fail at call time.
     let (url, up) = Upstream::spawn(Behaviour::Json).await;
     up.sells(&[("claude-opus-5", None, None), ("gpt-5.6-terra", None, None)]);
-    up.speaks(&[
-        ("claude-opus-5", &["anthropic", "openai"]),
-        ("gpt-5.6-terra", &["openai", "openai-response"]),
-    ]);
     let b = broker(
         vec![("primary", &url, Trust::Low)],
         vec![("haiku", "primary", None, vec![])],
@@ -2246,16 +2242,25 @@ async fn a_model_sold_on_another_surface_is_not_served_here() {
     )
     .await;
 
+    // Before the site publishes anything, both ids look servable and both are
+    // switched on.
     let out = refresh(&b).await;
     assert_eq!(out["refreshed"][0]["found"], 2);
-    assert_eq!(out["refreshed"][0]["speaks"], 1);
-    // The page is public, and douane asks for it with nothing attached.
-    assert_eq!(up.dialect_keys(), vec![None]);
-
-    // Both switched on by hand: the one that cannot answer here is refused,
-    // and the refusal says which dialect it wanted.
+    assert_eq!(out["refreshed"][0]["speaks"], 2);
     assert_eq!(enable(&b, "primary-claude-opus-5", true).await, 200);
     assert_eq!(enable(&b, "primary-gpt-5.6-terra", true).await, 200);
+
+    up.speaks(&[
+        ("claude-opus-5", &["anthropic", "openai"]),
+        ("gpt-5.6-terra", &["openai", "openai-response"]),
+    ]);
+    let out = refresh(&b).await;
+    assert_eq!(out["refreshed"][0]["speaks"], 1);
+    // The page is public, and douane asks for it with nothing attached.
+    assert!(up.dialect_keys().iter().all(Option::is_none));
+    // A row the owner switched on is never deleted under them, however wrong
+    // the surface turns out to be. It is refused instead, and says so.
+    assert_eq!(out["refreshed"][0]["dropped"], 0);
     let cat = catalogue(&b).await;
     assert_eq!(
         cat["collisions"]["primary-gpt-5.6-terra"]["kind"],
@@ -2269,6 +2274,16 @@ async fn a_model_sold_on_another_surface_is_not_served_here() {
     assert_eq!(up.calls(), before, "the refused model reached the upstream");
     let res = call(&b, "vk-the-virtual-one", ask("primary-claude-opus-5")).await;
     assert_eq!(res.status(), 200);
+
+    // Switched off, it is not kept as a row nobody may ever switch on again:
+    // it leaves the table at the next sweep.
+    assert_eq!(enable(&b, "primary-gpt-5.6-terra", false).await, 200);
+    let out = refresh(&b).await;
+    assert_eq!(out["refreshed"][0]["dropped"], 1);
+    let cat = catalogue(&b).await;
+    let rows = cat["models"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["route"], "primary-claude-opus-5");
 }
 
 #[tokio::test]
@@ -2292,7 +2307,12 @@ async fn serving_everything_a_provider_sells_skips_what_it_cannot_reach() {
         None,
     )
     .await;
-    refresh(&b).await;
+    // The sweep keeps only what this surface can reach, so the video and the
+    // OpenAI-only id never make it to the screen in the first place.
+    let out = refresh(&b).await;
+    assert_eq!(out["refreshed"][0]["found"], 3);
+    assert_eq!(out["refreshed"][0]["dropped"], 2);
+    assert_eq!(catalogue(&b).await["models"].as_array().unwrap().len(), 1);
 
     let (status, body) = admin(
         &b,
@@ -2303,7 +2323,7 @@ async fn serving_everything_a_provider_sells_skips_what_it_cannot_reach() {
     .await;
     assert_eq!(status, 200);
     assert_eq!(body["changed"], 1);
-    assert_eq!(body["skipped"], 2);
+    assert_eq!(body["skipped"], 0);
 
     let (_, ids) = listing(&b, "vk-the-virtual-one").await;
     assert!(ids.contains(&"primary-claude-opus-5".to_owned()));

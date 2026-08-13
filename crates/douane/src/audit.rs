@@ -475,6 +475,45 @@ impl Audit {
         Ok((added, gone.len()))
     }
 
+    /// Delete the probed rows this provider's surface cannot reach.
+    ///
+    /// The dialect is read in Rust rather than matched in SQL, because what
+    /// counts as speaking a dialect is [`Wire::speaks`] and there must be one
+    /// answer to that question in this codebase. **A row that is switched on is
+    /// never deleted**: the owner said to serve it, and a refusal it can see is
+    /// better than a row that vanishes. Manual rows are never touched either,
+    /// for the reason a sweep never touches them anywhere else.
+    pub fn models_drop_unreachable(
+        &self,
+        provider: &str,
+        wire: crate::wire::Wire,
+    ) -> rusqlite::Result<usize> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let doomed: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT route, endpoints FROM models
+                 WHERE provider = ?1 AND source = 'probed' AND enabled = 0",
+            )?;
+            let rows = stmt.query_map([provider], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (route, endpoints) = row?;
+                if !wire.speaks(&split_endpoints(&endpoints)) {
+                    out.push(route);
+                }
+            }
+            out
+        };
+        for route in &doomed {
+            tx.execute("DELETE FROM models WHERE route = ?1", [route])?;
+        }
+        tx.commit()?;
+        Ok(doomed.len())
+    }
+
     /// Add or replace one row by hand. The path for a site that publishes no
     /// catalogue, and the only way a `manual` row is ever created.
     pub fn model_put(&self, m: &ModelEntry) -> rusqlite::Result<()> {

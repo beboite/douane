@@ -189,6 +189,9 @@ export type RefreshResult = {
 	/** How many of those this surface can actually reach. */
 	speaks: number;
 	added: number;
+	/** Rows deleted because this surface cannot reach them. Never one that was
+	 *  switched on: a decision is refused in the open, never erased. */
+	dropped: number;
 	missing: number;
 	status: number | null;
 	ms: number;

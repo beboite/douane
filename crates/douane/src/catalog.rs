@@ -287,6 +287,10 @@ pub struct RefreshResult {
     pub added: usize,
     /// Rows that were in the catalogue and are no longer listed upstream.
     pub missing: usize,
+    /// Rows deleted because this surface cannot reach them. Never one that was
+    /// switched on.
+    #[serde(default)]
+    pub dropped: usize,
     pub status: Option<u16>,
     pub ms: u64,
     /// The upstream's own words on failure, truncated and scrubbed.
@@ -431,6 +435,7 @@ pub async fn fetch(state: &AppState, name: &str, provider: &Provider) -> Refresh
         found: 0,
         speaks: 0,
         added: 0,
+        dropped: 0,
         missing: 0,
         status: None,
         ms: 0,
@@ -541,6 +546,16 @@ pub async fn fetch(state: &AppState, name: &str, provider: &Provider) -> Refresh
         Ok((added, missing)) => {
             out.added = added;
             out.missing = missing;
+            // Everything this surface cannot reach leaves the table, unless the
+            // owner switched it on: a screen offering three hundred and fifty
+            // ids that answer next door is a screen nobody can use, and a row
+            // nobody may switch on is a row worth deleting rather than
+            // greying out. What is on stays, refused and visible, because a
+            // decision is not douane's to erase.
+            match state.audit.models_drop_unreachable(name, provider.wire) {
+                Ok(n) => out.dropped = n,
+                Err(e) => tracing::error!("the unreachable models could not be dropped: {e}"),
+            }
         }
         Err(e) => {
             tracing::error!("the catalogue could not be written: {e}");

@@ -165,9 +165,12 @@
 			const failed = refreshed.filter((r) => !r.ok);
 			const added = refreshed.reduce((n, r) => n + r.added, 0);
 			const gone = refreshed.reduce((n, r) => n + r.missing, 0);
+			const dropped = refreshed.reduce((n, r) => n + r.dropped, 0);
 			const parts = [];
 			if (added) parts.push(`${added} nouveau${added > 1 ? 'x' : ''}`);
 			if (gone) parts.push(`${gone} disparu${gone > 1 ? 's' : ''}`);
+			if (dropped)
+				parts.push(`${dropped} retiré${dropped > 1 ? 's' : ''} : vendus sur une autre surface`);
 			if (failed.length) {
 				toast.error(
 					`${failed.length} fournisseur${failed.length > 1 ? 's' : ''} n'a pas répondu : ${failed
