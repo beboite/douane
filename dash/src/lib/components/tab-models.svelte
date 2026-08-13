@@ -110,7 +110,9 @@
 			case 'no_provider':
 				return 'ce fournisseur a quitté douane.toml';
 			case 'already_in_file':
-				return 'déjà servi par douane.toml';
+				return m.blocked.other && m.blocked.other !== m.route
+					? `déjà servi sous le nom ${m.blocked.other}`
+					: 'déjà servi par douane.toml';
 			default:
 				return null;
 		}

@@ -2189,10 +2189,41 @@ async fn the_file_serving_the_same_model_is_not_a_conflict() {
 
     let cat = catalogue(&b).await;
     assert_eq!(cat["collisions"]["primary-kimi-k3"]["kind"], "already_in_file");
+    assert_eq!(cat["collisions"]["primary-kimi-k3"]["other"], "primary-kimi-k3");
     // And it is not a broken route: the call goes through.
     let res = call(&b, "vk-the-virtual-one", ask("primary-kimi-k3")).await;
     assert_eq!(res.status(), 200);
     assert_eq!(up.last().body["model"], "kimi-k3");
+}
+
+#[tokio::test]
+async fn the_same_model_under_a_second_name_is_refused_once() {
+    // A curated route and a discovered row can point at one model on one
+    // provider. Installing both puts it in every menu twice with nothing to
+    // choose between the entries, so the file keeps its name and the row says
+    // where the model went.
+    let (url, up) = Upstream::spawn(Behaviour::Json).await;
+    up.sells(&[("glm-5.2", None, None), ("kimi-k3", None, None)]);
+    let b = broker(
+        vec![("primary", &url, Trust::Low)],
+        vec![("glm", "primary", Some("glm-5.2"), vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+    )
+    .await;
+    refresh(&b).await;
+    enable(&b, "primary-glm-5.2", true).await;
+    enable(&b, "primary-kimi-k3", true).await;
+
+    let cat = catalogue(&b).await;
+    assert_eq!(cat["collisions"]["primary-glm-5.2"]["kind"], "already_in_file");
+    assert_eq!(cat["collisions"]["primary-glm-5.2"]["other"], "glm");
+    let (_, ids) = listing(&b, "vk-the-virtual-one").await;
+    assert!(ids.contains(&"glm".to_owned()));
+    assert!(!ids.contains(&"primary-glm-5.2".to_owned()));
+    // The one the file says nothing about is served as usual.
+    assert!(ids.contains(&"primary-kimi-k3".to_owned()));
 }
 
 #[tokio::test]

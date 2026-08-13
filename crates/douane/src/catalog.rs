@@ -166,7 +166,26 @@ impl Config {
                         m.route, file.provider
                     )
                 },
-                other: Some(file.provider.clone()),
+                // What in the file wins: the route that already serves this
+                // model, or the provider the name is taken by.
+                other: Some(if same {
+                    m.route.clone()
+                } else {
+                    file.provider.clone()
+                }),
+            });
+        }
+        // The same model under a second name. A curated route and a discovered
+        // row can point at one id on one provider, and installing both puts the
+        // model in every menu twice with nothing to choose between the two
+        // entries. The file keeps its name; this row says where it went.
+        if let Some((name, _)) = self.routes.iter().find(|(n, r)| {
+            r.provider == m.provider && r.model.as_deref().unwrap_or(n) == m.upstream_id
+        }) {
+            return Some(Collision {
+                kind: CollisionKind::AlreadyInFile,
+                detail: format!("`{}` in douane.toml already serves this model", name),
+                other: Some(name.clone()),
             });
         }
         let Some(p) = self.providers.get(&m.provider) else {
