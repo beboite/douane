@@ -248,6 +248,47 @@ pub async fn threads(
     }
 }
 
+/// `?seconds=300`. Short on purpose: this window is how long an agent stays on
+/// screen after its last call, not how far back the log is read.
+#[derive(Debug, Deserialize)]
+pub struct Live {
+    #[serde(default)]
+    seconds: Option<i64>,
+}
+
+/// Who is working right now.
+///
+/// The answer carries the server's clock and the window it used, so the page
+/// can say "il y a 4 s" against douane's own time rather than against a
+/// browser clock that may be minutes off.
+pub async fn live(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<Live>,
+) -> Response {
+    if let Some(r) = denied(&state, &headers) {
+        return r;
+    }
+    // Below half a minute a thread blinks out between two turns of the same
+    // agent thinking, which reads as an agent that left and came back.
+    let seconds = q.seconds.unwrap_or(300).clamp(30, 3600);
+    let now = OffsetDateTime::now_utc();
+    let since = (now - time::Duration::seconds(seconds))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+    match state.audit.live(&since, 200) {
+        Ok(agents) => Json(serde_json::json!({
+            "now": now
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+            "window_seconds": seconds,
+            "agents": agents,
+        }))
+        .into_response(),
+        Err(e) => db_error(e),
+    }
+}
+
 pub async fn alerts(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,

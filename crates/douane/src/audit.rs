@@ -54,6 +54,10 @@ pub struct Start {
     pub thread_fingerprint: Option<String>,
     pub streamed: bool,
     pub bytes_up: usize,
+    /// The `user-agent` the caller sent, truncated. It names the harness rather
+    /// than the agent, which is what turns a fingerprint into something a human
+    /// recognises on the live screen. Absent when the client sends none.
+    pub user_agent: Option<String>,
 }
 
 /// One thing the scrubber found on its way out.
@@ -115,11 +119,15 @@ impl Audit {
         self.tables()?;
         // A `models` table written before douane knew about dialects has no
         // `endpoints` column. Adding it is the whole migration, and the error
-        // this raises the second time is the column already being there.
-        let _ = self.lock().execute(
+        // this raises the second time is the column already being there. Same
+        // for `calls.user_agent`, added when the dashboard started naming the
+        // harness behind a fingerprint: an old row simply has none.
+        for sql in [
             "ALTER TABLE models ADD COLUMN endpoints TEXT NOT NULL DEFAULT ''",
-            [],
-        );
+            "ALTER TABLE calls ADD COLUMN user_agent TEXT",
+        ] {
+            let _ = self.lock().execute(sql, []);
+        }
         Ok(())
     }
 
@@ -139,6 +147,7 @@ impl Audit {
                 thread_fingerprint TEXT,
                 streamed           INTEGER NOT NULL,
                 bytes_up           INTEGER NOT NULL,
+                user_agent         TEXT,
                 status             INTEGER,
                 duration_ms        INTEGER,
                 bytes_down         INTEGER,
@@ -229,8 +238,9 @@ impl Audit {
         let conn = self.lock();
         conn.execute(
             r#"INSERT INTO calls (at, client, route, provider, model_requested, model_sent,
-                                  trust, agent_fingerprint, thread_fingerprint, streamed, bytes_up)
-               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)"#,
+                                  trust, agent_fingerprint, thread_fingerprint, streamed, bytes_up,
+                                  user_agent)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)"#,
             rusqlite::params![
                 now(),
                 s.client,
@@ -243,6 +253,7 @@ impl Audit {
                 s.thread_fingerprint,
                 s.streamed as i64,
                 s.bytes_up as i64,
+                s.user_agent,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -945,6 +956,83 @@ impl Audit {
         .collect()
     }
 
+    /// Who is working right now. One row per agent, newest first.
+    ///
+    /// An agent is a thread: the Anthropic wire replays the conversation every
+    /// turn, so its first message is a session id no client has to send, and
+    /// Claude Code gives every subagent a conversation of its own. A call with
+    /// no thread at all falls back to its client, which keeps a one-shot
+    /// completion visible instead of dropping it off the screen.
+    ///
+    /// The window is what makes this live: nothing is stored as a session, and
+    /// a thread simply stops being listed once it has been quiet for longer
+    /// than `since`. Everything but the counters is read off the newest call of
+    /// each thread, so the model on screen is the one that answered last rather
+    /// than the one it started with.
+    pub fn live(&self, since: &str, limit: u32) -> rusqlite::Result<Vec<LiveAgent>> {
+        // A call whose client walked away is never finished: the row keeps the
+        // null status it was born with, for good. Counting those as generating
+        // would leave an agent that died mid-stream pulsing on screen until its
+        // window ran out, which is the one lie this screen must not tell. So a
+        // call only counts as in flight while it is younger than a turn
+        // plausibly is; past that it is a dead stream, and silence is the
+        // honest reading.
+        let flight = (OffsetDateTime::now_utc() - time::Duration::seconds(180))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default();
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            r#"WITH recent AS (
+                   SELECT *, COALESCE(thread_fingerprint, 'client:' || client) AS k
+                   FROM calls WHERE at >= ?1
+               ),
+               agg AS (
+                   SELECT k, COUNT(*) AS calls, MIN(at) AS first_at, MAX(at) AS last_at,
+                          MAX(id) AS last_id,
+                          SUM(CASE WHEN status IS NULL AND error IS NULL AND at >= ?3
+                                   THEN 1 ELSE 0 END) AS in_flight,
+                          SUM(CASE WHEN status >= 400 OR error IS NOT NULL THEN 1 ELSE 0 END) AS errors,
+                          COALESCE(SUM(input_tokens),0)       AS input_tokens,
+                          COALESCE(SUM(output_tokens),0)      AS output_tokens,
+                          COALESCE(SUM(cache_read_tokens),0)  AS cache_read_tokens,
+                          COALESCE(SUM(cache_write_tokens),0) AS cache_write_tokens
+                   FROM recent GROUP BY k
+               )
+               SELECT a.k, a.calls, a.first_at, a.last_at, a.in_flight, a.errors,
+                      a.input_tokens, a.output_tokens, a.cache_read_tokens, a.cache_write_tokens,
+                      r.client, r.route, r.provider, r.model_requested, r.model_sent, r.trust,
+                      r.agent_fingerprint, r.thread_fingerprint, r.user_agent, r.streamed, r.status
+               FROM agg a JOIN recent r ON r.id = a.last_id
+               ORDER BY a.last_at DESC, a.last_id DESC LIMIT ?2"#,
+        )?;
+        stmt.query_map(rusqlite::params![since, limit, flight], |r| {
+            Ok(LiveAgent {
+                key: r.get(0)?,
+                calls: r.get(1)?,
+                first_at: r.get(2)?,
+                last_at: r.get(3)?,
+                in_flight: r.get(4)?,
+                errors: r.get(5)?,
+                input_tokens: r.get(6)?,
+                output_tokens: r.get(7)?,
+                cache_read_tokens: r.get(8)?,
+                cache_write_tokens: r.get(9)?,
+                client: r.get(10)?,
+                route: r.get(11)?,
+                provider: r.get(12)?,
+                model_requested: r.get(13)?,
+                model_sent: r.get(14)?,
+                trust: r.get(15)?,
+                agent_fingerprint: r.get(16)?,
+                thread_fingerprint: r.get(17)?,
+                user_agent: r.get(18)?,
+                streamed: r.get::<_, i64>(19)? != 0,
+                last_status: r.get::<_, Option<i64>>(20)?.map(|v| v as u16),
+            })
+        })?
+        .collect()
+    }
+
     pub fn alerts(&self, limit: u32) -> rusqlite::Result<Vec<Alert>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
@@ -1063,6 +1151,41 @@ pub struct Thread {
     pub output_tokens: i64,
 }
 
+/// One agent seen working inside the live window.
+///
+/// There is no session table behind this: a row is a group of calls, and it
+/// disappears on its own when the calls stop. `in_flight` is the only thing
+/// here that says *now* rather than *just before*: a call whose response has
+/// not landed yet is an agent that is generating while the screen is read.
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveAgent {
+    /// The thread fingerprint, or `client:<name>` for a call that carried no
+    /// conversation. Stable for the life of the thread, so the front end can
+    /// key a list on it without rows jumping between refreshes.
+    pub key: String,
+    pub client: String,
+    pub route: String,
+    pub provider: String,
+    pub model_requested: String,
+    pub model_sent: String,
+    pub trust: String,
+    pub agent_fingerprint: Option<String>,
+    pub thread_fingerprint: Option<String>,
+    pub user_agent: Option<String>,
+    pub first_at: String,
+    pub last_at: String,
+    pub calls: i64,
+    /// Calls with no answer yet: the agent is generating right now.
+    pub in_flight: i64,
+    pub errors: i64,
+    pub streamed: bool,
+    pub last_status: Option<u16>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+}
+
 /// One credential access request, as filed by an agent and decided by the
 /// owner. Everything here is a name or a timestamp; there is no field a value
 /// could travel in, the same property `EntryInfo` has.
@@ -1148,6 +1271,7 @@ mod tests {
             thread_fingerprint: Some("def456".into()),
             streamed: true,
             bytes_up: 900,
+            user_agent: Some("claude-cli/2.0.1 (external, cli)".into()),
         }
     }
 
@@ -1389,6 +1513,75 @@ mod tests {
         assert_eq!(t[0].fingerprint, "def456");
         assert_eq!(t[0].calls, 3);
         assert_eq!(t[0].output_tokens, 360);
+    }
+
+    #[test]
+    fn a_live_agent_is_a_thread_and_its_unanswered_call_is_what_says_now() {
+        let a = Audit::in_memory().unwrap();
+        // Two turns of one conversation, both answered.
+        for _ in 0..2 {
+            let id = a.begin(&a_start()).unwrap();
+            a.finish(id, &a_finish()).unwrap();
+        }
+        // A third, still generating: no status, no error.
+        a.begin(&a_start()).unwrap();
+        // A subagent: its own system prompt, its own conversation.
+        let mut sub = a_start();
+        sub.agent_fingerprint = Some("sub999".into());
+        sub.thread_fingerprint = Some("thread999".into());
+        sub.route = "pk-grok-4-6".into();
+        let id = a.begin(&sub).unwrap();
+        a.finish(id, &a_finish()).unwrap();
+
+        let live = a.live("1970-01-01T00:00:00Z", 10).unwrap();
+        assert_eq!(live.len(), 2, "one row per conversation, not per call");
+
+        let main = live.iter().find(|l| l.key == "def456").unwrap();
+        assert_eq!(main.calls, 3);
+        assert_eq!(main.in_flight, 1, "the turn with no answer yet");
+        assert_eq!(main.errors, 0);
+        assert_eq!(main.output_tokens, 240, "only the finished turns counted");
+        assert_eq!(
+            main.user_agent.as_deref(),
+            Some("claude-cli/2.0.1 (external, cli)")
+        );
+
+        let other = live.iter().find(|l| l.key == "thread999").unwrap();
+        assert_eq!(other.route, "pk-grok-4-6", "read off its own newest call");
+        assert_eq!(other.in_flight, 0);
+    }
+
+    #[test]
+    fn a_stream_nobody_ever_finished_stops_claiming_to_be_generating() {
+        let a = Audit::in_memory().unwrap();
+        let id = a.begin(&a_start()).unwrap();
+        // What an abandoned call looks like for ever after: born with no status
+        // and never updated, because the client that would have waited for the
+        // answer is gone.
+        a.lock()
+            .execute("UPDATE calls SET at = '2020-01-01T00:00:00Z' WHERE id = ?1", [id])
+            .unwrap();
+
+        let live = a.live("1970-01-01T00:00:00Z", 10).unwrap();
+        assert_eq!(live[0].calls, 1);
+        assert_eq!(
+            live[0].in_flight, 0,
+            "an old row with no status is a dead stream, not an agent at work"
+        );
+    }
+
+    #[test]
+    fn a_thread_that_went_quiet_falls_off_the_live_screen() {
+        // Nothing is stored as a session, so leaving is not an event: a thread
+        // is live exactly as long as the window still contains one of its calls.
+        let a = Audit::in_memory().unwrap();
+        let id = a.begin(&a_start()).unwrap();
+        a.finish(id, &a_finish()).unwrap();
+
+        let soon = (OffsetDateTime::now_utc() + time::Duration::seconds(1))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        assert!(a.live(&soon, 10).unwrap().is_empty());
     }
 
     #[test]

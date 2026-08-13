@@ -54,6 +54,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/api/summary", get(dash::summary))
         .route("/admin/api/calls", get(dash::calls))
         .route("/admin/api/threads", get(dash::threads))
+        .route("/admin/api/live", get(dash::live))
         .route("/admin/api/alerts", get(dash::alerts))
         .route("/admin/api/vault", get(dash::vault))
         .route("/admin/api/vault/{namespace}/{key}", put(dash::put_secret))

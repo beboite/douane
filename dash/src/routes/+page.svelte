@@ -16,8 +16,10 @@
 	import ShieldCheck from '@lucide/svelte/icons/shield-check';
 	import Signpost from '@lucide/svelte/icons/signpost';
 	import Sun from '@lucide/svelte/icons/sun';
+	import Users from '@lucide/svelte/icons/users';
 	import Vault from '@lucide/svelte/icons/vault';
 
+	import TabAgents from '$lib/components/tab-agents.svelte';
 	import TabModels from '$lib/components/tab-models.svelte';
 	import TabProtection from '$lib/components/tab-protection.svelte';
 	import TabRoutes from '$lib/components/tab-routes.svelte';
@@ -32,6 +34,7 @@
 		type CatalogView,
 		type ConfigView,
 		type Grant,
+		type LiveView,
 		type Summary,
 		type Thread,
 		type VaultView
@@ -47,7 +50,10 @@
 	];
 
 	let hours = $state('24');
-	let tab = $state('protection');
+	/* The screen the dashboard opens on: who is working right now. The barrier's
+	   verdict is one click away and keeps its own screen; this is the one that
+	   answers the question asked on arrival. */
+	let tab = $state('agents');
 	let typed = $state('');
 	let rejected = $state('');
 
@@ -60,10 +66,17 @@
 	let alerts = $state<Alert[]>([]);
 	let grants = $state<Grant[]>([]);
 	let thread = $state<string | null>(null);
+	let live = $state<LiveView | null>(null);
+	/** How long an agent stays listed after its last call. */
+	let idle = $state(300);
 
 	let loading = $state(false);
 	let failure = $state('');
 	let dark = $state(true);
+
+	const atWork = $derived(live?.agents.length ?? 0);
+	/** Agents whose current call has no answer yet: generating, right now. */
+	const answering = $derived(live?.agents.filter((a) => a.in_flight > 0).length ?? 0);
 
 	const pending = $derived(grants.filter((g) => g.status === 'pending').length);
 	const repointed = $derived(config?.routes.filter((r) => r.overridden).length ?? 0);
@@ -79,6 +92,11 @@
 	/* Each screen names itself and says in one line what it answers, so the
 	   panels below can keep their titles short. */
 	const SCREENS: Record<string, { label: string; icon: typeof Activity; desc: string }> = {
+		agents: {
+			label: 'Agents',
+			icon: Users,
+			desc: 'qui travaille en ce moment, sur quel modèle et chez qui'
+		},
 		protection: {
 			label: 'Protection',
 			icon: ShieldCheck,
@@ -144,6 +162,28 @@
 		}
 	}
 
+	/* The live screen has a loop of its own. Everything else on the dashboard is
+	   fine at half a minute; an agent that started four seconds ago is not. It
+	   fails silently on purpose: a red banner blinking every few seconds over a
+	   working page is worse than a count that stopped moving. */
+	async function refreshLive() {
+		if (!session.unlocked) return;
+		try {
+			live = await api.live(session.token, idle);
+		} catch (e) {
+			if (e instanceof ApiError && e.status === UNAUTHORIZED) {
+				rejected = 'ce jeton a été refusé';
+				session.lock();
+			}
+		}
+	}
+
+	/** From an agent to its calls: the traffic screen, filtered on its thread. */
+	function openThread(t: string) {
+		thread = t;
+		tab = 'trafic';
+	}
+
 	function unlock(event: SubmitEvent) {
 		event.preventDefault();
 		rejected = '';
@@ -177,6 +217,20 @@
 	$effect(() => {
 		if (!session.unlocked) return;
 		const timer = setInterval(load, 30_000);
+		return () => clearInterval(timer);
+	});
+
+	$effect(() => {
+		void idle;
+		void session.token;
+		if (!session.unlocked) return;
+		void refreshLive();
+		const timer = setInterval(() => {
+			// A hidden tab polls nothing: the answer would be stale the moment it
+			// is looked at again, and the loop keeps a laptop awake for a screen
+			// nobody is reading.
+			if (!document.hidden) void refreshLive();
+		}, 4_000);
 		return () => clearInterval(timer);
 	});
 </script>
@@ -249,6 +303,28 @@
 	{/if}
 {/snippet}
 
+<!-- The live count, which is the only badge on the rail that moves on its own.
+     The dot is not decoration: it appears when a call is in flight and stops
+     when none is, so the rail says "something is happening" from any screen. -->
+{#snippet liveBadge()}
+	{#if atWork > 0}
+		<span class="ml-auto inline-flex shrink-0 items-center gap-1.5">
+			{#if answering > 0}
+				<span class="text-trust-max relative flex size-2 rounded-full bg-current">
+					<span
+						class="absolute inline-flex size-full animate-ping rounded-full bg-current opacity-60"
+					></span>
+				</span>
+			{/if}
+			<span
+				class="tabular bg-sidebar-accent text-sidebar-accent-foreground inline-flex h-5 min-w-5 items-center justify-center rounded-full px-1.5 text-[0.7rem] font-bold"
+			>
+				{count(atWork)}
+			</span>
+		</span>
+	{/if}
+{/snippet}
+
 {#snippet navItems(compact: boolean)}
 	{#each Object.entries(SCREENS) as [id, s] (id)}
 		{@const ScreenIcon = s.icon}
@@ -264,7 +340,8 @@
 		>
 			<ScreenIcon class="size-4 shrink-0" />
 			{s.label}
-			{#if id === 'protection'}{@render navBadge(pending, true)}
+			{#if id === 'agents'}{@render liveBadge()}
+			{:else if id === 'protection'}{@render navBadge(pending, true)}
 			{:else if id === 'routes'}{@render navBadge(repointed, false)}
 			{:else if id === 'modeles'}{@render navBadge(served, false)}
 			{:else if id === 'coffre'}{@render navBadge(vault?.entries.length ?? 0, false)}{/if}
@@ -460,7 +537,9 @@
 				     changed, short enough that nobody waits for it. -->
 				{#key tab}
 					<div in:fly={{ y: 8, duration: 220, easing: cubicOut }}>
-						{#if tab === 'protection'}
+						{#if tab === 'agents'}
+							<TabAgents {live} {catalog} bind:seconds={idle} {openThread} />
+						{:else if tab === 'protection'}
 							<!-- The verdict, before any number: the boom is up or it is not. -->
 							<Card.Root class="shadow-panel mb-5 overflow-hidden">
 								<div class="flex flex-col gap-5 p-6 sm:flex-row sm:items-center sm:gap-7">

@@ -278,6 +278,17 @@ fn peek(body: &[u8]) -> Option<Peek> {
     })
 }
 
+/// What the caller says it is. A hint and never a credential: it names the
+/// harness on the live screen, where a hash alone says nothing to a human.
+/// Capped because a header is caller-controlled and this one is stored.
+fn user_agent(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get("user-agent")?.to_str().ok()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(raw.chars().take(160).collect())
+}
+
 /// Pull the presented key out of either header form. The MCP endpoint
 /// authenticates the same way, which is why this is crate-visible.
 pub(crate) fn presented_key(headers: &HeaderMap) -> Option<String> {
@@ -452,6 +463,7 @@ pub async fn messages(
                 thread_fingerprint: peeked.thread_fingerprint.clone(),
                 streamed: peeked.stream,
                 bytes_up: outgoing.len(),
+                user_agent: user_agent(&headers),
             })
             .unwrap_or(-1);
 

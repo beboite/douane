@@ -72,6 +72,47 @@ export type Thread = {
 	output_tokens: number;
 };
 
+/** One agent seen working inside the live window. There is no session table
+ *  behind this: a row is a group of calls that stops being listed on its own
+ *  once the calls stop, so nothing has to report that it left. */
+export type LiveAgent = {
+	/** The thread fingerprint, or `client:<name>` for a call that carried no
+	 *  conversation. Stable for the life of the thread, so a list keyed on it
+	 *  does not reshuffle between refreshes. */
+	key: string;
+	client: string;
+	route: string;
+	provider: string;
+	model_requested: string;
+	model_sent: string;
+	trust: Trust;
+	agent_fingerprint: string | null;
+	thread_fingerprint: string | null;
+	/** What the harness calls itself. A hint, never a credential. */
+	user_agent: string | null;
+	first_at: string;
+	last_at: string;
+	calls: number;
+	/** Calls with no answer yet: the agent is generating while the screen is
+	 *  being read. The one field here that says now rather than just before. */
+	in_flight: number;
+	errors: number;
+	streamed: boolean;
+	last_status: number | null;
+	input_tokens: number;
+	output_tokens: number;
+	cache_read_tokens: number;
+	cache_write_tokens: number;
+};
+
+export type LiveView = {
+	/** The broker's own clock. Ages are measured against it, so a browser whose
+	 *  clock drifts still reads the right delay. */
+	now: string;
+	window_seconds: number;
+	agents: LiveAgent[];
+};
+
 export type Alert = {
 	id: number;
 	at: string;
@@ -300,6 +341,10 @@ export const api = {
 		request<Thread[]>(token, `/threads?hours=${hours}&limit=${limit}`),
 
 	alerts: (token: string, limit = 200) => request<Alert[]>(token, `/alerts?limit=${limit}`),
+
+	/** Who is working right now. `seconds` is how long an agent stays on screen
+	 *  after its last call, not how far back the log is read. */
+	live: (token: string, seconds: number) => request<LiveView>(token, `/live?seconds=${seconds}`),
 
 	config: (token: string) => request<ConfigView>(token, '/config'),
 

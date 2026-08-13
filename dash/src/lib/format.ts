@@ -53,6 +53,66 @@ export function ago(iso: string): string {
 	return `il y a ${Math.floor(s / 86400)} j`;
 }
 
+/** How long ago, counted in seconds and measured against the broker's clock
+ *  rather than the browser's. On a live screen `ago` is too coarse: everything
+ *  under a minute reads "à l'instant", which is most of what is on it. */
+export function delay(nowIso: string, iso: string): string {
+	const now = new Date(nowIso).getTime();
+	const then = new Date(iso).getTime();
+	if (Number.isNaN(now) || Number.isNaN(then)) return '';
+	const s = Math.max(0, Math.round((now - then) / 1000));
+	if (s < 5) return "à l'instant";
+	if (s < 60) return `il y a ${s} s`;
+	if (s < 3600) return `il y a ${Math.floor(s / 60)} min`;
+	return `il y a ${Math.floor(s / 3600)} h`;
+}
+
+/** How long a stretch of work has been going, from its first call to its last. */
+export function lasted(fromIso: string, toIso: string): string {
+	const from = new Date(fromIso).getTime();
+	const to = new Date(toIso).getTime();
+	if (Number.isNaN(from) || Number.isNaN(to)) return '';
+	const s = Math.max(0, Math.round((to - from) / 1000));
+	if (s < 60) return `${s} s`;
+	if (s < 3600) return `${Math.floor(s / 60)} min`;
+	return `${Math.floor(s / 3600)} h ${Math.floor((s % 3600) / 60)} min`;
+}
+
+/* What each harness calls itself in its `user-agent`. The left side is matched
+   lowercased, and the first hit wins, so the more specific names come first. */
+const HARNESSES: [string, string][] = [
+	['claude-cli', 'Claude Code'],
+	['claude-code', 'Claude Code'],
+	['opencode', 'OpenCode'],
+	['codex', 'Codex'],
+	['cline', 'Cline'],
+	['roo', 'Roo'],
+	['aider', 'Aider'],
+	['cursor', 'Cursor'],
+	['zed', 'Zed'],
+	['anthropic-sdk', 'SDK Anthropic'],
+	['anthropic', 'SDK Anthropic'],
+	['openai', 'SDK OpenAI'],
+	['langchain', 'LangChain'],
+	['litellm', 'LiteLLM'],
+	['python-httpx', 'script Python'],
+	['python-requests', 'script Python'],
+	['httpx', 'script Python'],
+	['curl', 'curl'],
+	['node', 'Node']
+];
+
+/** The harness behind a call, named from what it says about itself. A hint and
+ *  nothing more: the header is caller-controlled, so this labels a row and is
+ *  never allowed to decide anything. */
+export function harness(userAgent: string | null | undefined): string {
+	if (!userAgent) return '';
+	const ua = userAgent.toLowerCase();
+	for (const [needle, name] of HARNESSES) if (ua.includes(needle)) return name;
+	// Something unknown: its own first word is a better label than nothing.
+	return userAgent.split(/[\s/]/)[0].slice(0, 24);
+}
+
 /** A fingerprint is 64 hex characters and nobody reads more than the first few.
  *  Shortening it in the UI keeps the full value in the DOM for copying. */
 export function short(fingerprint: string | null | undefined, n = 8): string {

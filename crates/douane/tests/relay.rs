@@ -1985,6 +1985,82 @@ async fn a_failing_probe_reports_the_upstreams_words_but_never_a_value() {
     assert_eq!(answer["probes"][0]["status"], 401);
 }
 
+/// The live screen: who is working, read off the calls themselves.
+///
+/// Nothing here is reported by an agent. A conversation is a group of calls,
+/// its harness is the header it happened to send, and the row leaves on its own
+/// when the calls stop.
+#[tokio::test]
+async fn the_live_screen_names_who_is_working_right_now() {
+    let (url, up) = Upstream::spawn(Behaviour::Json).await;
+    let b = broker(
+        vec![("primary", &url, Trust::Low)],
+        vec![("haiku", "primary", Some("deepseek-chat"), vec![])],
+        &secrets(),
+        ScrubConfig::default(),
+        None,
+    )
+    .await;
+
+    // Gated like every other admin view.
+    assert_eq!(
+        reqwest::Client::new()
+            .get(format!("{}/admin/api/live", b.url))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+
+    // One agent, two turns of the same conversation.
+    for _ in 0..2 {
+        call(&b, "vk-the-virtual-one", ask("haiku")).await;
+    }
+
+    // A second agent: its own first message, and a harness that names itself.
+    let mut other = ask("haiku");
+    other["system"] = "You are another test agent.".into();
+    other["messages"][0]["content"] = "an entirely different opening".into();
+    reqwest::Client::new()
+        .post(format!("{}/v1/messages", b.url))
+        .header("x-api-key", "vk-the-virtual-one")
+        .header("anthropic-version", "2023-06-01")
+        .header("user-agent", "claude-cli/2.0.1 (external, cli)")
+        .json(&other)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(up.calls(), 3);
+
+    let (status, live) = admin(&b, reqwest::Method::GET, "/admin/api/live", None).await;
+    assert_eq!(status, 200);
+    let agents = live["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 2, "one row per conversation, not per call");
+
+    // Newest first, so the one that just spoke leads.
+    assert_eq!(agents[0]["calls"], 1);
+    assert_eq!(agents[0]["user_agent"], "claude-cli/2.0.1 (external, cli)");
+    // What the screen says about it: where it went, under which name, and how
+    // much the broker trusts the far end.
+    assert_eq!(agents[0]["provider"], "primary");
+    assert_eq!(agents[0]["route"], "haiku");
+    assert_eq!(agents[0]["model_requested"], "haiku");
+    assert_eq!(agents[0]["model_sent"], "deepseek-chat");
+    assert_eq!(agents[0]["trust"], "low");
+    assert_eq!(agents[0]["in_flight"], 0, "its answer already landed");
+
+    assert_eq!(agents[1]["calls"], 2, "two turns of one conversation");
+    // A client that sent no user agent is simply unnamed, never guessed at.
+    assert!(agents[1]["user_agent"].is_null());
+
+    // The window is the whole mechanism, and it travels with the answer so the
+    // page can say what silence it is tolerating.
+    assert_eq!(live["window_seconds"], 300);
+    let (_, narrow) = admin(&b, reqwest::Method::GET, "/admin/api/live?seconds=45", None).await;
+    assert_eq!(narrow["window_seconds"], 45);
+}
+
 // -------------------------------------------------------------- catalogue --
 //
 // The claim these prove: douane can learn what an upstream sells without any of
