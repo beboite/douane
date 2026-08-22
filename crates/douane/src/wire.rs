@@ -352,7 +352,11 @@ pub fn response_to_anthropic(body: &[u8], model: &str) -> Option<Vec<u8>> {
         "content": content,
         "stop_reason": stop_reason(choice.get("finish_reason").and_then(Value::as_str)),
         "stop_sequence": Value::Null,
-        "usage": v.get("usage").map_or_else(|| json!({}), usage_to_anthropic),
+        // Same rule as the streamed close: an upstream that reports nothing still
+        // owes the client the two counters, zeroed.
+        "usage": v
+            .get("usage")
+            .map_or_else(|| json!({"input_tokens": 0, "output_tokens": 0}), usage_to_anthropic),
     });
     serde_json::to_vec(&out).ok()
 }
@@ -576,13 +580,19 @@ impl StreamTranslator {
             self.started = true;
         }
         self.close_block(out);
-        let mut delta = json!({
+        // `usage` is not optional on this event: the Anthropic schema requires it,
+        // and a client that validates the stream rejects the whole response when it
+        // is missing. Every stream reaching this point without a final usage frame
+        // is affected, an upstream cut off mid-answer included, since that lands
+        // here too. Zeros go out rather than nothing.
+        let delta = json!({
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason(self.finish.as_deref()), "stop_sequence": Value::Null},
+            "usage": self
+                .usage
+                .clone()
+                .unwrap_or_else(|| json!({"input_tokens": 0, "output_tokens": 0})),
         });
-        if let Some(u) = &self.usage {
-            delta["usage"] = u.clone();
-        }
         emit(out, "message_delta", &delta);
         emit(out, "message_stop", &json!({"type": "message_stop"}));
     }
@@ -880,6 +890,27 @@ mod tests {
         assert_eq!(last_delta["usage"]["input_tokens"], 12);
         assert_eq!(last_delta["usage"]["output_tokens"], 3);
         assert_eq!(last_delta["delta"]["stop_reason"], "end_turn");
+    }
+
+    /// `stream_options.include_usage` is a request, not a guarantee: an upstream
+    /// can finish without ever sending counts. Leaving `usage` off the closing
+    /// event fails Anthropic schema validation client side, which reads as a
+    /// broken model rather than a silent upstream.
+    #[test]
+    fn a_stream_whose_upstream_never_reports_usage_still_closes_with_zeros() {
+        let mut t = StreamTranslator::new("ox-alpha-free");
+        let mut all = Vec::new();
+        all.extend(
+            t.push(b"data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n"),
+        );
+        all.extend(t.push(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n"));
+        all.extend(t.push(b"data: [DONE]\n"));
+
+        let f = frames(&all);
+        let last = f.iter().find(|x| x["type"] == "message_delta").unwrap();
+        assert_eq!(last["usage"]["input_tokens"], 0);
+        assert_eq!(last["usage"]["output_tokens"], 0);
+        assert_eq!(last["delta"]["stop_reason"], "end_turn");
     }
 
     #[test]
