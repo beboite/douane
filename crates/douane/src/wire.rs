@@ -374,16 +374,29 @@ pub fn response_to_anthropic(body: &[u8], model: &str) -> Option<Vec<u8>> {
 /// end. The tap absorbs usage from both events and the later one wins, so the
 /// ledger is right; a client that reads `message_start` alone sees zeros, which
 /// is the one visible cost of this translation.
+/// What an open content block accepts. Anthropic types its blocks and its
+/// deltas together, so the wrong pairing is not a formatting slip: a client
+/// indexing parts by block has nowhere to put the delta and drops the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockKind {
+    Text,
+    Tool,
+}
+
 pub struct StreamTranslator {
     model: String,
     partial: String,
     started: bool,
-    /// Index of the open content block, and whether it is a tool call. Anthropic
-    /// numbers blocks within a message and expects them closed in order.
-    open: Option<usize>,
+    /// The open content block: its index, and what it accepts. Anthropic numbers
+    /// blocks within a message, expects them closed in order, and takes only the
+    /// one delta kind a block was opened for.
+    open: Option<(usize, BlockKind)>,
     next_index: usize,
     finish: Option<String>,
     usage: Option<Value>,
+    /// What the upstream said went wrong, when it said anything at all. Kept so
+    /// a stream that produced no answer can say why instead of ending quietly.
+    upstream_error: Option<String>,
     done: bool,
 }
 
@@ -397,6 +410,7 @@ impl StreamTranslator {
             next_index: 0,
             finish: None,
             usage: None,
+            upstream_error: None,
             done: false,
         }
     }
@@ -450,6 +464,19 @@ impl StreamTranslator {
             self.usage = Some(usage_to_anthropic(u));
         }
 
+        // An OpenAI upstream reports a mid-stream failure as a bare object with no
+        // `choices`. Dropping that frame is how a failed call reaches the client
+        // looking like a valid empty answer, so the reason is kept for `close`.
+        if self.upstream_error.is_none()
+            && let Some(e) = v.get("error")
+            && !e.is_null()
+        {
+            self.upstream_error = Some(match e.get("message").and_then(Value::as_str) {
+                Some(m) => m.to_owned(),
+                None => e.to_string(),
+            });
+        }
+
         let Some(choice) = v.get("choices").and_then(|c| c.get(0)) else {
             return;
         };
@@ -484,15 +511,21 @@ impl StreamTranslator {
         if let Some(t) = delta.get("content").and_then(Value::as_str)
             && !t.is_empty()
         {
-            if self.open.is_none() {
-                self.open_block(out, &json!({"type": "text", "text": ""}));
+            // Text arriving after a tool call has to start its own block. Sending
+            // it at the tool's index is a text delta on a block the client opened
+            // as a tool call, and a client tracking parts by index has nothing to
+            // append it to: the AI SDK answers `text part <n> not found` and drops
+            // the message, which reads as a model that stopped for no reason.
+            if !matches!(self.open, Some((_, BlockKind::Text))) {
+                self.close_block(out);
+                self.open_block(out, BlockKind::Text, &json!({"type": "text", "text": ""}));
             }
             emit(
                 out,
                 "content_block_delta",
                 &json!({
                     "type": "content_block_delta",
-                    "index": self.open.unwrap_or(0),
+                    "index": self.open.map_or(0, |(i, _)| i),
                     "delta": {"type": "text_delta", "text": t},
                 }),
             );
@@ -511,6 +544,7 @@ impl StreamTranslator {
                 self.close_block(out);
                 self.open_block(
                     out,
+                    BlockKind::Tool,
                     &json!({
                         "type": "tool_use",
                         "id": call.get("id").cloned().unwrap_or(Value::Null),
@@ -522,12 +556,23 @@ impl StreamTranslator {
             if let Some(args) = f.and_then(|f| f.get("arguments")).and_then(Value::as_str)
                 && !args.is_empty()
             {
+                // Arguments before the name that opens their block have nothing to
+                // attach to, and a text block is the wrong home for them. Anthropic
+                // has no way to say "a tool call whose name is still coming", so
+                // they are dropped rather than sent somewhere they corrupt.
+                let Some((index, BlockKind::Tool)) = self.open else {
+                    tracing::warn!(
+                        model = %self.model,
+                        "tool arguments arrived before the name that opens their block"
+                    );
+                    continue;
+                };
                 emit(
                     out,
                     "content_block_delta",
                     &json!({
                         "type": "content_block_delta",
-                        "index": self.open.unwrap_or(0),
+                        "index": index,
                         "delta": {"type": "input_json_delta", "partial_json": args},
                     }),
                 );
@@ -535,10 +580,10 @@ impl StreamTranslator {
         }
     }
 
-    fn open_block(&mut self, out: &mut String, block: &Value) {
+    fn open_block(&mut self, out: &mut String, kind: BlockKind, block: &Value) {
         let index = self.next_index;
         self.next_index += 1;
-        self.open = Some(index);
+        self.open = Some((index, kind));
         emit(
             out,
             "content_block_start",
@@ -547,7 +592,7 @@ impl StreamTranslator {
     }
 
     fn close_block(&mut self, out: &mut String) {
-        if let Some(index) = self.open.take() {
+        if let Some((index, _)) = self.open.take() {
             emit(
                 out,
                 "content_block_stop",
@@ -561,23 +606,30 @@ impl StreamTranslator {
             return;
         }
         self.done = true;
-        // An upstream that died before its first delta still owes the client a
-        // well-formed message rather than a stream that simply stops.
+        // An upstream that never sent a single frame produced no answer, and it
+        // used to be closed here as a well-formed empty message. That tells the
+        // client the model chose to say nothing, so an agent reads a finished turn
+        // and stops mid-task with no reason given and nothing to retry on. An
+        // error event is what actually happened, and it is a shape the Anthropic
+        // protocol already carries mid-stream.
         if !self.started {
+            let message = self.upstream_error.clone().unwrap_or_else(|| {
+                "the upstream closed the stream without sending a single frame".to_owned()
+            });
+            tracing::warn!(
+                model = %self.model,
+                reason = %message,
+                "a translated stream produced no answer at all"
+            );
             emit(
                 out,
-                "message_start",
+                "error",
                 &json!({
-                    "type": "message_start",
-                    "message": {
-                        "id": Value::Null, "type": "message", "role": "assistant",
-                        "model": self.model, "content": [],
-                        "stop_reason": Value::Null, "stop_sequence": Value::Null,
-                        "usage": {"input_tokens": 0, "output_tokens": 0},
-                    }
+                    "type": "error",
+                    "error": {"type": "api_error", "message": message},
                 }),
             );
-            self.started = true;
+            return;
         }
         self.close_block(out);
         // `usage` is not optional on this event: the Anthropic schema requires it,
@@ -896,6 +948,37 @@ mod tests {
     /// can finish without ever sending counts. Leaving `usage` off the closing
     /// event fails Anthropic schema validation client side, which reads as a
     /// broken model rather than a silent upstream.
+    /// Five calls on one route came back 200 with an empty body and a 90 s
+    /// average, which the client read as a finished turn saying nothing and an
+    /// agent read as permission to stop. Nothing was logged and nothing was
+    /// retryable.
+    #[test]
+    fn a_stream_that_produced_nothing_says_so_instead_of_closing_empty() {
+        let mut t = StreamTranslator::new("m");
+        let all = t.finish();
+
+        let f = frames(&all);
+        let types: Vec<&str> = f.iter().map(|x| x["type"].as_str().unwrap_or("")).collect();
+        assert_eq!(types, ["error"], "{types:?}");
+        assert_eq!(f[0]["error"]["type"], "api_error");
+    }
+
+    /// A failure the upstream did explain reaches the client in its own words,
+    /// rather than as douane's guess at what went wrong.
+    #[test]
+    fn an_upstream_that_errors_mid_stream_hands_its_reason_on() {
+        let mut t = StreamTranslator::new("m");
+        let mut all = Vec::new();
+        all.extend(
+            t.push(b"data: {\"error\":{\"message\":\"rate limited\",\"type\":\"rate_limit\"}}\n"),
+        );
+        all.extend(t.push(b"data: [DONE]\n"));
+
+        let f = frames(&all);
+        assert_eq!(f[0]["type"], "error");
+        assert_eq!(f[0]["error"]["message"], "rate limited");
+    }
+
     #[test]
     fn a_stream_whose_upstream_never_reports_usage_still_closes_with_zeros() {
         let mut t = StreamTranslator::new("ox-alpha-free");
@@ -963,6 +1046,74 @@ mod tests {
         assert_eq!(
             f.iter().find(|x| x["type"] == "message_delta").unwrap()["delta"]["stop_reason"],
             "tool_use"
+        );
+    }
+
+    /// Text, a tool call, then more text. The last stretch used to go out as a
+    /// text delta on the tool call's index, because the open block carried no
+    /// kind. The AI SDK indexes parts by that index, finds a tool call where a
+    /// text part should be, answers `text part 1 not found` and drops the whole
+    /// message, which reads as an agent that stopped mid-edit.
+    #[test]
+    fn text_after_a_tool_call_starts_its_own_block() {
+        let mut t = StreamTranslator::new("m");
+        let mut all = Vec::new();
+        all.extend(t.push(b"data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"before\"}}]}\n"));
+        all.extend(t.push(
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"t1\",\"function\":{\"name\":\"ls\",\"arguments\":\"{}\"}}]}}]}\n",
+        ));
+        all.extend(t.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"after\"}}]}\n"));
+        all.extend(
+            t.push(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n"),
+        );
+        all.extend(t.push(b"data: [DONE]\n"));
+
+        let f = frames(&all);
+        // Every delta lands on a block opened for the kind it carries, and every
+        // block that opened also closed.
+        let mut kind = std::collections::HashMap::new();
+        let mut open = std::collections::HashSet::new();
+        for x in &f {
+            let i = x["index"].as_u64();
+            match x["type"].as_str() {
+                Some("content_block_start") => {
+                    kind.insert(i, x["content_block"]["type"].as_str().unwrap().to_owned());
+                    open.insert(i);
+                }
+                Some("content_block_stop") => {
+                    open.remove(&i);
+                }
+                Some("content_block_delta") => {
+                    let want = match x["delta"]["type"].as_str() {
+                        Some("text_delta") => "text",
+                        _ => "tool_use",
+                    };
+                    assert_eq!(kind.get(&i).map(String::as_str), Some(want), "index {i:?}");
+                }
+                _ => {}
+            }
+        }
+        assert!(open.is_empty(), "a block left open hangs the client");
+        assert_eq!(kind.len(), 3, "text, tool call, then text again: {kind:?}");
+    }
+
+    /// Arguments cannot be attached before the name that opens their block, and
+    /// a text block is the wrong home for them.
+    #[test]
+    fn tool_arguments_with_no_block_open_are_dropped_not_misfiled() {
+        let mut t = StreamTranslator::new("m");
+        let mut all = Vec::new();
+        all.extend(t.push(b"data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n"));
+        all.extend(t.push(
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"p\\\":1}\"}}]}}]}\n",
+        ));
+        all.extend(t.push(b"data: [DONE]\n"));
+
+        let f = frames(&all);
+        assert!(
+            !f.iter()
+                .any(|x| x["delta"]["type"] == "input_json_delta"),
+            "arguments on a text block corrupt the message: {f:?}"
         );
     }
 
