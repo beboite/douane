@@ -19,6 +19,8 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct Server {
     pub listen: String,
+    /// Public client API address when the dashboard uses a different origin.
+    pub client_api_base_url: Option<String>,
     pub auth_dir: PathBuf,
     pub database: PathBuf,
     /// Optional management token, loaded from this environment variable.
@@ -39,6 +41,7 @@ impl Default for Server {
     fn default() -> Self {
         Self {
             listen: "127.0.0.1:8787".into(),
+            client_api_base_url: None,
             auth_dir: "auth".into(),
             database: "douane.sqlite".into(),
             management_token_env: None,
@@ -55,6 +58,57 @@ impl Default for Settings {
             default_provider: None,
         }
     }
+}
+impl Server {
+    pub fn normalize(&mut self) -> Result<()> {
+        if let Some(base) = &self.client_api_base_url {
+            self.client_api_base_url = Some(normalize_client_api_base_url(base)?);
+        }
+        Ok(())
+    }
+}
+
+fn normalize_client_api_base_url(value: &str) -> Result<String> {
+    let invalid = || {
+        anyhow::anyhow!(
+            "client_api_base_url must be an absolute HTTP(S) URL without credentials, query, fragment, whitespace or control characters"
+        )
+    };
+    if value
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(invalid());
+    }
+    let (scheme, authority) = value.split_once("://").ok_or_else(invalid)?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return Err(invalid());
+    }
+    if authority
+        .split(['/', '?', '#'])
+        .next()
+        .is_some_and(|authority| authority.contains('@'))
+    {
+        return Err(invalid());
+    }
+    let mut url = reqwest::Url::parse(value).map_err(|_| invalid())?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(invalid());
+    }
+    let path = url.path().trim_end_matches('/');
+    let path = if path.ends_with("/v1") {
+        path.to_owned()
+    } else {
+        format!("{path}/v1")
+    };
+    url.set_path(&path);
+    Ok(url.into())
 }
 impl Settings {
     pub fn validate(&self) -> Result<()> {
@@ -78,6 +132,7 @@ impl Config {
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let mut config: Self = toml::from_str(&content).context("invalid configuration; douane 0.2 uses subscription accounts instead of vault/provider/client sections")?;
         config.settings.validate()?;
+        config.server.normalize()?;
         let parent = path.parent().unwrap_or(Path::new("."));
         if config.server.auth_dir.is_relative() {
             config.server.auth_dir = parent.join(&config.server.auth_dir);

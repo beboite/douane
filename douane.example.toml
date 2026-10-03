@@ -1,5 +1,6 @@
 [server]
 listen = "127.0.0.1:8787"
+# client_api_base_url = "http://127.0.0.1:8787/v1"
 auth_dir = "auth"
 database = "douane.sqlite"
 # management_token_env = "DOUANE_MANAGEMENT_TOKEN"

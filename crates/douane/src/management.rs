@@ -353,8 +353,9 @@ pub async fn calls(State(state): State<Arc<AppState>>, Query(q): Query<Params>) 
 pub async fn summary(State(state): State<Arc<AppState>>) -> Json<Value> {
     let accounts = state.accounts.list().await;
     let l = &state.ledger;
+    let client_api_base_url = state.config.read().await.server.client_api_base_url.clone();
     Json(
-        json!({"accounts":accounts.len(),"enabled_accounts":accounts.iter().filter(|a|a.enabled).count(),"providers":accounts.iter().map(|a|a.provider).collect::<BTreeSet<_>>().len(),"requests":l.requests.load(Ordering::Relaxed),"errors":l.errors.load(Ordering::Relaxed),"input_tokens":l.input_tokens.load(Ordering::Relaxed),"output_tokens":l.output_tokens.load(Ordering::Relaxed),"cache_read_tokens":l.cache_read_tokens.load(Ordering::Relaxed),"cache_write_tokens":l.cache_write_tokens.load(Ordering::Relaxed),"in_flight":l.in_flight.load(Ordering::Relaxed),"dropped_logs":l.dropped_logs.load(Ordering::Relaxed),"uptime_seconds":l.started.elapsed().as_secs(),"version":env!("CARGO_PKG_VERSION"),"websocket":true}),
+        json!({"accounts":accounts.len(),"enabled_accounts":accounts.iter().filter(|a|a.enabled).count(),"providers":accounts.iter().map(|a|a.provider).collect::<BTreeSet<_>>().len(),"requests":l.requests.load(Ordering::Relaxed),"errors":l.errors.load(Ordering::Relaxed),"input_tokens":l.input_tokens.load(Ordering::Relaxed),"output_tokens":l.output_tokens.load(Ordering::Relaxed),"cache_read_tokens":l.cache_read_tokens.load(Ordering::Relaxed),"cache_write_tokens":l.cache_write_tokens.load(Ordering::Relaxed),"in_flight":l.in_flight.load(Ordering::Relaxed),"dropped_logs":l.dropped_logs.load(Ordering::Relaxed),"uptime_seconds":l.started.elapsed().as_secs(),"version":env!("CARGO_PKG_VERSION"),"websocket":true,"client_api_base_url":client_api_base_url}),
     )
 }
 pub async fn settings(State(state): State<Arc<AppState>>) -> Json<Value> {

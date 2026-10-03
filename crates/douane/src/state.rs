@@ -54,8 +54,9 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(config: Config, config_path: Option<PathBuf>) -> Result<Arc<Self>> {
+    pub fn new(mut config: Config, config_path: Option<PathBuf>) -> Result<Arc<Self>> {
         config.settings.validate()?;
+        config.server.normalize()?;
         let management_token = config
             .server
             .management_token_env

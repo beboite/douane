@@ -15,8 +15,8 @@
 	let filteredModels = $derived(models.filter(m => `${m.id} ${m.name} ${m.provider}`.toLowerCase().includes(search.toLowerCase())));
 	let filteredCalls = $derived(calls.filter(c => (!onlyErrors || c.status >= 400 || c.error) && `${c.model} ${c.provider} ${c.account_id}`.toLowerCase().includes(search.toLowerCase())));
 	let successRate = $derived(summary?.requests ? Math.round((summary.requests-summary.errors)/summary.requests*100) : null);
-	let baseUrl = $derived(typeof window === 'undefined' ? '' : `${window.location.origin}/v1`);
-	let claudeConfig = $derived(`$env:ANTHROPIC_BASE_URL = '${baseUrl.replace(/\/v1$/, '')}'\n$env:ANTHROPIC_AUTH_TOKEN = 'douane'\nclaude`);
+	let baseUrl = $derived(summary?.client_api_base_url ?? (typeof window === 'undefined' ? '' : `${window.location.origin}/v1`));
+	let claudeConfig = $derived(`$env:ANTHROPIC_BASE_URL = '${baseUrl.replace(/\/v1$/, '').replace(/'/g, "''")}'\n$env:ANTHROPIC_AUTH_TOKEN = 'douane'\nclaude`);
 	async function copy(value: string) { try { await navigator.clipboard.writeText(value); copied = true; copyFailure = ''; } catch { copied = false; copyFailure = 'Copie indisponible. Sélectionnez le texte pour le copier.'; } }
 </script>
 

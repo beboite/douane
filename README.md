@@ -19,6 +19,7 @@ Create `douane.toml`:
 listen = "127.0.0.1:8787"
 auth_dir = "auth"
 database = "douane.sqlite"
+# client_api_base_url = "http://127.0.0.1:8787/v1"
 
 [settings]
 strategy = "smart"
@@ -55,6 +56,8 @@ Provider features depend on the account, plan and upstream. An unavailable quota
 ## Use a client
 
 Set the client's base URL to `http://127.0.0.1:8787/v1`. Clients that require an API key can use the placeholder `douane`; upstream authentication uses the connected subscription. Choose a model ID returned by `/v1/models`, including its provider prefix.
+
+If the dashboard and client API use different addresses, set `server.client_api_base_url` to the API's HTTP(S) address. The dashboard uses it in client configuration snippets. An origin or a path ending in `/v1` is accepted; an existing proxy path is retained. Omit the setting to use the dashboard's origin. Credentials, query parameters and fragments are rejected.
 
 ```sh
 curl http://127.0.0.1:8787/v1/models
