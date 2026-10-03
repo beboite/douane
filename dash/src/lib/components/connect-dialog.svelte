@@ -7,6 +7,7 @@
 	import Copy from '@lucide/svelte/icons/copy';
 	import ChevronRight from '@lucide/svelte/icons/chevron-right';
 	import ProviderMark from './provider-mark.svelte';
+	import { copyText } from '$lib/clipboard';
 	import { management, importErrors, type Provider, type OAuthSession } from '$lib/management';
 	let { providers, close, completed, importFiles }: { providers: Provider[]; close: () => void; completed: () => void; importFiles: (files: FileList) => void } = $props();
 	let dialog: HTMLDialogElement;
@@ -23,6 +24,7 @@
 	let credential = $state('');
 	let endpoint = $state('');
 	let codeCopied = $state(false);
+	const copyFailureMessage = 'Copie refusée par le navigateur. Sélectionnez le code pour le copier.';
 	let mounted = false;
 	const endpoints: Record<string,string> = { opencode_go:'https://opencode.ai/zen/go',xai:'https://cli-chat-proxy.grok.com/v1',openai_compatible:'',kimi:'https://api.kimi.com/coding/v1',qwen:'https://portal.qwen.ai/v1' };
 	onMount(() => { mounted = true; dialog.showModal(); return () => { mounted = false; dialog.close(); credential = ''; callback = ''; }; });
@@ -69,7 +71,7 @@
 		finally { pending = false; }
 	}
 	function reset() { session = null; manual = ''; credential = ''; callback = ''; failure = ''; status = ''; terminal = false; }
-	async function copyCode() { if (!session?.user_code) return; try { await navigator.clipboard.writeText(session.user_code); codeCopied = true; } catch { failure = 'Copie refusée par le navigateur. Sélectionnez le code pour le copier.'; } }
+	async function copyCode() { if (!session?.user_code) return; try { await copyText(session.user_code); codeCopied = true; if (failure === copyFailureMessage) failure = ''; } catch { codeCopied = false; failure = copyFailureMessage; } }
 </script>
 
 <dialog bind:this={dialog} oncancel={close} class="connect-dialog">

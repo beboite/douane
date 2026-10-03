@@ -5,6 +5,7 @@
 	import ArrowUpRight from '@lucide/svelte/icons/arrow-up-right';
 	import ProviderMark from './provider-mark.svelte';
 	import EmptyState from './empty-state.svelte';
+	import { copyText } from '$lib/clipboard';
 	import { formatCount, formatDate, providerName, privateLabel, type Status, type Call, type Model, type Account } from '$lib/management';
 	let { screen, summary, calls, models, accounts, busy, toggleModel, navigate, showEmails = false }: { screen: string; summary: Status | null; calls: Call[]; models: Model[]; accounts: Account[]; busy: string; toggleModel: (model: Model) => void; navigate: (screen: string) => void; showEmails?: boolean } = $props();
 	let search = $state('');
@@ -17,7 +18,7 @@
 	let successRate = $derived(summary?.requests ? Math.round((summary.requests-summary.errors)/summary.requests*100) : null);
 	let baseUrl = $derived(summary?.client_api_base_url ?? (typeof window === 'undefined' ? '' : `${window.location.origin}/v1`));
 	let claudeConfig = $derived(`$env:ANTHROPIC_BASE_URL = '${baseUrl.replace(/\/v1$/, '').replace(/'/g, "''")}'\n$env:ANTHROPIC_AUTH_TOKEN = 'douane'\nclaude`);
-	async function copy(value: string) { try { await navigator.clipboard.writeText(value); copied = true; copyFailure = ''; } catch { copied = false; copyFailure = 'Copie indisponible. Sélectionnez le texte pour le copier.'; } }
+	async function copy(value: string) { try { await copyText(value); copied = true; copyFailure = ''; } catch { copied = false; copyFailure = 'Copie indisponible. Sélectionnez le texte pour le copier.'; } }
 </script>
 
 {#if screen === 'overview'}
