@@ -7,19 +7,6 @@
 		<meta name="robots" content="noindex, nofollow" />
 		<title>douane</title>
 		%sveltekit.head%
-		<script>
-			// Before the first paint, so an unlocked dashboard never flashes the
-			// wrong theme at whoever opens it in a dark room at three in the
-			// morning. `dark` is on the element already, so this only ever
-			// removes it.
-			try {
-				const saved = localStorage.getItem('douane-theme');
-				const dark = saved ? saved === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
-				document.documentElement.classList.toggle('dark', dark);
-			} catch {
-				/* storage refused: the default stands */
-			}
-		</script>
 	</head>
 	<body data-sveltekit-preload-data="hover">
 		<div style="display: contents">%sveltekit.body%</div>

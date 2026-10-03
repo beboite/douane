@@ -1,0 +1,1328 @@
+use super::oauth::send_json;
+use super::store::{subscription_from_value, text};
+use super::{
+    AccountCredential, AccountStore, OAuthManager, SubscriptionError, SubscriptionProvider,
+    SubscriptionTier, now, parse_timestamp, timestamp,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::{collections::BTreeMap, sync::Arc};
+use tokio::sync::RwLock;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QuotaWindow {
+    pub id: String,
+    pub label: String,
+    pub remaining_percent: Option<f64>,
+    pub reset_at: Option<String>,
+    pub used: Option<f64>,
+    pub limit: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QuotaSnapshot {
+    pub account_id: String,
+    pub provider: SubscriptionProvider,
+    pub windows: Vec<QuotaWindow>,
+    pub updated_at: String,
+    pub error: Option<String>,
+    #[serde(default)]
+    pub subscription: Option<SubscriptionTier>,
+    #[serde(default)]
+    pub credits: Vec<QuotaCredits>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QuotaCredits {
+    pub id: String,
+    pub label: String,
+    pub used: Option<f64>,
+    pub limit: Option<f64>,
+    pub remaining: Option<f64>,
+    pub unit: String,
+    pub reset_at: Option<String>,
+    pub unlimited: Option<bool>,
+    pub enabled: Option<bool>,
+}
+
+struct Observation {
+    windows: Vec<QuotaWindow>,
+    plan: Option<String>,
+    subscription: Option<SubscriptionTier>,
+    credits: Vec<QuotaCredits>,
+    organization_id: Option<String>,
+}
+
+impl QuotaSnapshot {
+    pub fn weekly_reset(&self) -> Option<&str> {
+        self.windows
+            .iter()
+            .filter(|window| is_weekly(&window.id))
+            .filter_map(|window| window.reset_at.as_deref())
+            .filter(|reset| parse_timestamp(reset).is_some())
+            .min_by_key(|reset| parse_timestamp(reset))
+    }
+
+    pub fn remaining_percent(&self) -> Option<f64> {
+        self.windows
+            .iter()
+            .filter(|window| is_global(&window.id))
+            .filter_map(|window| window.remaining_percent)
+            .reduce(f64::min)
+    }
+
+    pub fn weekly_remaining_percent(&self) -> Option<f64> {
+        self.windows
+            .iter()
+            .filter(|window| is_weekly(&window.id))
+            .filter_map(|window| window.remaining_percent)
+            .reduce(f64::min)
+    }
+}
+
+pub struct QuotaService {
+    client: reqwest::Client,
+    store: Arc<AccountStore>,
+    oauth: Arc<OAuthManager>,
+    cache: RwLock<BTreeMap<String, QuotaSnapshot>>,
+}
+
+impl QuotaService {
+    pub fn new(client: reqwest::Client, store: Arc<AccountStore>) -> Self {
+        let oauth = Arc::new(OAuthManager::new(client.clone(), store.clone()));
+        Self::with_oauth(client, store, oauth)
+    }
+
+    pub fn with_oauth(
+        client: reqwest::Client,
+        store: Arc<AccountStore>,
+        oauth: Arc<OAuthManager>,
+    ) -> Self {
+        Self {
+            client,
+            store,
+            oauth,
+            cache: RwLock::new(BTreeMap::new()),
+        }
+    }
+
+    pub async fn list(&self) -> Vec<QuotaSnapshot> {
+        let accounts: std::collections::BTreeSet<_> = self
+            .store
+            .list()
+            .await
+            .into_iter()
+            .map(|account| account.id)
+            .collect();
+        self.cache
+            .read()
+            .await
+            .values()
+            .filter(|snapshot| accounts.contains(&snapshot.account_id))
+            .cloned()
+            .collect()
+    }
+
+    pub async fn get(&self, id: &str) -> Option<QuotaSnapshot> {
+        self.cache.read().await.get(id).cloned()
+    }
+
+    pub async fn refresh(&self, id: &str) -> Result<QuotaSnapshot, SubscriptionError> {
+        let account = self
+            .store
+            .get(id)
+            .await
+            .ok_or(SubscriptionError::NotFound)?;
+        let result = match self.oauth.credential(id).await {
+            Ok(credential) => self.fetch(&credential).await,
+            Err(error) => Err(error),
+        };
+        let snapshot = match result {
+            Ok(observation) => {
+                let snapshot = QuotaSnapshot {
+                    account_id: id.into(),
+                    provider: account.provider,
+                    windows: observation.windows,
+                    updated_at: now(),
+                    error: None,
+                    subscription: observation
+                        .subscription
+                        .or_else(|| account.summary().subscription),
+                    credits: observation.credits,
+                };
+                self.apply_observation(id, &snapshot, observation.plan, &account.updated_at)
+                    .await?;
+                if let Some(organization_id) = observation.organization_id {
+                    self.store
+                        .modify(id, |account| {
+                            account.organization_id = Some(organization_id)
+                        })
+                        .await?;
+                }
+                snapshot
+            }
+            Err(error) => {
+                // Keep the last real observation on a transient error. Its
+                // timestamp still states when those numbers were observed.
+                let previous = self.cache.read().await.get(id).cloned();
+                QuotaSnapshot {
+                    account_id: id.into(),
+                    provider: account.provider,
+                    windows: previous
+                        .as_ref()
+                        .map(|v| v.windows.clone())
+                        .unwrap_or_default(),
+                    updated_at: previous
+                        .as_ref()
+                        .map(|v| v.updated_at.clone())
+                        .unwrap_or_else(now),
+                    error: Some(error.to_string()),
+                    subscription: previous
+                        .as_ref()
+                        .and_then(|v| v.subscription.clone())
+                        .or_else(|| account.summary().subscription),
+                    credits: previous.map(|v| v.credits).unwrap_or_default(),
+                }
+            }
+        };
+        self.cache.write().await.insert(id.into(), snapshot.clone());
+        Ok(snapshot)
+    }
+
+    async fn fetch(&self, account: &AccountCredential) -> Result<Observation, SubscriptionError> {
+        let observed = time::OffsetDateTime::now_utc();
+        let (value, windows) = match account.provider {
+            SubscriptionProvider::Codex => {
+                let mut request = self
+                    .client
+                    .get("https://chatgpt.com/backend-api/wham/usage")
+                    .bearer_auth(&account.access_token)
+                    .header("User-Agent", "codex-tui/0.149.1");
+                if let Some(id) = &account.account_id {
+                    request = request.header("ChatGPT-Account-Id", id);
+                }
+                let value = send_json(request).await?;
+                let windows = parse_codex(&value, observed);
+                (value, windows)
+            }
+            SubscriptionProvider::Claude => {
+                let value = send_json(
+                    self.client
+                        .get("https://api.anthropic.com/api/oauth/usage")
+                        .bearer_auth(&account.access_token)
+                        .header("anthropic-beta", "oauth-2025-04-20")
+                        .header("User-Agent", "claude-cli/2.1.280 (external, cli)"),
+                )
+                .await?;
+                let windows = parse_claude(&value, observed);
+                (value, windows)
+            }
+            SubscriptionProvider::Xai => {
+                let mut request = self
+                    .client
+                    .get("https://cli-chat-proxy.grok.com/v1/billing?format=credits")
+                    .bearer_auth(&account.access_token)
+                    .header("x-xai-token-auth", "xai-grok-cli")
+                    .header("x-grok-client-version", "1.0.44")
+                    .header(
+                        "User-Agent",
+                        "grok-pager/1.0.44 grok-shell/1.0.44 (macos; aarch64)",
+                    );
+                if let Some(id) = &account.account_id {
+                    request = request.header("x-userid", id);
+                }
+                let value = send_json(request).await?;
+                let windows = parse_xai(&value, observed);
+                (value, windows)
+            }
+            SubscriptionProvider::OpencodeGo => {
+                let value = send_json(
+                    self.client
+                        .get("https://opencode.ai/zen/go/v1/usage")
+                        .bearer_auth(&account.access_token)
+                        .header("User-Agent", "douane/0.2.0"),
+                )
+                .await?;
+                let windows = parse_opencode_go(&value, observed);
+                (value, windows)
+            }
+            SubscriptionProvider::Antigravity => {
+                let project =
+                    account
+                        .project_id
+                        .as_deref()
+                        .ok_or(SubscriptionError::InvalidImport(
+                            "missing Google project ID",
+                        ))?;
+                let value = send_json(self.client.post("https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary")
+                    .bearer_auth(&account.access_token).header("User-Agent", "antigravity/hub/2.9.1")
+                    .json(&json!({"project":project}))).await?;
+                let windows = parse_antigravity(&value, observed);
+                (value, windows)
+            }
+            SubscriptionProvider::Gemini => {
+                let project =
+                    account
+                        .project_id
+                        .as_deref()
+                        .ok_or(SubscriptionError::InvalidImport(
+                            "missing Google project ID",
+                        ))?;
+                let value = send_json(
+                    self.client
+                        .post("https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota")
+                        .bearer_auth(&account.access_token)
+                        .header("User-Agent", "GeminiCLI/0.34.0 (windows; amd64)")
+                        .json(&json!({"project":project})),
+                )
+                .await?;
+                let windows = parse_gemini(&value, observed);
+                (value, windows)
+            }
+            SubscriptionProvider::Kimi => {
+                let value = send_json(
+                    self.client
+                        .get("https://api.kimi.com/coding/v1/usages")
+                        .bearer_auth(&account.access_token),
+                )
+                .await?;
+                let windows = parse_kimi(&value, observed);
+                (value, windows)
+            }
+            SubscriptionProvider::OpenaiCompatible | SubscriptionProvider::Qwen => {
+                return Err(SubscriptionError::Unsupported);
+            }
+        };
+        let credits = parse_credits(account.provider, &value, observed);
+        if windows.is_empty() && credits.is_empty() {
+            return Err(SubscriptionError::InvalidResponse);
+        }
+        let plan = text(&value, &["plan_type", "planType", "subscription_type"]);
+        let mut subscription = subscription_from_value(account.provider, &value, "provider_usage");
+        let mut organization_id = None;
+        // Usage and account metadata are different provider resources. A
+        // metadata outage must not discard a successful quota observation.
+        match account.provider {
+            SubscriptionProvider::Claude => {
+                if let Ok(profile) = send_json(
+                    self.client
+                        .get("https://api.anthropic.com/api/oauth/profile")
+                        .bearer_auth(&account.access_token)
+                        .header("User-Agent", "claude-cli/2.1.280 (external, cli)")
+                        .header("anthropic-beta", "oauth-2025-04-20")
+                        .timeout(std::time::Duration::from_secs(10)),
+                )
+                .await
+                {
+                    subscription =
+                        subscription_from_value(account.provider, &profile, "provider_profile")
+                            .or(subscription);
+                    organization_id = profile
+                        .get("organization")
+                        .and_then(|organization| text(organization, &["uuid", "id"]));
+                }
+            }
+            SubscriptionProvider::Xai => {
+                let mut request = self
+                    .client
+                    .get("https://cli-chat-proxy.grok.com/v1/settings")
+                    .bearer_auth(&account.access_token)
+                    .header("x-xai-token-auth", "xai-grok-cli")
+                    .header("x-grok-client-version", "1.0.44")
+                    .timeout(std::time::Duration::from_secs(10));
+                if let Some(id) = &account.account_id {
+                    request = request.header("x-userid", id);
+                }
+                if let Ok(settings) = send_json(request).await {
+                    subscription =
+                        subscription_from_value(account.provider, &settings, "provider_settings")
+                            .or(subscription);
+                }
+            }
+            SubscriptionProvider::OpencodeGo if !windows.is_empty() => {
+                // This endpoint rejects accounts without the Go entitlement.
+                subscription =
+                    SubscriptionTier::detect(account.provider, Some("go"), None, "provider_usage");
+            }
+            _ => {}
+        }
+        Ok(Observation {
+            windows,
+            plan,
+            subscription,
+            credits,
+            organization_id,
+        })
+    }
+
+    async fn apply_observation(
+        &self,
+        id: &str,
+        snapshot: &QuotaSnapshot,
+        plan: Option<String>,
+        account_version: &str,
+    ) -> Result<(), SubscriptionError> {
+        self.store
+            .modify(id, |account| {
+                let current = time::OffsetDateTime::now_utc();
+                let cooling = account
+                    .cooldown_until
+                    .as_deref()
+                    .and_then(parse_timestamp)
+                    .is_some_and(|until| until > current);
+                // A successful authenticated quota read supersedes an older
+                // generic failure, but cannot dismiss an error recorded while
+                // the request was in flight or an active inference cooldown.
+                if account.updated_at == account_version
+                    && account.last_error.as_deref() == Some("provider request failed")
+                    && !cooling
+                {
+                    account.last_error = None;
+                }
+                if let Some(plan) = plan {
+                    account.plan = Some(plan);
+                }
+                if let Some(subscription) = &snapshot.subscription {
+                    account.subscription = Some(subscription.clone());
+                    account.plan = Some(subscription.id.clone());
+                }
+                account.exhausted_until = None;
+                account.exhausted_without_reset = false;
+                account.model_exhaustion.clear();
+                for window in &snapshot.windows {
+                    if !window
+                        .remaining_percent
+                        .is_some_and(|percent| percent <= 0.0)
+                    {
+                        continue;
+                    }
+                    let reset = window.reset_at.as_deref().and_then(parse_timestamp);
+                    if reset.is_some_and(|reset| reset <= current) {
+                        continue;
+                    }
+                    if is_global(&window.id) {
+                        if let Some(reset) = reset {
+                            let previous =
+                                account.exhausted_until.as_deref().and_then(parse_timestamp);
+                            if previous.is_none_or(|previous| previous < reset) {
+                                account.exhausted_until = Some(timestamp(reset));
+                            }
+                        } else {
+                            account.exhausted_without_reset = true;
+                        }
+                    } else {
+                        if let Some(model) = window
+                            .id
+                            .strip_prefix("model:")
+                            .and_then(|id| id.split(':').next())
+                        {
+                            if !model.is_empty() {
+                                account
+                                    .model_exhaustion
+                                    .insert(model.into(), window.reset_at.clone());
+                            }
+                        }
+                        for family in ["opus", "sonnet", "fable"] {
+                            if window.id.contains(family) {
+                                account
+                                    .model_exhaustion
+                                    .insert(family.into(), window.reset_at.clone());
+                            }
+                        }
+                    }
+                }
+            })
+            .await?;
+        Ok(())
+    }
+}
+
+fn is_weekly(id: &str) -> bool {
+    matches!(id, "weekly" | "seven-day" | "seven_day")
+}
+fn is_global(id: &str) -> bool {
+    id.starts_with("window-")
+        || matches!(
+            id,
+            "five-hour" | "weekly" | "seven-day" | "monthly" | "daily"
+        )
+}
+
+fn number(value: Option<&Value>) -> Option<f64> {
+    let value = value?;
+    value
+        .as_f64()
+        .or_else(|| value.as_str()?.parse().ok())
+        .filter(|v| v.is_finite())
+}
+
+fn field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
+    keys.iter().find_map(|key| value.get(*key))
+}
+fn remaining(used_percent: Option<f64>) -> Option<f64> {
+    used_percent.map(|used| (100.0 - used).clamp(0.0, 100.0))
+}
+
+fn reset(
+    value: Option<&Value>,
+    relative: Option<&Value>,
+    observed: time::OffsetDateTime,
+) -> Option<String> {
+    value
+        .and_then(|value| {
+            if let Some(raw) = value.as_str() {
+                if let Some(timestamp) = parse_timestamp(raw) {
+                    return Some(timestamp);
+                }
+            }
+            let seconds = number(Some(value))?;
+            if seconds <= 0.0 {
+                return None;
+            }
+            // Contemporary millisecond epochs cannot be confused with seconds.
+            let seconds = if seconds > 100_000_000_000.0 {
+                seconds / 1000.0
+            } else {
+                seconds
+            };
+            time::OffsetDateTime::from_unix_timestamp(seconds as i64).ok()
+        })
+        .or_else(|| {
+            number(relative)
+                .filter(|seconds| *seconds >= 0.0 && *seconds <= 31_536_000.0)
+                .map(|seconds| observed + time::Duration::seconds(seconds as i64))
+        })
+        .map(timestamp)
+}
+
+fn cent(value: Option<&Value>) -> Option<f64> {
+    let value = value?.as_object()?;
+    // The provider's proto3 Cent message serializes zero as an empty object.
+    value
+        .get("val")
+        .map(|value| number(Some(value)))
+        .unwrap_or(Some(0.0))
+        .filter(|amount| *amount >= 0.0)
+        .map(|amount| amount / 100.0)
+}
+
+fn credit_remaining(used: Option<f64>, limit: Option<f64>) -> Option<f64> {
+    Some((limit? - used?).max(0.0))
+}
+
+fn parse_credits(
+    provider: SubscriptionProvider,
+    value: &Value,
+    observed: time::OffsetDateTime,
+) -> Vec<QuotaCredits> {
+    match provider {
+        SubscriptionProvider::Codex => value
+            .get("credits")
+            .filter(|credits| credits.is_object())
+            .map(|credits| {
+                vec![QuotaCredits {
+                    id: "codex-credits".into(),
+                    label: "Credits".into(),
+                    used: None,
+                    limit: None,
+                    remaining: number(credits.get("balance")).filter(|balance| *balance >= 0.0),
+                    unit: "credits".into(),
+                    reset_at: None,
+                    unlimited: credits.get("unlimited").and_then(Value::as_bool),
+                    enabled: field(credits, &["has_credits", "hasCredits"])
+                        .and_then(Value::as_bool),
+                }]
+            })
+            .unwrap_or_default(),
+        SubscriptionProvider::Claude => {
+            let Some(extra) = value.get("extra_usage").filter(|extra| extra.is_object()) else {
+                return Vec::new();
+            };
+            let currency = text(extra, &["currency"])
+                .filter(|currency| {
+                    currency.len() == 3 && currency.bytes().all(|byte| byte.is_ascii_alphabetic())
+                })
+                .unwrap_or_else(|| "USD".into())
+                .to_ascii_uppercase();
+            // USD values are cents. Other currencies retain explicit minor
+            // units rather than guessing a currency's decimal exponent.
+            let (unit, divisor) = if currency == "USD" {
+                (currency, 100.0)
+            } else {
+                (format!("{currency}_minor"), 1.0)
+            };
+            let used = number(extra.get("used_credits"))
+                .filter(|value| *value >= 0.0)
+                .map(|value| value / divisor);
+            let limit = number(extra.get("monthly_limit"))
+                .filter(|value| *value >= 0.0)
+                .map(|value| value / divisor);
+            vec![QuotaCredits {
+                id: "claude-extra-usage".into(),
+                label: "Extra usage".into(),
+                used,
+                limit,
+                remaining: credit_remaining(used, limit),
+                unit,
+                reset_at: reset(field(extra, &["resets_at", "reset_at"]), None, observed),
+                unlimited: None,
+                enabled: extra.get("is_enabled").and_then(Value::as_bool),
+            }]
+        }
+        SubscriptionProvider::Xai => {
+            let Some(config) = value.get("config") else {
+                return Vec::new();
+            };
+            let period = field(config, &["currentPeriod", "current_period"]);
+            let reset_at = reset(
+                period
+                    .and_then(|period| period.get("end"))
+                    .or_else(|| field(config, &["billingPeriodEnd", "billing_period_end"])),
+                None,
+                observed,
+            );
+            let mut credits = Vec::new();
+            for (used_fields, limit_fields, id, label) in [
+                (
+                    &["used"][..],
+                    &["monthlyLimit", "monthly_limit"][..],
+                    "grok-included",
+                    "Included credits",
+                ),
+                (
+                    &["onDemandUsed", "on_demand_used"][..],
+                    &["onDemandCap", "on_demand_cap"][..],
+                    "grok-on-demand",
+                    "On-demand credits",
+                ),
+            ] {
+                let used = cent(field(config, used_fields));
+                let limit = cent(field(config, limit_fields));
+                if used.is_some() || limit.is_some() {
+                    credits.push(QuotaCredits {
+                        id: id.into(),
+                        label: label.into(),
+                        used,
+                        limit,
+                        remaining: credit_remaining(used, limit),
+                        unit: "USD".into(),
+                        reset_at: reset_at.clone(),
+                        unlimited: None,
+                        enabled: None,
+                    });
+                }
+            }
+            if let Some(balance) = cent(field(config, &["prepaidBalance", "prepaid_balance"])) {
+                credits.push(QuotaCredits {
+                    id: "grok-prepaid".into(),
+                    label: "Prepaid credits".into(),
+                    used: None,
+                    limit: None,
+                    remaining: Some(balance),
+                    unit: "USD".into(),
+                    reset_at: None,
+                    unlimited: None,
+                    enabled: None,
+                });
+            }
+            credits
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn parse_codex(value: &Value, observed: time::OffsetDateTime) -> Vec<QuotaWindow> {
+    let mut windows = Vec::new();
+    for (keys, prefix, label) in [
+        (&["rate_limit", "rateLimit"][..], "", "Codex"),
+        (
+            &["code_review_rate_limit", "codeReviewRateLimit"][..],
+            "code-review-",
+            "Code review",
+        ),
+    ] {
+        let Some(limits) = field(value, keys) else {
+            continue;
+        };
+        for (keys, id, name) in [
+            (
+                &["primary_window", "primaryWindow"][..],
+                "five-hour",
+                "5 hours",
+            ),
+            (
+                &["secondary_window", "secondaryWindow"][..],
+                "weekly",
+                "Weekly",
+            ),
+        ] {
+            let Some(window) = field(limits, keys).filter(|v| v.is_object()) else {
+                continue;
+            };
+            let duration = number(field(
+                window,
+                &["limit_window_seconds", "limitWindowSeconds"],
+            ));
+            // A plan can report its weekly allowance as the primary window.
+            // Position in the payload is not the window's duration.
+            let (id, name) = match duration.filter(|seconds| *seconds > 0.0) {
+                Some(seconds) if seconds == 604_800.0 => ("weekly".into(), "Weekly".into()),
+                Some(seconds) if seconds == 18_000.0 => ("five-hour".into(), "5 hours".into()),
+                Some(seconds) if seconds == 86_400.0 => ("daily".into(), "Daily".into()),
+                Some(seconds) if (27.0 * 86_400.0..=32.0 * 86_400.0).contains(&seconds) => {
+                    ("monthly".into(), "Monthly".into())
+                }
+                Some(seconds) => (
+                    format!("window-{}s", seconds as u64),
+                    format!("{} seconds", seconds as u64),
+                ),
+                None => (id.to_owned(), name.to_owned()),
+            };
+            let used = number(field(window, &["used_percent", "usedPercent"]));
+            windows.push(QuotaWindow {
+                id: format!("{prefix}{id}"),
+                label: format!("{label} {name}"),
+                remaining_percent: remaining(used),
+                reset_at: reset(
+                    field(window, &["reset_at", "resetAt"]),
+                    field(window, &["reset_after_seconds", "resetAfterSeconds"]),
+                    observed,
+                ),
+                used,
+                limit: Some(100.0),
+            });
+        }
+    }
+    windows
+}
+
+fn parse_claude(value: &Value, observed: time::OffsetDateTime) -> Vec<QuotaWindow> {
+    let mut windows = Vec::new();
+    for (key, id, label) in [
+        ("five_hour", "five-hour", "5 hours"),
+        ("seven_day", "seven-day", "Weekly"),
+        (
+            "seven_day_oauth_apps",
+            "seven-day-oauth-apps",
+            "OAuth apps weekly",
+        ),
+        ("seven_day_opus", "seven-day-opus", "Opus weekly"),
+        ("seven_day_sonnet", "seven-day-sonnet", "Sonnet weekly"),
+        ("seven_day_cowork", "seven-day-cowork", "Cowork weekly"),
+        ("iguana_necktie", "seven-day-fable", "Fable weekly"),
+    ] {
+        let Some(window) = value.get(key).filter(|v| v.is_object()) else {
+            continue;
+        };
+        let used = number(window.get("utilization"));
+        windows.push(QuotaWindow {
+            id: id.into(),
+            label: label.into(),
+            remaining_percent: remaining(used),
+            reset_at: reset(window.get("resets_at"), None, observed),
+            used,
+            limit: Some(100.0),
+        });
+    }
+    if let Some(limits) = value.get("limits").and_then(Value::as_array) {
+        for (index, window) in limits.iter().enumerate() {
+            if window.get("is_active").and_then(Value::as_bool) == Some(false) {
+                continue;
+            }
+            let used = number(window.get("percent"));
+            let model = window.pointer("/scope/model/id").and_then(Value::as_str);
+            let kind = text(window, &["kind", "group"]).unwrap_or_else(|| format!("limit-{index}"));
+            let id = if kind.contains("5") || kind.contains("five") {
+                "five-hour".into()
+            } else if kind.contains("7") || kind.contains("week") {
+                model
+                    .map(|m| format!("seven-day-{m}"))
+                    .unwrap_or_else(|| "seven-day".into())
+            } else {
+                format!("{kind}-{}", model.unwrap_or("all"))
+            };
+            if windows.iter().any(|existing| existing.id == id) {
+                continue;
+            }
+            windows.push(QuotaWindow {
+                id,
+                label: model.map(|m| format!("{m} {kind}")).unwrap_or(kind),
+                remaining_percent: remaining(used),
+                reset_at: reset(window.get("resets_at"), None, observed),
+                used,
+                limit: Some(100.0),
+            });
+        }
+    }
+    windows
+}
+
+fn parse_xai(value: &Value, observed: time::OffsetDateTime) -> Vec<QuotaWindow> {
+    let Some(config) = value.get("config") else {
+        return Vec::new();
+    };
+    let explicit_used = number(field(
+        config,
+        &["creditUsagePercent", "credit_usage_percent"],
+    ));
+    let period = field(config, &["currentPeriod", "current_period"]);
+    let period_reset = reset(period.and_then(|p| p.get("end")), None, observed);
+    let legacy_limit = cent(field(config, &["monthlyLimit", "monthly_limit"]));
+    let legacy_used = cent(config.get("used"));
+    let used = explicit_used
+        .or_else(|| Some(legacy_used? / legacy_limit.filter(|limit| *limit > 0.0)? * 100.0))
+        .or_else(|| {
+            (period_reset.is_some() && legacy_used.is_none() && legacy_limit.is_none())
+                .then_some(0.0)
+        });
+    let kind = period
+        .and_then(|p| p.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let monthly = kind.contains("month")
+        || (period.is_none()
+            && (legacy_limit.is_some()
+                || field(config, &["billingPeriodEnd", "billing_period_end"]).is_some()));
+    let weekly = kind.contains("week");
+    let reset_at = period_reset.or_else(|| {
+        monthly
+            .then(|| {
+                reset(
+                    field(config, &["billingPeriodEnd", "billing_period_end"]),
+                    None,
+                    observed,
+                )
+            })
+            .flatten()
+    });
+    let mut windows = Vec::new();
+    // Monthly billing periodEnd must never masquerade as a weekly capacity reset.
+    if used.is_some() || reset_at.is_some() {
+        windows.push(QuotaWindow {
+            id: if monthly {
+                "monthly"
+            } else if weekly {
+                "weekly"
+            } else {
+                "window-period"
+            }
+            .into(),
+            label: if monthly {
+                "Grok monthly"
+            } else if weekly {
+                "Grok weekly"
+            } else {
+                "Grok usage"
+            }
+            .into(),
+            remaining_percent: remaining(used),
+            reset_at: reset_at.clone(),
+            used,
+            limit: Some(100.0),
+        });
+    }
+    if let Some(products) =
+        field(config, &["productUsage", "product_usage"]).and_then(Value::as_array)
+    {
+        for (index, product) in products.iter().enumerate() {
+            let used = number(field(product, &["usagePercent", "usage_percent"]));
+            windows.push(QuotaWindow {
+                id: format!("product-{index}"),
+                label: text(product, &["product"])
+                    .unwrap_or_else(|| format!("Product {}", index + 1)),
+                remaining_percent: remaining(used),
+                reset_at: reset_at.clone(),
+                used,
+                limit: Some(100.0),
+            });
+        }
+    }
+    windows
+}
+
+fn parse_opencode_go(value: &Value, observed: time::OffsetDateTime) -> Vec<QuotaWindow> {
+    let mut windows = Vec::new();
+    for (key, id, label) in [
+        ("rolling", "five-hour", "5 hours"),
+        ("weekly", "weekly", "Weekly"),
+        ("monthly", "monthly", "Monthly"),
+    ] {
+        let Some(window) = value
+            .get("usage")
+            .and_then(|usage| usage.get(key))
+            .filter(|v| v.is_object())
+        else {
+            continue;
+        };
+        let used = number(window.get("percent"));
+        windows.push(QuotaWindow {
+            id: id.into(),
+            label: label.into(),
+            remaining_percent: remaining(used),
+            reset_at: reset(
+                field(window, &["resetsAt", "resetAt"]),
+                field(window, &["resetInSec", "reset_in_sec"]),
+                observed,
+            ),
+            used,
+            limit: Some(100.0),
+        });
+    }
+    windows
+}
+
+fn parse_antigravity(value: &Value, observed: time::OffsetDateTime) -> Vec<QuotaWindow> {
+    let mut windows = Vec::new();
+    if let Some(groups) = value.get("groups").and_then(Value::as_array) {
+        for (index, group) in groups.iter().enumerate() {
+            let label = text(group, &["displayName", "display_name"])
+                .unwrap_or_else(|| format!("Group {}", index + 1));
+            if let Some(buckets) = group.get("buckets").and_then(Value::as_array) {
+                for (bucket_index, bucket) in buckets.iter().enumerate() {
+                    let fraction =
+                        number(field(bucket, &["remainingFraction", "remaining_fraction"]));
+                    windows.push(QuotaWindow {
+                        id: text(bucket, &["bucketId", "bucket_id"])
+                            .unwrap_or_else(|| format!("group-{index}-bucket-{bucket_index}")),
+                        label: format!(
+                            "{label} {}",
+                            text(bucket, &["displayName", "display_name", "window"])
+                                .unwrap_or_default()
+                        ),
+                        remaining_percent: fraction.map(|v| (v * 100.0).clamp(0.0, 100.0)),
+                        reset_at: reset(
+                            field(bucket, &["resetTime", "reset_time"]),
+                            None,
+                            observed,
+                        ),
+                        used: None,
+                        limit: None,
+                    });
+                }
+            }
+        }
+    }
+    windows
+}
+
+fn parse_gemini(value: &Value, observed: time::OffsetDateTime) -> Vec<QuotaWindow> {
+    value
+        .get("buckets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(index, bucket)| {
+            let model = text(bucket, &["modelId", "model_id"]);
+            let kind = text(bucket, &["tokenType", "token_type"])
+                .unwrap_or_else(|| format!("bucket-{index}"));
+            QuotaWindow {
+                id: model
+                    .as_ref()
+                    .map(|model| format!("model:{model}:{kind}"))
+                    .unwrap_or_else(|| format!("bucket-{index}")),
+                label: model.map(|model| format!("{model} {kind}")).unwrap_or(kind),
+                remaining_percent: number(field(
+                    bucket,
+                    &["remainingFraction", "remaining_fraction"],
+                ))
+                .map(|fraction| (fraction * 100.0).clamp(0.0, 100.0)),
+                reset_at: reset(field(bucket, &["resetTime", "reset_time"]), None, observed),
+                used: None,
+                limit: None,
+            }
+        })
+        .collect()
+}
+
+fn parse_kimi(value: &Value, observed: time::OffsetDateTime) -> Vec<QuotaWindow> {
+    let mut windows = Vec::new();
+    if let Some(limits) = value.get("limits").and_then(Value::as_array) {
+        for (index, limit) in limits.iter().enumerate() {
+            let detail = limit.get("detail").unwrap_or(limit);
+            let used = number(detail.get("used"));
+            let max = number(detail.get("limit"));
+            let percent = used
+                .zip(max)
+                .filter(|(_, max)| *max > 0.0)
+                .map(|(used, max)| (100.0 - used / max * 100.0).clamp(0.0, 100.0));
+            windows.push(QuotaWindow {
+                id: format!("limit-{index}"),
+                label: text(limit, &["name", "title", "scope"])
+                    .unwrap_or_else(|| format!("Limit {}", index + 1)),
+                remaining_percent: percent,
+                reset_at: reset(
+                    field(detail, &["reset_at", "resetAt", "reset_time", "resetTime"]),
+                    field(detail, &["reset_in", "resetIn", "ttl"]),
+                    observed,
+                ),
+                used,
+                limit: max,
+            });
+        }
+    }
+    windows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn observed() -> time::OffsetDateTime {
+        parse_timestamp("2026-10-03T12:00:00Z").unwrap()
+    }
+
+    #[test]
+    fn credits_preserve_provider_units_balances_and_unknown_limits() {
+        let codex = parse_credits(
+            SubscriptionProvider::Codex,
+            &json!({"credits":{"has_credits":true,"unlimited":false,"balance":"42.5"}}),
+            observed(),
+        );
+        assert_eq!(codex[0].remaining, Some(42.5));
+        assert_eq!(codex[0].unit, "credits");
+        assert_eq!(codex[0].used, None);
+        assert_eq!(codex[0].limit, None);
+        let claude = parse_credits(
+            SubscriptionProvider::Claude,
+            &json!({"extra_usage":{"is_enabled":true,"monthly_limit":5000,"used_credits":1250,"utilization":25}}),
+            observed(),
+        );
+        assert_eq!(claude[0].used, Some(12.5));
+        assert_eq!(claude[0].limit, Some(50.0));
+        assert_eq!(claude[0].remaining, Some(37.5));
+        assert_eq!(claude[0].unit, "USD");
+        assert_eq!(claude[0].reset_at, None);
+        let grok = parse_credits(
+            SubscriptionProvider::Xai,
+            &json!({"config":{"monthlyLimit":{"val":1000},"used":{},"prepaidBalance":{"val":350},"onDemandCap":{"val":500},"currentPeriod":{"end":"2026-10-10T00:00:00Z"}}}),
+            observed(),
+        );
+        assert_eq!(grok[0].used, Some(0.0));
+        assert_eq!(grok[0].remaining, Some(10.0));
+        assert_eq!(grok[1].used, None);
+        assert_eq!(grok[1].remaining, None);
+        assert_eq!(grok[2].remaining, Some(3.5));
+        assert_eq!(grok[2].reset_at, None);
+    }
+
+    #[test]
+    fn credit_only_snapshots_and_old_snapshot_shapes_remain_valid() {
+        let old: QuotaSnapshot = serde_json::from_value(json!({"account_id":"fixture","provider":"codex","windows":[],"updated_at":"2026-10-03T12:00:00Z","error":null})).unwrap();
+        assert!(old.subscription.is_none());
+        assert!(old.credits.is_empty());
+        assert!(
+            parse_credits(
+                SubscriptionProvider::OpencodeGo,
+                &json!({"usage":{"weekly":{"percent":10}}}),
+                observed()
+            )
+            .is_empty()
+        );
+        let missing = parse_credits(
+            SubscriptionProvider::Codex,
+            &json!({"credits":{"unlimited":true}}),
+            observed(),
+        );
+        assert_eq!(missing[0].remaining, None);
+        assert_eq!(missing[0].unlimited, Some(true));
+    }
+
+    #[test]
+    fn opencode_go_accepts_relative_resets_from_the_native_usage_reader() {
+        let windows = parse_opencode_go(
+            &json!({"usage":{"weekly":{"percent":97,"resetInSec":7200}}}),
+            observed(),
+        );
+        assert_eq!(windows[0].reset_at.as_deref(), Some("2026-10-03T14:00:00Z"));
+    }
+
+    #[test]
+    fn grok_proto3_zero_usage_is_available_when_current_period_is_reported() {
+        let windows = parse_xai(
+            &json!({"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2026-10-08T00:00:00Z"}}}),
+            observed(),
+        );
+        assert_eq!(windows[0].remaining_percent, Some(100.0));
+    }
+
+    #[test]
+    fn grok_missing_period_type_does_not_invent_a_weekly_window() {
+        let windows = parse_xai(
+            &json!({"config":{"creditUsagePercent":12,"currentPeriod":{"end":"2026-10-08T00:00:00Z"}}}),
+            observed(),
+        );
+        assert_eq!(windows[0].id, "window-period");
+        assert_eq!(windows[0].remaining_percent, Some(88.0));
+    }
+
+    #[test]
+    fn gemini_model_buckets_keep_real_resets_and_unknown_amounts() {
+        let windows = parse_gemini(
+            &json!({"buckets":[
+                {"modelId":"gemini-2.5-pro","tokenType":"REQUESTS","remainingFraction":0.25,"resetTime":"2026-10-04T12:00:00Z"},
+                {"modelId":"gemini-2.5-flash","tokenType":"REQUESTS","resetTime":"2026-10-04T13:00:00Z"}
+            ]}),
+            observed(),
+        );
+        assert_eq!(windows[0].id, "model:gemini-2.5-pro:REQUESTS");
+        assert_eq!(windows[0].remaining_percent, Some(25.0));
+        assert_eq!(windows[0].reset_at.as_deref(), Some("2026-10-04T12:00:00Z"));
+        assert_eq!(windows[1].remaining_percent, None);
+        assert!(
+            windows
+                .iter()
+                .all(|window| window.used.is_none() && window.limit.is_none())
+        );
+        let snapshot = QuotaSnapshot {
+            account_id: "fixture".into(),
+            provider: SubscriptionProvider::Gemini,
+            windows,
+            updated_at: now(),
+            error: None,
+            subscription: None,
+            credits: Vec::new(),
+        };
+        assert_eq!(snapshot.weekly_reset(), None);
+        assert_eq!(snapshot.weekly_remaining_percent(), None);
+    }
+
+    #[test]
+    fn codex_percentages_and_reset_instants_come_from_the_same_windows() {
+        let windows = parse_codex(
+            &json!({"rate_limit":{"primary_window":{"used_percent":21,"reset_after_seconds":3600},
+            "secondary_window":{"used_percent":"76.5","reset_at":1791633600,"limit_window_seconds":604800}},
+            "code_review_rate_limit":{"primary_window":{"used_percent":100,"reset_at":1791633600000i64}}}),
+            observed(),
+        );
+        assert_eq!(windows[0].remaining_percent, Some(79.0));
+        assert_eq!(windows[0].reset_at.as_deref(), Some("2026-10-03T13:00:00Z"));
+        assert_eq!(windows[1].remaining_percent, Some(23.5));
+        assert_eq!(windows[1].reset_at, windows[2].reset_at);
+        assert_eq!(windows[2].id, "code-review-five-hour");
+    }
+
+    #[test]
+    fn codex_primary_weekly_window_drives_weekly_routing() {
+        let windows = parse_codex(
+            &json!({"rate_limit":{
+                "primary_window":{"used_percent":6,"reset_at":1791580593,"reset_after_seconds":560546,"limit_window_seconds":604800},
+                "secondary_window":null
+            }}),
+            observed(),
+        );
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].id, "weekly");
+        assert_eq!(windows[0].label, "Codex Weekly");
+        assert_eq!(windows[0].remaining_percent, Some(94.0));
+        let snapshot = QuotaSnapshot {
+            account_id: "fixture".into(),
+            provider: SubscriptionProvider::Codex,
+            windows,
+            updated_at: now(),
+            error: None,
+            subscription: None,
+            credits: Vec::new(),
+        };
+        assert_eq!(snapshot.weekly_remaining_percent(), Some(94.0));
+        assert_eq!(snapshot.weekly_reset(), Some("2026-10-09T21:16:33Z"));
+    }
+
+    #[test]
+    fn claude_missing_utilization_stays_unknown_instead_of_looking_available() {
+        let windows = parse_claude(
+            &json!({"five_hour":{"utilization":100,"resets_at":"2026-10-03T17:00:00Z"},
+            "seven_day":{"resets_at":null},"seven_day_opus":{"utilization":42,"resets_at":"2026-10-07T12:00:00Z"}}),
+            observed(),
+        );
+        assert_eq!(windows[0].remaining_percent, Some(0.0));
+        assert_eq!(windows[1].remaining_percent, None);
+        assert_eq!(windows[1].reset_at, None);
+        assert_eq!(windows[2].remaining_percent, Some(58.0));
+    }
+
+    #[test]
+    fn grok_weekly_reset_does_not_borrow_a_monthly_billing_rollover() {
+        let weekly = parse_xai(
+            &json!({"config":{"creditUsagePercent":39.0,"currentPeriod":{"type":"weekly","start":"2026-10-01T00:00:00Z","end":"2026-10-08T00:00:00Z"}}}),
+            observed(),
+        );
+        assert_eq!(weekly[0].remaining_percent, Some(61.0));
+        assert_eq!(weekly[0].reset_at.as_deref(), Some("2026-10-08T00:00:00Z"));
+        let monthly = parse_xai(
+            &json!({"config":{"used":{"val":350},"monthlyLimit":{"val":1000},"billingPeriodEnd":"2026-11-01T00:00:00Z"}}),
+            observed(),
+        );
+        assert_eq!(monthly[0].id, "monthly");
+        assert_eq!(monthly[0].remaining_percent, Some(65.0));
+        assert_eq!(monthly[0].reset_at.as_deref(), Some("2026-11-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn opencode_go_reads_all_reported_subscription_windows() {
+        let windows = parse_opencode_go(
+            &json!({"usage":{"rolling":{"status":"ok","percent":18.5,"resetsAt":"2026-10-03T17:00:00Z"},
+            "weekly":{"status":"rate-limited","percent":100,"resetsAt":"2026-10-09T00:00:00Z"},
+            "monthly":{"status":"ok","percent":37,"resetsAt":"2026-11-03T00:00:00Z"}}}),
+            observed(),
+        );
+        assert_eq!(windows.len(), 3);
+        assert_eq!(windows[0].remaining_percent, Some(81.5));
+        assert_eq!(windows[1].remaining_percent, Some(0.0));
+        assert_eq!(windows[1].reset_at.as_deref(), Some("2026-10-09T00:00:00Z"));
+    }
+
+    #[test]
+    fn antigravity_fraction_and_kimi_counts_remain_real_observations() {
+        let antigravity = parse_antigravity(
+            &json!({"groups":[{"displayName":"Gemini","buckets":[{"bucketId":"gemini-5h","remainingFraction":"0.3","resetTime":"2026-10-03T15:00:00Z"}]}]}),
+            observed(),
+        );
+        assert_eq!(antigravity[0].remaining_percent, Some(30.0));
+        let kimi = parse_kimi(
+            &json!({"limits":[{"name":"Requests","detail":{"used":6,"limit":10,"reset_in":120}}]}),
+            observed(),
+        );
+        assert_eq!(kimi[0].remaining_percent, Some(40.0));
+        assert_eq!(kimi[0].reset_at.as_deref(), Some("2026-10-03T12:02:00Z"));
+    }
+
+    #[tokio::test]
+    async fn successful_quota_clears_only_an_older_generic_error_without_active_cooldown() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(AccountStore::open(directory.path()).unwrap());
+        let account = store
+            .import(json!({"type":"xai","access_token":"fixture-access","refresh_token":"fixture-refresh"}), None)
+            .await
+            .unwrap();
+        let service = QuotaService::new(reqwest::Client::new(), store.clone());
+        let snapshot = QuotaSnapshot {
+            account_id: account.id.clone(),
+            provider: SubscriptionProvider::Xai,
+            windows: parse_xai(
+                &json!({"config":{"creditUsagePercent":57.0,"currentPeriod":{"type":"weekly","end":"2030-10-05T18:34:26Z"}}}),
+                observed(),
+            ),
+            updated_at: now(),
+            error: None,
+            subscription: None,
+            credits: Vec::new(),
+        };
+        store
+            .mark_error(&account.id, Some("fixture transient failure".into()))
+            .await
+            .unwrap();
+        let before = store.get(&account.id).await.unwrap();
+        assert_eq!(before.summary().status, "error");
+        service
+            .apply_observation(&account.id, &snapshot, None, &before.updated_at)
+            .await
+            .unwrap();
+        let recovered = store.get(&account.id).await.unwrap();
+        assert_eq!(recovered.summary().status, "ready");
+        assert!(recovered.last_error.is_none());
+        assert_eq!(recovered.access_token, before.access_token);
+        assert_eq!(recovered.refresh_token, before.refresh_token);
+        assert!(
+            AccountStore::open(directory.path())
+                .unwrap()
+                .get(&account.id)
+                .await
+                .unwrap()
+                .last_error
+                .is_none()
+        );
+
+        store
+            .mark_cooldown(&account.id, 60, "provider request failed")
+            .await
+            .unwrap();
+        let cooling = store.get(&account.id).await.unwrap();
+        service
+            .apply_observation(&account.id, &snapshot, None, &cooling.updated_at)
+            .await
+            .unwrap();
+        let after = store.get(&account.id).await.unwrap();
+        assert_eq!(after.summary().status, "cooldown");
+        assert_eq!(after.cooldown_until, cooling.cooldown_until);
+        assert_eq!(after.last_error, cooling.last_error);
+
+        store
+            .modify(&account.id, |account| account.cooldown_until = None)
+            .await
+            .unwrap();
+        let before = store.get(&account.id).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        store
+            .mark_error(&account.id, Some("fixture newer failure".into()))
+            .await
+            .unwrap();
+        let newer = store.get(&account.id).await.unwrap();
+        assert_ne!(newer.updated_at, before.updated_at);
+        service
+            .apply_observation(&account.id, &snapshot, None, &before.updated_at)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get(&account.id).await.unwrap().last_error,
+            newer.last_error
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_global_window_blocks_selection_but_opus_window_only_blocks_opus() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(AccountStore::open(directory.path()).unwrap());
+        let account = store
+            .import(json!({"type":"claude","access_token":"fixture"}), None)
+            .await
+            .unwrap();
+        let service = QuotaService::new(reqwest::Client::new(), store.clone());
+        let mut snapshot = QuotaSnapshot {
+            account_id: account.id.clone(),
+            provider: SubscriptionProvider::Claude,
+            windows: vec![QuotaWindow {
+                id: "seven-day-opus".into(),
+                label: "Opus".into(),
+                remaining_percent: Some(0.0),
+                reset_at: Some("2030-01-01T00:00:00Z".into()),
+                used: Some(100.0),
+                limit: Some(100.0),
+            }],
+            updated_at: now(),
+            error: None,
+            subscription: None,
+            credits: Vec::new(),
+        };
+        service
+            .apply_observation(&account.id, &snapshot, None, &account.updated_at)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .eligible(SubscriptionProvider::Claude, Some("claude-opus-4-6"))
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .eligible(SubscriptionProvider::Claude, Some("claude-sonnet-4-6"))
+                .await
+                .len(),
+            1
+        );
+        snapshot.windows[0].id = "five-hour".into();
+        service
+            .apply_observation(&account.id, &snapshot, None, &account.updated_at)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .eligible(SubscriptionProvider::Claude, Some("claude-sonnet-4-6"))
+                .await
+                .is_empty()
+        );
+    }
+}

@@ -1,4 +1,7 @@
 /target
+/auth/
+oauth-clients.json
+*.auth.json
 
 # The vault, in every shape it might land in. It is encrypted, but an encrypted
 # file in a public history is an offline cracking target with unlimited time.

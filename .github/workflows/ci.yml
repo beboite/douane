@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust 1.90
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust 1.90
+        run: rustup toolchain install 1.90.0 --profile minimal
+      - name: Test workspace
+        run: cargo +1.90.0 test --workspace --locked
+
+  dashboard:
+    name: Svelte dashboard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: dash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Install pnpm
+        run: npm install --global pnpm@11.1.2
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Check Svelte
+        run: pnpm check
+      - name: Build dashboard
+        run: pnpm build

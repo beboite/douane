@@ -1,19 +1,15 @@
 //! Speaking the other dialect.
 //!
-//! douane's whole surface is the Anthropic Messages API: that is what agents
-//! send, what the router matches on, what the scrubber reads and what the tap
-//! counts. Some upstreams only sell the OpenAI chat-completions shape, and a few
-//! sell both but have let the Anthropic one rot. crof.ai is the live example:
-//! `crof.ai/v1` answers 200 with a real key while `anthropic.nahcrof.com` has
-//! been 502 since 2026-08-01.
+//! Anthropic Messages requests can be translated to OpenAI chat completions.
+//! Native requests retain their protocol fields. Translation belongs at the
+//! provider boundary when the client and subscription speak different dialects.
 //!
 //! So a provider may declare `wire = "openai"`, and this module translates in
 //! both directions. **The translation happens at the edges of `forward` and
 //! nowhere else.** Going out, the body is rewritten just before it is sent.
 //! Coming back, the response is rewritten into the Anthropic shape *before* the
 //! tap sees it, so usage accounting, the audit log and the dashboard all
-//! keep working on the one shape they were written for. Nothing downstream of
-//! this file knows a second dialect exists.
+//! keep working. The usage tap also reads native Responses completion events.
 //!
 //! What is deliberately not translated:
 //!
@@ -22,9 +18,7 @@
 //!   carries a signature the next turn is expected to send back. Forging an
 //!   unsigned one produces a conversation that dies on its second message, which
 //!   is worse than losing text nobody reads. Dropped.
-//! - **Images and documents.** No upstream reached this way serves them today,
-//!   and guessing at a mapping that nothing exercises is how silent corruption
-//!   gets shipped. A request carrying one is refused rather than mangled.
+//! - **Documents.** A document without an equivalent content type is refused.
 //! - **Prompt caching.** There is no OpenAI request field for it. Cache *reads*
 //!   are reported back when the upstream volunteers `cached_tokens`, so a
 //!   provider that caches on its own is still counted; douane just cannot ask.
@@ -40,8 +34,10 @@ pub enum Wire {
     Anthropic,
     /// `/chat/completions`, appended to `base_url` as written. Unlike the
     /// Anthropic form, an OpenAI `base_url` carries its own version segment
-    /// (`https://crof.ai/v1`), because that is how those sites publish it.
+    /// (`https://provider.example/v1`), because that is how those sites publish it.
     Openai,
+    /// Native Responses passthrough, accepted only at `/v1/responses`.
+    Responses,
 }
 
 impl Wire {
@@ -50,6 +46,7 @@ impl Wire {
         match self {
             Self::Anthropic => "/v1/messages",
             Self::Openai => "/chat/completions",
+            Self::Responses => "/responses",
         }
     }
 
@@ -59,7 +56,7 @@ impl Wire {
     pub fn models_path(self) -> &'static str {
         match self {
             Self::Anthropic => "/v1/models",
-            Self::Openai => "/models",
+            Self::Openai | Self::Responses => "/models",
         }
     }
 
@@ -68,6 +65,7 @@ impl Wire {
         match self {
             Self::Anthropic => "anthropic",
             Self::Openai => "openai",
+            Self::Responses => "responses",
         }
     }
 
@@ -77,8 +75,7 @@ impl Wire {
     ///
     /// `openai-response` does not count as OpenAI here. It is the Responses
     /// API, and douane's OpenAI path posts to `/chat/completions`, so a model
-    /// offering only that one answers 404 on every call douane knows how to
-    /// make.
+    /// offering only that endpoint needs `wire = "responses"`.
     pub fn speaks(self, endpoints: &[String]) -> bool {
         if endpoints.is_empty() {
             return true;
@@ -86,6 +83,7 @@ impl Wire {
         endpoints.iter().any(|e| match self {
             Self::Anthropic => e.eq_ignore_ascii_case("anthropic"),
             Self::Openai => e.eq_ignore_ascii_case("openai"),
+            Self::Responses => e.eq_ignore_ascii_case("openai-response") || e.eq_ignore_ascii_case("responses"),
         })
     }
 }
@@ -187,6 +185,8 @@ fn translate_turn(turn: &Value, out: &mut Vec<Value>) -> Result<(), Untranslatab
     };
 
     let mut text = String::new();
+    let mut multimodal = Vec::new();
+    let mut has_image = false;
     let mut tool_calls = Vec::new();
     let mut results = Vec::new();
 
@@ -195,7 +195,22 @@ fn translate_turn(turn: &Value, out: &mut Vec<Value>) -> Result<(), Untranslatab
             Some("text") => {
                 if let Some(t) = b.get("text").and_then(Value::as_str) {
                     text.push_str(t);
+                    multimodal.push(json!({"type":"text","text":t}));
                 }
+            }
+            Some("image") => {
+                let source = b.get("source").ok_or_else(|| Untranslatable("image source is missing".into()))?;
+                let url = match source.get("type").and_then(Value::as_str) {
+                    Some("url") => source.get("url").and_then(Value::as_str).ok_or_else(|| Untranslatable("image URL is missing".into()))?.to_owned(),
+                    Some("base64") => {
+                        let media = source.get("media_type").and_then(Value::as_str).ok_or_else(|| Untranslatable("image media type is missing".into()))?;
+                        let data = source.get("data").and_then(Value::as_str).ok_or_else(|| Untranslatable("image data is missing".into()))?;
+                        format!("data:{media};base64,{data}")
+                    }
+                    _ => return Err(Untranslatable("unsupported image source".into())),
+                };
+                multimodal.push(json!({"type":"image_url","image_url":{"url":url}}));
+                has_image = true;
             }
             Some("tool_use") => tool_calls.push(json!({
                 "id": b.get("id").cloned().unwrap_or(Value::Null),
@@ -212,12 +227,17 @@ fn translate_turn(turn: &Value, out: &mut Vec<Value>) -> Result<(), Untranslatab
                     ),
                 }
             })),
-            Some("tool_result") => results.push(json!({
+            Some("tool_result") => {
+                if b.get("content").and_then(Value::as_array).is_some_and(|parts| parts.iter().any(|part| part["type"] != "text")) {
+                    return Err(Untranslatable("tool results containing non-text blocks cannot use this dialect".into()));
+                }
+                results.push(json!({
                 "role": "tool",
                 "tool_call_id": b.get("tool_use_id").cloned().unwrap_or(Value::Null),
                 "content": flatten_text(b.get("content").unwrap_or(&Value::Null))
                     .unwrap_or_default(),
-            })),
+                }));
+            }
             // Signed thinking from a previous turn. Dropping it is safe in this
             // direction: it is context the upstream never produced and cannot
             // verify.
@@ -234,11 +254,11 @@ fn translate_turn(turn: &Value, out: &mut Vec<Value>) -> Result<(), Untranslatab
     // A turn that was nothing but tool results has no message of its own: the
     // results are the whole turn. Emitting an empty user message alongside them
     // makes some upstreams answer as though the user had said nothing.
-    let empty = text.is_empty() && tool_calls.is_empty();
+    let empty = text.is_empty() && tool_calls.is_empty() && !has_image;
     if !(empty && !results.is_empty()) {
         let mut m = Map::new();
         m.insert("role".to_owned(), Value::String(role.to_owned()));
-        m.insert("content".to_owned(), Value::String(text));
+        m.insert("content".to_owned(), if has_image { Value::Array(multimodal) } else { Value::String(text) });
         if !tool_calls.is_empty() {
             m.insert("tool_calls".to_owned(), Value::Array(tool_calls));
         }
@@ -288,10 +308,12 @@ fn usage_to_anthropic(u: &Value) -> Value {
         .and_then(|d| d.get("cached_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let cache_write = u.pointer("/prompt_tokens_details/cache_write_tokens").and_then(Value::as_u64).unwrap_or(0);
     json!({
-        "input_tokens": n("prompt_tokens").saturating_sub(cached),
+        "input_tokens": n("prompt_tokens").saturating_sub(cached).saturating_sub(cache_write),
         "output_tokens": n("completion_tokens"),
         "cache_read_input_tokens": cached,
+        "cache_creation_input_tokens": cache_write,
     })
 }
 
@@ -383,14 +405,37 @@ enum BlockKind {
     Tool,
 }
 
+/// One OpenAI tool call, assembled before any of it is sent on.
+///
+/// The two dialects disagree about what a tool call is on the wire. Anthropic
+/// opens a block with a name and feeds it in order. OpenAI streams fragments
+/// that carry an index and often nothing else: the name can arrive after the
+/// arguments it belongs to, split across chunks, or as an empty string first,
+/// and text deltas of the same answer are interleaved with all of it. Reacting
+/// to each fragment as it lands is what lost 253 calls' worth of arguments on
+/// kimi in production. So a call is held here until the stream moves on to
+/// something else, and then goes out whole.
+#[derive(Debug, Default)]
+struct PendingTool {
+    /// The upstream's own numbering, which is the one field every fragment of a
+    /// call carries. A stream that sends none has a single call to give.
+    index: i64,
+    id: Option<String>,
+    name: String,
+    arguments: String,
+}
+
 pub struct StreamTranslator {
     model: String,
-    partial: String,
+    partial: Vec<u8>,
     started: bool,
     /// The open content block: its index, and what it accepts. Anthropic numbers
     /// blocks within a message, expects them closed in order, and takes only the
     /// one delta kind a block was opened for.
     open: Option<(usize, BlockKind)>,
+    /// Tool calls seen since the last thing that was not one, in upstream order.
+    tools: Vec<PendingTool>,
+    pending_text: String,
     next_index: usize,
     finish: Option<String>,
     usage: Option<Value>,
@@ -404,9 +449,11 @@ impl StreamTranslator {
     pub fn new(model: &str) -> Self {
         Self {
             model: model.to_owned(),
-            partial: String::new(),
+            partial: Vec::new(),
             started: false,
             open: None,
+            tools: Vec::new(),
+            pending_text: String::new(),
             next_index: 0,
             finish: None,
             usage: None,
@@ -417,19 +464,22 @@ impl StreamTranslator {
 
     /// Feed one upstream chunk, get back the Anthropic frames it produced.
     pub fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
-        let Ok(text) = std::str::from_utf8(chunk) else {
-            return Vec::new();
-        };
-        self.partial.push_str(text);
-        let Some(cut) = self.partial.rfind('\n') else {
+        if self.done { return Vec::new(); }
+        self.partial.extend_from_slice(chunk);
+        let Some(cut) = self.partial.iter().rposition(|byte| *byte == b'\n') else {
             // A frame longer than any real one is not one. Cap rather than let a
             // malformed upstream grow this without end.
             if self.partial.len() > 1_000_000 {
                 self.partial.clear();
+                self.upstream_error = Some("upstream stream frame exceeds its size limit".into());
             }
             return Vec::new();
         };
-        let complete: String = self.partial.drain(..=cut).collect();
+        let complete: Vec<u8> = self.partial.drain(..=cut).collect();
+        let Ok(complete) = String::from_utf8(complete) else {
+            self.upstream_error = Some("upstream stream is not valid UTF-8".into());
+            return Vec::new();
+        };
 
         let mut out = String::new();
         for line in complete.lines() {
@@ -452,9 +502,11 @@ impl StreamTranslator {
     /// Called when the upstream stream ends, whether or not `[DONE]` arrived.
     /// A truncated stream still has to be closed or the client waits forever.
     pub fn finish(&mut self) -> Vec<u8> {
+        let mut tail = if self.partial.is_empty() { Vec::new() } else { self.push(b"\n") };
         let mut out = String::new();
         self.close(&mut out);
-        out.into_bytes()
+        tail.extend(out.into_bytes());
+        tail
     }
 
     fn frame(&mut self, v: &Value, out: &mut String) {
@@ -471,10 +523,7 @@ impl StreamTranslator {
             && let Some(e) = v.get("error")
             && !e.is_null()
         {
-            self.upstream_error = Some(match e.get("message").and_then(Value::as_str) {
-                Some(m) => m.to_owned(),
-                None => e.to_string(),
-            });
+            self.upstream_error = Some("upstream reported an error in its stream".into());
         }
 
         let Some(choice) = v.get("choices").and_then(|c| c.get(0)) else {
@@ -511,72 +560,129 @@ impl StreamTranslator {
         if let Some(t) = delta.get("content").and_then(Value::as_str)
             && !t.is_empty()
         {
-            // Text arriving after a tool call has to start its own block. Sending
-            // it at the tool's index is a text delta on a block the client opened
-            // as a tool call, and a client tracking parts by index has nothing to
-            // append it to: the AI SDK answers `text part <n> not found` and drops
-            // the message, which reads as a model that stopped for no reason.
-            if !matches!(self.open, Some((_, BlockKind::Text))) {
-                self.close_block(out);
-                self.open_block(out, BlockKind::Text, &json!({"type": "text", "text": ""}));
-            }
-            emit(
-                out,
-                "content_block_delta",
-                &json!({
-                    "type": "content_block_delta",
-                    "index": self.open.map_or(0, |(i, _)| i),
-                    "delta": {"type": "text_delta", "text": t},
-                }),
-            );
+            // Text can arrive between two fragments of the same tool. Hold it
+            // behind the call until the terminal frame proves the call whole.
+            if self.tools.is_empty() { self.emit_text(t, out); }
+            else { self.pending_text.push_str(t); }
         }
 
+        // Nothing is emitted from a tool fragment: it is filed under its index
+        // and read back by `flush_tools`, which is the only place that knows
+        // whether a call is whole.
         for call in delta
             .get("tool_calls")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
         {
-            // A tool call announces its name once, then streams its arguments.
-            // The name is what says a new block has begun.
-            let f = call.get("function");
-            if let Some(name) = f.and_then(|f| f.get("name")).and_then(Value::as_str) {
-                self.close_block(out);
-                self.open_block(
-                    out,
-                    BlockKind::Tool,
-                    &json!({
-                        "type": "tool_use",
-                        "id": call.get("id").cloned().unwrap_or(Value::Null),
-                        "name": name,
-                        "input": {},
-                    }),
-                );
+            let index = call.get("index").and_then(Value::as_i64).unwrap_or(0);
+            let id = call
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+            // A fragment belongs to the most recent call at its index, unless
+            // it names an id that says otherwise. Matching on the index alone
+            // would be enough for an upstream that numbers its calls, and every
+            // one seen so far does, but one that numbers none and gives each a
+            // fresh id instead is still several calls: merged, their names run
+            // together into one that matches no tool the agent declared.
+            let existing = self.tools.iter().rposition(|t| {
+                t.index == index && id.is_none_or(|i| t.id.as_deref().is_none_or(|had| had == i))
+            });
+            let slot = match existing {
+                Some(i) => &mut self.tools[i],
+                None => {
+                    self.tools.push(PendingTool {
+                        index,
+                        ..PendingTool::default()
+                    });
+                    self.tools.last_mut().expect("pushed on the line above")
+                }
+            };
+            if let Some(id) = id {
+                slot.id = Some(id.to_owned());
             }
-            if let Some(args) = f.and_then(|f| f.get("arguments")).and_then(Value::as_str)
-                && !args.is_empty()
-            {
-                // Arguments before the name that opens their block have nothing to
-                // attach to, and a text block is the wrong home for them. Anthropic
-                // has no way to say "a tool call whose name is still coming", so
-                // they are dropped rather than sent somewhere they corrupt.
-                let Some((index, BlockKind::Tool)) = self.open else {
+            let f = call.get("function");
+            // Both of these are appended rather than assigned. An upstream is
+            // free to stream a name the way it streams arguments, and one that
+            // opens with an empty name and sends the real one next used to
+            // produce a nameless block followed by a second one holding the
+            // arguments of the first.
+            if let Some(name) = f.and_then(|f| f.get("name")).and_then(Value::as_str) {
+                slot.name.push_str(name);
+            }
+            if let Some(args) = f.and_then(|f| f.get("arguments")).and_then(Value::as_str) {
+                slot.arguments.push_str(args);
+            }
+        }
+    }
+
+    fn emit_text(&mut self, text: &str, out: &mut String) {
+        if !matches!(self.open, Some((_, BlockKind::Text))) {
+            self.close_block(out);
+            self.open_block(out, BlockKind::Text, &json!({"type":"text","text":""}));
+        }
+        emit(out, "content_block_delta", &json!({"type":"content_block_delta","index":self.open.map_or(0, |(i, _)| i),"delta":{"type":"text_delta","text":text}}));
+    }
+
+    /// Send every tool call assembled so far and forget them.
+    ///
+    /// Called wherever the stream has moved on to something that is not a tool
+    /// fragment, so the blocks land in the order the model produced them, and
+    /// once more at the close for the calls that ended the answer.
+    fn flush_tools(&mut self, out: &mut String) {
+        for t in std::mem::take(&mut self.tools) {
+            if t.name.is_empty() {
+                // Arguments alone are not a call: nothing here says which tool
+                // was meant, and a nameless block is one the client refuses.
+                tracing::warn!(
+                    model = %self.model,
+                    index = t.index,
+                    "a tool call streamed its arguments and never its name"
+                );
+                continue;
+            }
+            self.close_block(out);
+            self.open_block(
+                out,
+                BlockKind::Tool,
+                &json!({
+                    "type": "tool_use",
+                    // An upstream that sends no id leaves the client nothing to
+                    // put in `tool_use_id` on the way back, and the turn after
+                    // this one is refused for a tool result that matches no
+                    // call. A generated id is at least answerable.
+                    "id": t.id.unwrap_or_else(|| format!("douane_tool_{}", t.index)),
+                    "name": t.name,
+                    "input": {},
+                }),
+            );
+            if !t.arguments.is_empty() {
+                // Holding the call whole is what makes this readable at all, and
+                // arguments that do not parse are handed on as an empty object
+                // rather than as a fragment the client fails on. Same answer the
+                // buffered path gives to the same garbage.
+                let partial = if serde_json::from_str::<Value>(&t.arguments).is_ok() {
+                    t.arguments
+                } else {
                     tracing::warn!(
                         model = %self.model,
-                        "tool arguments arrived before the name that opens their block"
+                        index = t.index,
+                        "a tool call streamed arguments that are not JSON"
                     );
-                    continue;
+                    "{}".to_owned()
                 };
                 emit(
                     out,
                     "content_block_delta",
                     &json!({
                         "type": "content_block_delta",
-                        "index": index,
-                        "delta": {"type": "input_json_delta", "partial_json": args},
+                        "index": self.open.map_or(0, |(i, _)| i),
+                        "delta": {"type": "input_json_delta", "partial_json": partial},
                     }),
                 );
             }
+            self.close_block(out);
         }
     }
 
@@ -631,6 +737,11 @@ impl StreamTranslator {
             );
             return;
         }
+        // A call that ended the answer has nothing after it to push it out, so
+        // the close is where it goes.
+        self.flush_tools(out);
+        let pending_text = std::mem::take(&mut self.pending_text);
+        if !pending_text.is_empty() { self.emit_text(&pending_text, out); }
         self.close_block(out);
         // `usage` is not optional on this event: the Anthropic schema requires it,
         // and a client that validates the stream rejects the whole response when it
@@ -692,7 +803,7 @@ where
     }
 
     let how = match (wire, sse) {
-        (Wire::Anthropic, _) => How::Passthrough,
+        (Wire::Anthropic | Wire::Responses, _) => How::Passthrough,
         (Wire::Openai, true) => How::Sse(StreamTranslator::new(&model)),
         (Wire::Openai, false) => How::Json(Vec::new()),
     };
@@ -970,13 +1081,16 @@ mod tests {
         let mut t = StreamTranslator::new("m");
         let mut all = Vec::new();
         all.extend(
-            t.push(b"data: {\"error\":{\"message\":\"rate limited\",\"type\":\"rate_limit\"}}\n"),
+            t.push(b"data: {\"error\":{\"message\":\"rate limited fixture-provider-token\",\"type\":\"rate_limit\"}}\n"),
         );
         all.extend(t.push(b"data: [DONE]\n"));
 
         let f = frames(&all);
         assert_eq!(f[0]["type"], "error");
-        assert_eq!(f[0]["error"]["message"], "rate limited");
+        assert_eq!(f[0]["error"]["message"], "upstream reported an error in its stream");
+        let emitted = String::from_utf8(all).unwrap();
+        assert!(!emitted.contains("rate limited"));
+        assert!(!emitted.contains("fixture-provider-token"));
     }
 
     #[test]
@@ -997,7 +1111,7 @@ mod tests {
     }
 
     #[test]
-    fn a_translated_stream_is_countable_by_the_tap_that_reads_anthropic() {
+    fn a_translated_stream_reports_usage_in_the_final_anthropic_delta() {
         let mut t = StreamTranslator::new("m");
         let mut all = Vec::new();
         all.extend(
@@ -1008,12 +1122,14 @@ mod tests {
         ));
         all.extend(t.push(b"data: [DONE]\n"));
 
-        let mut tap = crate::usage::Tap::new(crate::usage::Mode::Sse);
-        tap.feed(&all);
-        let u = tap.usage();
-        assert_eq!(u.input_tokens, Some(800));
-        assert_eq!(u.cache_read_tokens, Some(100));
-        assert_eq!(u.output_tokens, Some(40));
+        let parsed = frames(&all);
+        let usage = &parsed
+            .iter()
+            .find(|frame| frame["type"] == "message_delta")
+            .unwrap()["usage"];
+        assert_eq!(usage["input_tokens"], 800);
+        assert_eq!(usage["cache_read_input_tokens"], 100);
+        assert_eq!(usage["output_tokens"], 40);
     }
 
     #[test]
@@ -1097,10 +1213,10 @@ mod tests {
         assert_eq!(kind.len(), 3, "text, tool call, then text again: {kind:?}");
     }
 
-    /// Arguments cannot be attached before the name that opens their block, and
-    /// a text block is the wrong home for them.
+    /// Arguments whose call never names itself are not a call at all: there is
+    /// no block to open for them, and a text block is the wrong home.
     #[test]
-    fn tool_arguments_with_no_block_open_are_dropped_not_misfiled() {
+    fn tool_arguments_that_never_get_a_name_are_dropped_not_misfiled() {
         let mut t = StreamTranslator::new("m");
         let mut all = Vec::new();
         all.extend(t.push(b"data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n"));
@@ -1114,6 +1230,212 @@ mod tests {
             !f.iter()
                 .any(|x| x["delta"]["type"] == "input_json_delta"),
             "arguments on a text block corrupt the message: {f:?}"
+        );
+    }
+
+    /// The production failure: kimi streams a tool call's arguments in the same
+    /// frame that first mentions it and names it only afterwards. Reacting per
+    /// fragment, there was no block open to take them, so the arguments were
+    /// dropped and the client read a tool called with nothing. 253 calls in a
+    /// fortnight, and it looked like the model hallucinating a tool.
+    #[test]
+    fn arguments_that_arrive_before_their_name_still_reach_the_client() {
+        let mut t = StreamTranslator::new("kimi-k3");
+        let mut all = Vec::new();
+        all.extend(t.push(
+            b"data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n",
+        ));
+        all.extend(t.push(
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"t1\",\"function\":{\"name\":\"Read\",\"arguments\":\"\\\"a.rs\\\"}\"}}]}}]}\n",
+        ));
+        all.extend(
+            t.push(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n"),
+        );
+        all.extend(t.push(b"data: [DONE]\n"));
+
+        let f = frames(&all);
+        let start = f
+            .iter()
+            .find(|x| x["type"] == "content_block_start")
+            .unwrap();
+        assert_eq!(start["content_block"]["name"], "Read");
+        assert_eq!(start["content_block"]["id"], "t1");
+        let delta = f
+            .iter()
+            .find(|x| x["delta"]["type"] == "input_json_delta")
+            .unwrap();
+        assert_eq!(delta["delta"]["partial_json"], r#"{"path":"a.rs"}"#);
+        assert_eq!(delta["index"], start["index"]);
+    }
+
+    /// Text between two fragments of one call used to close the tool block and
+    /// open a text one, after which every remaining argument had nowhere to go.
+    /// The call is held whole, so the text lands after it and neither is lost.
+    #[test]
+    fn a_tool_call_survives_text_arriving_between_its_fragments() {
+        let mut t = StreamTranslator::new("m");
+        let mut all = Vec::new();
+        all.extend(t.push(
+            b"data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"t1\",\"function\":{\"name\":\"ls\",\"arguments\":\"{\\\"p\\\":\"}}]}}]}\n",
+        ));
+        all.extend(t.push(
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"1}\"}}]}}]}\n",
+        ));
+        all.extend(t.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n"));
+        all.extend(t.push(b"data: [DONE]\n"));
+
+        let f = frames(&all);
+        let delta = f
+            .iter()
+            .find(|x| x["delta"]["type"] == "input_json_delta")
+            .unwrap();
+        assert_eq!(delta["delta"]["partial_json"], r#"{"p":1}"#);
+        // The tool block opened and closed before the text block opened.
+        let types: Vec<&str> = f.iter().map(|x| x["type"].as_str().unwrap_or("")).collect();
+        let tool_stop = types
+            .iter()
+            .position(|x| *x == "content_block_stop")
+            .unwrap();
+        let text_start = types
+            .iter()
+            .enumerate()
+            .filter(|(_, x)| **x == "content_block_start")
+            .nth(1)
+            .unwrap()
+            .0;
+        assert!(tool_stop < text_start, "{types:?}");
+    }
+
+    /// Two calls in one answer are told apart by the index every fragment
+    /// carries, and by nothing else. Merging them gives one tool called with
+    /// both sets of arguments concatenated into unparseable JSON.
+    #[test]
+    fn two_tool_calls_keep_their_own_arguments() {
+        let mut t = StreamTranslator::new("m");
+        let mut all = Vec::new();
+        all.extend(t.push(
+            b"data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"t1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"a\\\":1}\"}}]}}]}\n",
+        ));
+        all.extend(t.push(
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"t2\",\"function\":{\"name\":\"write\",\"arguments\":\"{\\\"b\\\":2}\"}}]}}]}\n",
+        ));
+        all.extend(
+            t.push(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n"),
+        );
+        all.extend(t.push(b"data: [DONE]\n"));
+
+        let f = frames(&all);
+        let starts: Vec<&Value> = f
+            .iter()
+            .filter(|x| x["type"] == "content_block_start")
+            .collect();
+        assert_eq!(starts.len(), 2, "{f:?}");
+        assert_eq!(starts[0]["content_block"]["name"], "read");
+        assert_eq!(starts[1]["content_block"]["name"], "write");
+        let args: Vec<&Value> = f
+            .iter()
+            .filter(|x| x["delta"]["type"] == "input_json_delta")
+            .collect();
+        assert_eq!(args[0]["delta"]["partial_json"], r#"{"a":1}"#);
+        assert_eq!(args[0]["index"], starts[0]["index"]);
+        assert_eq!(args[1]["delta"]["partial_json"], r#"{"b":2}"#);
+        assert_eq!(args[1]["index"], starts[1]["index"]);
+    }
+
+    /// An upstream that numbers none of its calls is not an upstream with one
+    /// call. Filing both under index 0 runs the two names together into one
+    /// that matches no tool the agent declared, and concatenates the arguments.
+    #[test]
+    fn two_tool_calls_that_carry_no_index_are_still_two_calls() {
+        let mut t = StreamTranslator::new("m");
+        let mut all = Vec::new();
+        all.extend(t.push(
+            b"data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"t1\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"a\\\":1}\"}}]}}]}\n",
+        ));
+        all.extend(t.push(
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"t2\",\"function\":{\"name\":\"write\",\"arguments\":\"{\\\"b\\\":2}\"}}]}}]}\n",
+        ));
+        all.extend(t.push(b"data: [DONE]\n"));
+
+        let f = frames(&all);
+        let starts: Vec<&Value> = f
+            .iter()
+            .filter(|x| x["type"] == "content_block_start")
+            .collect();
+        assert_eq!(starts.len(), 2, "{f:?}");
+        assert_eq!(starts[0]["content_block"]["name"], "read");
+        assert_eq!(starts[1]["content_block"]["name"], "write");
+        assert_eq!(starts[1]["content_block"]["id"], "t2");
+    }
+
+    /// An upstream that opens with an empty name and sends the real one in the
+    /// next frame produced two blocks: a nameless one, then a second holding
+    /// the arguments of the first.
+    #[test]
+    fn a_name_arriving_in_pieces_opens_one_block() {
+        let mut t = StreamTranslator::new("m");
+        let mut all = Vec::new();
+        all.extend(t.push(
+            b"data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"t1\",\"function\":{\"name\":\"\",\"arguments\":\"\"}}]}}]}\n",
+        ));
+        all.extend(t.push(
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"Ed\"}}]}}]}\n",
+        ));
+        all.extend(t.push(
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"it\",\"arguments\":\"{}\"}}]}}]}\n",
+        ));
+        all.extend(t.push(b"data: [DONE]\n"));
+
+        let f = frames(&all);
+        let starts: Vec<&Value> = f
+            .iter()
+            .filter(|x| x["type"] == "content_block_start")
+            .collect();
+        assert_eq!(starts.len(), 1, "{f:?}");
+        assert_eq!(starts[0]["content_block"]["name"], "Edit");
+    }
+
+    /// A call cut off mid-arguments would hand the client a fragment of JSON it
+    /// cannot parse, which takes the whole message down rather than the one
+    /// call. The buffered path already answers this with an empty object.
+    #[test]
+    fn arguments_that_are_not_json_reach_the_client_as_an_empty_object() {
+        let mut t = StreamTranslator::new("m");
+        let mut all = Vec::new();
+        all.extend(t.push(
+            b"data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"t1\",\"function\":{\"name\":\"ls\",\"arguments\":\"{\\\"p\\\":\"}}]}}]}\n",
+        ));
+        all.extend(t.finish());
+
+        let f = frames(&all);
+        let delta = f
+            .iter()
+            .find(|x| x["delta"]["type"] == "input_json_delta")
+            .unwrap();
+        assert_eq!(delta["delta"]["partial_json"], "{}");
+    }
+
+    /// An upstream that names no id at all leaves the client with nothing to
+    /// answer the call with, and the turn after it is refused.
+    #[test]
+    fn a_tool_call_with_no_id_is_given_one_it_can_be_answered_with() {
+        let mut t = StreamTranslator::new("m");
+        let mut all = Vec::new();
+        all.extend(t.push(
+            b"data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"ls\",\"arguments\":\"{}\"}}]}}]}\n",
+        ));
+        all.extend(t.push(b"data: [DONE]\n"));
+
+        let f = frames(&all);
+        let start = f
+            .iter()
+            .find(|x| x["type"] == "content_block_start")
+            .unwrap();
+        assert!(
+            start["content_block"]["id"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "a null id is a tool result the next turn cannot match: {start}"
         );
     }
 

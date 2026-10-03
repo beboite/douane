@@ -1,0 +1,8 @@
+Model catalogue fields are derived from CLIProxyAPI, commit
+d7914afdedca7af95ee974a42453dc49fc1388ce.
+https://github.com/router-for-me/CLIProxyAPI
+The upstream MIT license is in CLIProxyAPI-LICENSE.
+
+Provider protocol implementations were independently written in Rust with
+CLIProxyAPI as a behavioral reference. Dashboard design references
+https://github.com/router-for-me/Cli-Proxy-API-Management-Center.

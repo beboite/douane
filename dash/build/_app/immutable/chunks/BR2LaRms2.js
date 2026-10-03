@@ -1,1 +1,0 @@
-function e(e,t){return[(t=+t)*Math.cos(e-=Math.PI/2),t*Math.sin(e)]}export{e as t};

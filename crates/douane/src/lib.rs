@@ -1,89 +1,99 @@
-//! The douane broker, as a library.
-//!
-//! The binary is a thin wrapper: read the config, open the vault, build the
-//! state, serve [`router`]. Everything worth testing lives here, so a test can
-//! stand a real broker up against a real upstream over a real socket rather
-//! than assert on the pieces separately and hope they fit together.
-
-pub mod audit;
-pub mod catalog;
-pub mod config;
-pub mod dash;
-pub mod egress;
-pub mod guard;
-pub mod mcp;
-pub mod proxy;
-pub mod scrub;
-pub mod usage;
+//! Subscription routing, OAuth, quota accounting, and native streaming transports.
+pub mod affinity;
+pub mod ledger;
+pub mod management;
+pub mod relay;
+pub mod scheduler;
+pub mod settings;
+pub mod socket;
+mod socket_compat;
+pub mod state;
+pub mod subscriptions;
+pub mod translate;
 pub mod wire;
 
+use axum::{
+    Router, middleware,
+    routing::{get, patch, post},
+};
+use state::AppState;
 use std::sync::Arc;
 
-use axum::Router;
-use axum::routing::{delete, get, patch, post, put};
-
-use crate::proxy::AppState;
-
-/// Every route douane serves.
-///
-/// The 64 MiB body limit is generous on purpose: a long conversation with
-/// images in it is legitimately large, and a request refused here looks to the
-/// agent exactly like a model failure.
 pub fn router(state: Arc<AppState>) -> Router {
+    let management = Router::new()
+        .route("/accounts", get(management::accounts))
+        .route("/accounts/import", post(management::import))
+        .route(
+            "/accounts/{id}",
+            patch(management::update_account).delete(management::delete_account),
+        )
+        .route("/quotas", get(management::quotas))
+        .route("/accounts/{id}/resets", get(management::account_resets))
+        .route(
+            "/accounts/{id}/resets/redeem",
+            post(management::redeem_reset),
+        )
+        .route("/quotas/refresh", post(management::refresh_quotas))
+        .route("/models", get(management::models))
+        .route("/models/refresh", post(management::refresh_models))
+        .route("/models/{*id}", patch(management::set_model))
+        .route("/calls", get(management::calls))
+        .route("/summary", get(management::summary))
+        .route("/status", get(management::summary))
+        .route(
+            "/settings",
+            get(management::settings)
+                .patch(management::update_settings)
+                .put(management::update_settings),
+        )
+        .route("/providers", get(management::providers))
+        .route("/oauth/start", post(management::oauth_start))
+        .route("/oauth/callback", post(management::oauth_callback))
+        .route("/oauth/{id}", get(management::oauth_status))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            management::guard,
+        ));
+    let compatible = Router::new()
+        .route(
+            "/auth-files",
+            get(management::auth_files)
+                .post(management::import)
+                .delete(management::delete_auth_file),
+        )
+        .route("/auth-files/status", patch(management::patch_auth_file))
+        .route("/auth-files/models", get(management::auth_file_models))
+        .route("/config", get(management::compatible_config))
+        .route("/usage", get(management::summary))
+        .route("/logs", get(management::calls))
+        .route("/models", get(management::public_models))
+        .route("/latest-version", get(management::version))
+        .route("/version", get(management::version))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            management::guard,
+        ));
     Router::new()
-        .route("/v1/messages", post(proxy::messages))
-        // What this caller may ask for. Authenticated by the same virtual keys
-        // as the relay and filtered by the same caps, so a client never learns
-        // that a route it cannot reach exists. This is what lets a launcher
-        // stop keeping a hand-written copy of the routing table.
-        .route("/v1/models", get(proxy::models))
-        .route("/health", get(proxy::health))
-        // Stateless MCP: one POST per request, no session, Tasks for anything
-        // that waits on a human. Guarded by the same virtual keys as the relay.
-        .route("/mcp", post(mcp::endpoint))
-        // The redemption path: the one surface that answers with a value,
-        // gated on a human approval. See `mcp::redeem` for why it exists.
-        .route("/agent/api/use", post(mcp::redeem))
-        .route("/admin", get(dash::page))
-        .route("/admin/", get(dash::page))
-        // The compiled bundle. Every asset SvelteKit emits lives under `_app`,
-        // so one wildcard covers them and nothing else is reachable: a static
-        // file server rooted at the whole bundle would be a wider door than
-        // this page needs.
-        .route("/admin/_app/{*path}", get(dash::asset))
-        .route("/admin/api/summary", get(dash::summary))
-        .route("/admin/api/calls", get(dash::calls))
-        .route("/admin/api/threads", get(dash::threads))
-        .route("/admin/api/live", get(dash::live))
-        .route("/admin/api/alerts", get(dash::alerts))
-        .route("/admin/api/vault", get(dash::vault))
-        .route("/admin/api/vault/{namespace}/{key}", put(dash::put_secret))
         .route(
-            "/admin/api/vault/{namespace}/{key}",
-            delete(dash::delete_secret),
+            "/",
+            get(|| async { axum::response::Redirect::temporary("/admin") }),
         )
-        .route("/admin/api/config", get(dash::config))
-        // POST on purpose: a probe sends one real, paid call per provider.
-        .route("/admin/api/providers/probe", post(dash::probe))
-        .route("/admin/api/routes/{name}", put(dash::set_route))
-        .route("/admin/api/routes/{name}", delete(dash::clear_route))
-        // The catalogue. Reading it is free; refreshing it spends one request
-        // per upstream, so that one is a POST like the probe is.
-        .route("/admin/api/models", get(dash::models))
-        .route("/admin/api/models", put(dash::put_model))
-        .route("/admin/api/models/refresh", post(dash::refresh_models))
+        .route("/health", get(management::health))
+        .route("/v1/models", get(management::public_models))
+        .route("/v1/messages", post(relay::forward))
+        .route("/v1/chat/completions", post(relay::forward))
+        .route("/v1/responses", post(relay::forward).get(socket::upgrade))
+        .route("/v1/responses/compact", post(relay::forward))
+        .route("/admin", get(management::page))
+        .route("/admin/", get(management::page))
         .route(
-            "/admin/api/models/{route}/enabled",
-            put(dash::set_model_enabled),
+            "/management.html",
+            get(|| async { axum::response::Redirect::temporary("/admin") }),
         )
-        .route("/admin/api/models/{route}", delete(dash::delete_model))
-        .route("/admin/api/models/{route}", patch(dash::edit_model))
-        .route(
-            "/admin/api/providers/{provider}/models/enabled",
-            put(dash::set_provider_models_enabled),
-        )
-        .route("/admin/api/grants", get(dash::grants))
-        .route("/admin/api/grants/{id}/decide", post(dash::decide_grant))
+        .route("/admin/_app/{*path}", get(management::asset))
+        .nest("/admin/api", management)
+        .nest("/v0/management", compatible.clone())
+        .nest("/v8/management", compatible)
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             64 * 1024 * 1024,
         ))
