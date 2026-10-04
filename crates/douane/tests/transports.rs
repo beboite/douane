@@ -58,6 +58,8 @@ struct Mock {
     native_pings: AtomicUsize,
     unique_native_ids: AtomicBool,
     omit_native_lane: AtomicBool,
+    omit_content_type: AtomicBool,
+    items_before_empty_completion: AtomicBool,
 }
 
 struct Server {
@@ -255,6 +257,19 @@ async fn mock_http(
          json!({"id":"chat-fixture","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
          json!({"id":"chat-fixture","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":80}}})]
             .iter().map(|frame| format!("data: {frame}\n\n")).collect::<String>()
+    } else if mock.items_before_empty_completion.load(Ordering::Relaxed) {
+        // Codex's backend: the finished items come one by one, then a
+        // completion whose output is empty.
+        let mut done = completed(None);
+        let item = done["response"]["output"][0].take();
+        done["response"]["output"] = json!([]);
+        format!(
+            "event: response.created\ndata: {}\n\nevent: response.output_text.delta\ndata: {}\n\nevent: response.output_item.done\ndata: {}\n\nevent: response.completed\ndata: {}",
+            json!({"type":"response.created","response":{"id":"response-fixture"}}),
+            json!({"type":"response.output_text.delta","delta":TEXT}),
+            json!({"type":"response.output_item.done","output_index":0,"item":item}),
+            done
+        )
     } else {
         format!(
             "event: response.created\ndata: {}\n\nevent: response.output_text.delta\ndata: {}\n\nevent: response.completed\ndata: {}",
@@ -274,6 +289,7 @@ async fn mock_http(
         .map(|cut| Bytes::copy_from_slice(&data.as_bytes()[cut[0]..cut[1]]))
         .collect();
     let hold = mock.hold_http.load(Ordering::Relaxed);
+    let omit_content_type = mock.omit_content_type.load(Ordering::Relaxed);
     let probe = HoldProbe { mock, hold };
     let stream = futures_util::stream::unfold((chunks, probe), |(mut chunks, probe)| async move {
         if probe.hold && chunks.len() <= 2 {
@@ -283,6 +299,9 @@ async fn mock_http(
         tokio::time::sleep(Duration::from_millis(3)).await;
         Some((Ok::<_, std::io::Error>(chunk), (chunks, probe)))
     });
+    if omit_content_type {
+        return Body::from_stream(stream).into_response();
+    }
     (
         [("content-type", "text/event-stream")],
         Body::from_stream(stream),
@@ -595,6 +614,68 @@ async fn unicode_sse_and_trailing_usage_survive_native_translation_and_collectio
                 .as_str()
                 .is_some_and(|key| !key.is_empty())
         );
+    }
+}
+
+#[tokio::test]
+async fn codex_stream_without_content_type_is_still_read_as_events() {
+    let fixture = Fixture::new(&[("codex", "alpha")], Strategy::FillFirst).await;
+    fixture
+        .mock
+        .omit_content_type
+        .store(true, Ordering::Relaxed);
+    for (path, body) in [
+        (
+            "/v1/responses",
+            json!({"model":"gpt-test","input":"hello","stream":false}),
+        ),
+        (
+            "/v1/responses",
+            json!({"model":"gpt-test","input":"hello","stream":true}),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model":"gpt-test","messages":[{"role":"user","content":"hello"}],"stream":false}),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model":"gpt-test","messages":[{"role":"user","content":"hello"}],"stream":true}),
+        ),
+    ] {
+        let response = fixture
+            .post(path, "conversation-untyped", body.clone())
+            .await;
+        assert_eq!(response.status(), StatusCode::OK, "{path} {body}");
+        let text = response.text().await.unwrap();
+        assert!(text.contains(TEXT), "{path} {body}: {text}");
+    }
+}
+
+#[tokio::test]
+async fn codex_items_fill_a_completion_that_arrives_with_an_empty_output() {
+    let fixture = Fixture::new(&[("codex", "alpha")], Strategy::FillFirst).await;
+    fixture
+        .mock
+        .items_before_empty_completion
+        .store(true, Ordering::Relaxed);
+    for (path, body) in [
+        (
+            "/v1/responses",
+            json!({"model":"gpt-test","input":"hello","stream":false}),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model":"gpt-test","messages":[{"role":"user","content":"hello"}],"stream":false}),
+        ),
+    ] {
+        let response = fixture.post(path, "conversation-items", body.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK, "{path} {body}");
+        let text = response.text().await.unwrap();
+        assert!(text.contains(TEXT), "{path} {body}: {text}");
+    }
+    // Codex's backend refuses a plain text input.
+    for request in fixture.received() {
+        assert!(request.body["input"].is_array(), "{}", request.body);
     }
 }
 

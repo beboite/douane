@@ -315,6 +315,11 @@ pub async fn forward(
             if translated.get("instructions").is_none() {
                 translated["instructions"] = json!("");
             }
+            // Codex's backend refuses a plain text input: "Input must be a list".
+            if let Some(text) = translated["input"].as_str() {
+                translated["input"] =
+                    json!([{"role":"user","content":[{"type":"input_text","text":text}]}]);
+            }
             for key in ["max_output_tokens", "max_tokens", "temperature", "top_p"] {
                 translated.as_object_mut().map(|m| m.remove(key));
             }
@@ -425,11 +430,14 @@ pub async fn forward(
                 .unwrap_or_else(|e| e.into_inner())
                 .bind(account.provider.as_str(), key, &account.id);
         }
-        let is_sse = response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.contains("text/event-stream"));
+        // Codex was asked for a stream above, and its backend can answer one
+        // without a content type.
+        let is_sse = codex_sse
+            || response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.contains("text/event-stream"));
         if stream && is_sse {
             return stream_response(response, from, to, model, call);
         }
@@ -489,38 +497,58 @@ async fn collect_response(
 ) -> Result<Value, String> {
     let mut decoder = Frames::default();
     let mut upstream = response.bytes_stream();
-    let mut result = None;
+    let mut collected = Collected::default();
     while let Some(chunk) = upstream.next().await {
         for frame in decoder.feed(&chunk.map_err(|_| "upstream stream interrupted")?)? {
-            call.observe(&frame);
-            if frame["type"] == "response.failed" || frame["type"] == "error" {
-                return Err("upstream reported a stream error".into());
-            }
-            if to == Dialect::Responses
-                && matches!(
-                    frame["type"].as_str(),
-                    Some("response.completed" | "response.incomplete")
-                )
-            {
-                result = Some(frame["response"].clone());
-            }
+            collected.frame(&frame, to, call)?;
         }
     }
     for frame in decoder.finish()? {
-        call.observe(&frame);
+        collected.frame(&frame, to, call)?;
+    }
+    let mut result = collected
+        .result
+        .ok_or("upstream stream closed before completing its response")?;
+    // Codex sends its items as `response.output_item.done` and completes with
+    // an empty `output`; the finished items are the answer.
+    let empty = result["output"].as_array().is_none_or(Vec::is_empty);
+    if empty && !collected.items.is_empty() {
+        collected.items.sort_by_key(|(index, _)| *index);
+        result["output"] =
+            Value::Array(collected.items.into_iter().map(|(_, item)| item).collect());
+    }
+    Ok(result)
+}
+
+#[derive(Default)]
+struct Collected {
+    result: Option<Value>,
+    items: Vec<(u64, Value)>,
+}
+
+impl Collected {
+    fn frame(&mut self, frame: &Value, to: Dialect, call: &mut CallGuard) -> Result<(), String> {
+        call.observe(frame);
         if frame["type"] == "response.failed" || frame["type"] == "error" {
             return Err("upstream reported a stream error".into());
         }
-        if to == Dialect::Responses
-            && matches!(
-                frame["type"].as_str(),
-                Some("response.completed" | "response.incomplete")
-            )
-        {
-            result = Some(frame["response"].clone());
+        if to != Dialect::Responses {
+            return Ok(());
         }
+        match frame["type"].as_str() {
+            Some("response.output_item.done") if frame["item"].is_object() => {
+                let index = frame["output_index"]
+                    .as_u64()
+                    .unwrap_or(self.items.len() as u64);
+                self.items.push((index, frame["item"].clone()));
+            }
+            Some("response.completed" | "response.incomplete") => {
+                self.result = Some(frame["response"].clone());
+            }
+            _ => {}
+        }
+        Ok(())
     }
-    result.ok_or("upstream stream closed before completing its response".into())
 }
 
 fn stream_response(
