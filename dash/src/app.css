@@ -70,12 +70,6 @@ h2 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: -.015em; }
 .sidebar-bottom>p { margin: 7px 0 20px 15px; color: var(--faint); font-size: 15px; }
 .sidebar-help { display: flex; align-items: center; justify-content: space-between; width: 100%; padding: 0; border: 0; background: transparent; color: var(--blue); font-size: 15px; }
 .workspace { margin-left: 248px; }
-.topbar { display: flex; align-items: center; justify-content: space-between; height: 66px; padding: 0 34px; border-bottom: 1px solid var(--border); background: #0c1222f0; }
-.breadcrumb { display: flex; align-items: center; gap: 13px; color: var(--faint); font-size: 15px; }
-.breadcrumb strong { color: var(--text); font-weight: 500; }
-.topbar-actions { display: flex; align-items: center; gap: 18px; }
-.topbar-service { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 15px; }
-.mobile-brand { display: none; }
 main { max-width: 1600px; margin: 0 auto; padding: 36px 34px 24px; }
 .page-heading { display: flex; align-items: center; justify-content: space-between; gap: 22px; margin-bottom: 28px; }
 .page-description { display: flex; align-items: center; flex-wrap: wrap; gap: 0; min-height: 18px; margin: 0; color: var(--muted); font-size: 15px; line-height: 1.5; }
@@ -119,24 +113,18 @@ tr:last-child td { border: 0; }
 .loading-state { display: flex; align-items: center; gap: 10px; margin-bottom: 20px; color: var(--muted); font-size: 15px; }
 .spinning { animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
-.mobile-toggle,.mobile-close,.mobile-nav { display: none; }
+.mobile-close,.mobile-nav { display: none; }
 .nav-backdrop { display: none; }
 
-@media(min-width:1600px) { main { padding: 42px 45px; } .topbar { padding: 0 45px; } }
+@media(min-width:1600px) { main { padding: 42px 45px; } }
 @media(max-width:1100px) { .page-heading { align-items: flex-start; flex-direction: column; gap: 20px; } .section-toolbar { align-items: flex-start; flex-wrap: wrap; } .toolbar-controls { margin-left: auto; } }
 @media(max-width:780px) {
 	.sidebar { width: 270px; transform: translateX(-100%); visibility: hidden; transition: transform 170ms ease,visibility 170ms; }
 	.sidebar.mobile-open { transform: translateX(0); visibility: visible; }
 	.workspace { margin-left: 0; }
-	.topbar { position: sticky; top: 0; z-index: 25; height: 64px; padding: 0 18px; backdrop-filter: blur(14px); }
-	.mobile-toggle,.mobile-close { display: inline-flex; }
+	.mobile-close { display: inline-flex; }
 	.mobile-close { margin-left: auto; }
 	.brand-version { margin-left: auto; }
-	.breadcrumb { gap: 10px; }
-	.breadcrumb>span:not(.mobile-brand),.breadcrumb>svg,.breadcrumb>strong { display: none; }
-	.mobile-brand { display: inline; color: var(--text); font-family: var(--font-display); font-size: 24px; font-weight: 700; letter-spacing: -.8px; }
-	.topbar-actions { gap: 8px; }
-	.topbar-service { font-size: 15px; }
 	.updated-label { display: none; }
 	.nav-backdrop { display: block; position: fixed; inset: 0; z-index: 35; border: 0; background: #030711b5; backdrop-filter: blur(3px); }
 	main { padding: 26px 18px 100px; }

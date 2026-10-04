@@ -22,7 +22,7 @@
 		{ label:'Abonnements', items:[{ id:'quotas',label:'Quotas',icon:Gauge },{ id:'overview',label:"Vue d'ensemble",icon:LayoutDashboard },{ id:'accounts',label:'Comptes',icon:Users },{ id:'models',label:'Modèles',icon:Boxes }] },
 		{ label:'Service',items:[{ id:'activity',label:'Requêtes',icon:Activity },{ id:'settings',label:'Réglages',icon:Settings2 },{ id:'quickstart',label:'Démarrage rapide',icon:Rocket }] }
 	];
-	const mobileItems = groups.flatMap(group => group.items).filter(item => ['quotas','accounts','models','activity','settings'].includes(item.id));
+	const mobileItems = groups.flatMap(group => group.items).filter(item => ['quotas','accounts','activity','settings'].includes(item.id));
 	let screen = $state('quotas');
 	let mobileOpen = $state(false);
 	let connectOpen = $state(false);
@@ -59,13 +59,13 @@
 	}
 	function navigate(next: string) { screen = next; mobileOpen = false; failure = ''; notice = ''; location.hash = next; window.scrollTo(0,0); }
 	function hashChange() { const hash = location.hash.slice(1); if (groups.flatMap(g => g.items).some(item => item.id === hash)) screen = hash; }
-	async function mutate(name: string, action: () => Promise<unknown>, message: string) {
+	async function mutate(name: string, action: () => Promise<unknown>, message = '') {
 		if (busy) return; busy = name; failure = ''; notice = '';
 		try { await action(); if (loadingRequest) await loadingRequest; await load(true); notice = message; }
 		catch (error) { failure = (error as Error).message; }
 		finally { busy = ''; }
 	}
-	function refresh(id?: string) { return mutate('quotas', () => management.refreshQuotas(id), 'Actualisation des quotas terminée.'); }
+	function refresh(id?: string) { return mutate('quotas', () => management.refreshQuotas(id)); }
 	async function rename(account: Account, name: string) {
 		if (busy) throw new Error('Une action est déjà en cours.');
 		busy = 'rename';
@@ -95,7 +95,7 @@
 		<nav aria-label="Navigation principale">{#each groups as group (group.label)}<div class="nav-group"><p>{group.label}</p>{#each group.items as item (item.id)}{@const Icon = item.icon}<button class="nav-link" class:active={screen === item.id} aria-current={screen === item.id ? 'page' : undefined} onclick={() => navigate(item.id)}><Icon size={17}/><span>{item.label}</span>{#if item.id === 'accounts' && accounts.length}<span class="nav-count">{accounts.length}</span>{/if}</button>{/each}</div>{/each}</nav>
 		<div class="sidebar-bottom"><button class="sidebar-help" onclick={() => navigate('quickstart')}>Configurer un outil<ChevronRight size={19}/></button></div>
 	</aside>
-	<div class="workspace"><header class="topbar"><div class="breadcrumb"><button class="icon-button mobile-toggle" onclick={() => mobileOpen = true} aria-label="Ouvrir le menu" aria-expanded={mobileOpen} aria-controls="main-navigation"><Menu size={22}/></button><span class="mobile-brand">douane</span><strong>{pageTitle}</strong></div><div class="topbar-actions"><span class="topbar-service"><span class="status-pip" class:offline={!summary}></span>{summary ? 'Connecté' : 'Hors ligne'}</span><button class="icon-button" onclick={() => load()} disabled={loading} aria-label="Recharger les données" title="Recharger les données"><RefreshCw size={19} class={loading ? 'spinning' : ''}/></button></div></header>
+	<div class="workspace">
 		<main id="main-content">
 			{#if failure}<div class="notice error" role="alert"><span>{failure}</span><button class="button small" onclick={() => load()} disabled={loading}>Réessayer</button></div>{/if}
 			{#if notice}<div class="notice success" role="status">{notice}<button class="icon-button" onclick={() => notice = ''} aria-label="Fermer la notification"><X size={14}/></button></div>{/if}
@@ -107,5 +107,5 @@
 		</main>
 	</div>
 </div>
-<nav class="mobile-nav" aria-label="Navigation mobile">{#each mobileItems as item (item.id)}{@const Icon = item.icon}<button class:active={screen === item.id} aria-current={screen === item.id ? 'page' : undefined} onclick={() => navigate(item.id)}><Icon size={19}/><span>{item.label}</span></button>{/each}</nav>
+<nav class="mobile-nav" aria-label="Navigation mobile">{#each mobileItems as item (item.id)}{@const Icon = item.icon}<button class:active={screen === item.id} aria-current={screen === item.id ? 'page' : undefined} onclick={() => navigate(item.id)}><Icon size={19}/><span>{item.label}</span></button>{/each}<button onclick={() => mobileOpen = true} aria-label="Ouvrir le menu" aria-expanded={mobileOpen} aria-controls="main-navigation"><Menu size={19}/><span>Menu</span></button></nav>
 {#if connectOpen}<ConnectDialog {providers} close={() => connectOpen = false} completed={() => { notice = 'Compte connecté.'; void load(true); }} {importFiles}/>{/if}

@@ -16,6 +16,19 @@ pub use store::{
     AccountCredential, AccountStore, AccountSummary, SubscriptionProvider, SubscriptionTier,
 };
 
+pub struct GoogleVerification {
+    url: Option<String>,
+}
+
+impl std::fmt::Debug for GoogleVerification {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GoogleVerification")
+            .field("verification_available", &self.url.is_some())
+            .finish()
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SubscriptionError {
     #[error("invalid authentication file: {0}")]
@@ -28,6 +41,12 @@ pub enum SubscriptionError {
     Storage,
     #[error("upstream authentication or quota request failed (HTTP {0})")]
     Upstream(u16),
+    #[error("Google account verification is required; complete verification and retry")]
+    VerificationRequired(GoogleVerification),
+    #[error(
+        "Google did not return a Cloud project for this account; check account setup in Antigravity"
+    )]
+    GoogleProjectUnavailable,
     #[error("upstream authentication or quota request could not be completed")]
     Transport,
     #[error("upstream returned an invalid response")]
@@ -42,6 +61,25 @@ pub enum SubscriptionError {
     NoRefreshToken,
     #[error("provider OAuth client is not configured")]
     OAuthNotConfigured,
+}
+
+impl SubscriptionError {
+    pub(crate) fn verification_required(url: Option<&str>) -> Self {
+        Self::VerificationRequired(GoogleVerification {
+            url: url.and_then(oauth::validate_google_verification_url),
+        })
+    }
+
+    pub(crate) fn is_verification_required(&self) -> bool {
+        matches!(self, Self::VerificationRequired(_))
+    }
+
+    pub(crate) fn verification_url(&self) -> Option<&str> {
+        match self {
+            Self::VerificationRequired(verification) => verification.url.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 pub(crate) fn now() -> String {

@@ -115,3 +115,37 @@ async fn reset_redemption_requires_explicit_confirmation_and_a_valid_request_id(
         0
     );
 }
+
+#[tokio::test]
+async fn verification_actions_require_management_authentication_and_return_safe_missing() {
+    let directory = TempDir::new().unwrap();
+    let mut config = Config::default();
+    config.server.auth_dir = directory.path().join("auth");
+    config.server.database = directory.path().join("requests.sqlite");
+    let mut state = AppState::new(config, None).unwrap();
+    std::sync::Arc::get_mut(&mut state)
+        .unwrap()
+        .management_token = Some("fixture-management".into());
+    let app = douane::router(state);
+    for path in [
+        "/admin/api/accounts/unknown/verification",
+        "/admin/api/oauth/unknown/verification",
+    ] {
+        let request = Request::builder().uri(path).body(Body::empty()).unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(!response.headers().contains_key("location"));
+
+        let request = Request::builder()
+            .uri(path)
+            .header("authorization", "Bearer fixture-management")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert!(!response.headers().contains_key("location"));
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(!String::from_utf8_lossy(&body).contains("fixture-management"));
+    }
+}

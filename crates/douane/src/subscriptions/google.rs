@@ -1,7 +1,7 @@
 //! Google's installed-app OAuth and Code Assist account onboarding.
 //! Public-client metadata comes from private runtime configuration, not source.
 
-use super::oauth::send_json;
+use super::oauth::{google_verification_error, send_json};
 use super::store::text;
 use super::{SubscriptionError, SubscriptionProvider, timestamp};
 use serde_json::{Value, json};
@@ -236,10 +236,17 @@ impl GoogleOAuth {
             request = request.header("User-Agent", "antigravity/hub/2.9.1");
         }
         let loaded = send_json(request).await?;
+        if let Some(error) = load_verification_error(&loaded) {
+            return Err(error);
+        }
         let tier = loaded
             .get("paidTier")
-            .or_else(|| loaded.get("currentTier"))
-            .and_then(|tier| text(tier, &["id"]));
+            .and_then(|tier| text(tier, &["id"]))
+            .or_else(|| {
+                loaded
+                    .get("currentTier")
+                    .and_then(|tier| text(tier, &["id"]))
+            });
         if let Some(project) = project_id(&loaded) {
             return Ok((project, tier));
         }
@@ -252,12 +259,21 @@ impl GoogleOAuth {
                 ),
             );
         }
+        // Subscription labels are separate from the activation tier sent upstream.
         let selected = loaded
             .get("allowedTiers")
             .and_then(Value::as_array)
             .and_then(|tiers| tiers.iter().find(|tier| tier["isDefault"] == true))
             .and_then(|tier| text(tier, &["id"]))
-            .or(tier)
+            .or_else(|| {
+                if provider == SubscriptionProvider::Antigravity {
+                    loaded
+                        .get("currentTier")
+                        .and_then(|tier| text(tier, &["id"]))
+                } else {
+                    None
+                }
+            })
             .unwrap_or_else(|| {
                 if provider == SubscriptionProvider::Antigravity {
                     "free-tier".into()
@@ -299,11 +315,42 @@ impl GoogleOAuth {
         let mut operation = send_json(onboard_request()).await?;
         for attempt in 0..12 {
             if operation["done"] == true {
-                let project = operation
-                    .get("response")
-                    .and_then(project_id)
-                    .ok_or(SubscriptionError::InvalidResponse)?;
-                return Ok((project, Some(selected)));
+                if let Some(error) = completed_onboarding_error(&operation, &endpoint) {
+                    return Err(error);
+                }
+                let Some(project) = operation.get("response").and_then(project_id) else {
+                    // Never log the operation, profile, project, or upstream error text.
+                    tracing::warn!(
+                        provider = provider.as_str(),
+                        activation_tier = activation_tier_category(&selected),
+                        current_tier_present = loaded
+                            .get("currentTier")
+                            .is_some_and(serde_json::Value::is_object),
+                        paid_tier_present = loaded
+                            .get("paidTier")
+                            .is_some_and(serde_json::Value::is_object),
+                        allowed_tier_count = loaded
+                            .get("allowedTiers")
+                            .and_then(serde_json::Value::as_array)
+                            .map_or(0, Vec::len),
+                        ineligible_tier_count = loaded
+                            .get("ineligibleTiers")
+                            .and_then(serde_json::Value::as_array)
+                            .map_or(0, Vec::len),
+                        ineligible_reasons = ?ineligible_reason_categories(&loaded),
+                        onboarding_status = diagnostic_enum(
+                            operation.pointer("/response/status/statusCode"),
+                            &["DEFAULT", "NOTICE", "WARNING"]
+                        ),
+                        help_link_present = operation.pointer("/response/status/helpLink/url").is_some(),
+                        response_present = operation
+                            .get("response")
+                            .is_some_and(serde_json::Value::is_object),
+                        "Google onboarding completed without a Cloud project"
+                    );
+                    return Err(SubscriptionError::GoogleProjectUnavailable);
+                };
+                return Ok((project, tier.or(Some(selected))));
             }
             if attempt == 11 {
                 break;
@@ -334,6 +381,95 @@ impl GoogleOAuth {
     }
 }
 
+fn activation_tier_category(tier: &str) -> &'static str {
+    match tier {
+        "free-tier" => "free-tier",
+        "standard-tier" => "standard-tier",
+        "legacy-tier" => "legacy-tier",
+        _ => "other",
+    }
+}
+
+fn ineligible_reason_categories(loaded: &Value) -> Vec<&'static str> {
+    const REASONS: &[&str] = &[
+        "UNKNOWN",
+        "INELIGIBLE_ACCOUNT",
+        "UNKNOWN_LOCATION",
+        "UNSUPPORTED_LOCATION",
+        "RESTRICTED_NETWORK",
+        "RESTRICTED_AGE",
+        "NON_USER_ACCOUNT",
+        "DASHER_USER",
+        "BYOID_USER",
+        "RESTRICTED_DASHER_USER",
+        "VALIDATION_REQUIRED",
+        "GOOGLE_TOS_NOT_SUPPORTED_BY_CLIENT",
+        "UNSUPPORTED_CLIENT",
+    ];
+    loaded
+        .get("ineligibleTiers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(16)
+        .map(|tier| diagnostic_enum(tier.get("reasonCode"), REASONS))
+        .collect()
+}
+
+fn diagnostic_enum(value: Option<&Value>, known: &'static [&'static str]) -> &'static str {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return "absent";
+    };
+    if let Some(code) = value.as_str() {
+        known
+            .iter()
+            .copied()
+            .find(|&known| known == code)
+            .unwrap_or("other")
+    } else {
+        value
+            .as_u64()
+            .and_then(|index| usize::try_from(index).ok())
+            .and_then(|index| known.get(index).copied())
+            .unwrap_or("other")
+    }
+}
+
+fn load_verification_error(value: &Value) -> Option<SubscriptionError> {
+    if value.get("currentTier").is_some_and(Value::is_object) {
+        return None;
+    }
+    let blocked = value
+        .get("ineligibleTiers")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|tier| tier["reasonCode"] == "VALIDATION_REQUIRED")?;
+    Some(SubscriptionError::verification_required(
+        blocked.get("validationUrl").and_then(Value::as_str),
+    ))
+}
+
+fn completed_onboarding_error(value: &Value, endpoint: &str) -> Option<SubscriptionError> {
+    let error = value.get("error").filter(|error| !error.is_null())?;
+    // Long-running operations use google.rpc.Status (7 = PERMISSION_DENIED).
+    // Some HTTP adapters retain its corresponding HTTP status code instead.
+    if matches!(error.get("code").and_then(Value::as_u64), Some(7 | 403)) {
+        if let (Ok(source), Ok(body)) = (
+            reqwest::Url::parse(endpoint),
+            serde_json::to_vec(&json!({"error": error})),
+        ) {
+            if let Some(error) =
+                google_verification_error(reqwest::StatusCode::FORBIDDEN, &source, &body)
+            {
+                return Some(error);
+            }
+        }
+    }
+    Some(SubscriptionError::InvalidImport(
+        "Google account onboarding failed",
+    ))
+}
+
 fn project_id(value: &Value) -> Option<String> {
     ["cloudaicompanionProject", "projectId", "project"]
         .into_iter()
@@ -355,6 +491,43 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn onboarding_diagnostics_only_contain_known_categories() {
+        let loaded = json!({"ineligibleTiers": [
+            {"reasonCode":"VALIDATION_REQUIRED","validationUrl":"https://accounts.google.com/signin/continue?private=value"},
+            {"reasonCode":"GOOGLE_TOS_NOT_SUPPORTED_BY_CLIENT"},
+            {"reasonCode":"UNSUPPORTED_CLIENT"},
+            {"reasonCode":"private-provider-value"},
+            {"reasonMessage":"private-provider-message"}
+        ]});
+        assert_eq!(
+            ineligible_reason_categories(&loaded),
+            vec![
+                "VALIDATION_REQUIRED",
+                "GOOGLE_TOS_NOT_SUPPORTED_BY_CLIENT",
+                "UNSUPPORTED_CLIENT",
+                "other",
+                "absent"
+            ]
+        );
+        assert_eq!(activation_tier_category("private-plan"), "other");
+        assert_eq!(
+            diagnostic_enum(Some(&json!(2)), &["DEFAULT", "NOTICE", "WARNING"]),
+            "WARNING"
+        );
+        assert_eq!(
+            diagnostic_enum(Some(&json!(999)), &["DEFAULT", "NOTICE", "WARNING"]),
+            "other"
+        );
+        assert_eq!(
+            diagnostic_enum(
+                Some(&json!("private-status")),
+                &["DEFAULT", "NOTICE", "WARNING"]
+            ),
+            "other"
+        );
+    }
 
     #[tokio::test]
     async fn google_code_exchange_profiles_and_onboards_a_managed_project() {
@@ -480,6 +653,269 @@ mod tests {
         assert_eq!(tokens["access_token"], "fixture-rotated");
         task.abort();
         let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn antigravity_onboarding_separates_activation_tier_from_paid_plan() {
+        let loaded = Arc::new(std::sync::Mutex::new(Value::Null));
+        let worker_loaded = loaded.clone();
+        let requested = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let worker_requested = requested.clone();
+        let app = axum::Router::new()
+            .route(
+                "/v1internal:loadCodeAssist",
+                axum::routing::post(move || {
+                    let loaded = worker_loaded.clone();
+                    async move { axum::Json(loaded.lock().unwrap().clone()) }
+                }),
+            )
+            .route(
+                "/daily:onboardUser",
+                axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                    let requested = worker_requested.clone();
+                    async move {
+                        requested
+                            .lock()
+                            .unwrap()
+                            .push(body["tier_id"].as_str().unwrap().to_owned());
+                        axum::Json(json!({
+                            "done": true,
+                            "response": {"cloudaicompanionProject": {"id": "fixture-project"}}
+                        }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let directory = tempfile::tempdir().unwrap();
+        let mut google = GoogleOAuth::load(
+            reqwest::Client::new(),
+            &directory.path().join("absent.json"),
+        );
+        google.codeassist_url = format!("{endpoint}/v1internal");
+        google.daily_url = format!("{endpoint}/daily");
+        google.poll_delay = Duration::ZERO;
+
+        for (response, expected_tier) in [
+            (
+                json!({"currentTier":{"id":"standard-tier"},"paidTier":{"id":"g1-pro-tier"}}),
+                "standard-tier",
+            ),
+            (json!({"paidTier":{"id":"g1-pro-tier"}}), "free-tier"),
+            (
+                json!({"currentTier":{"id":"standard-tier"},"paidTier":{"id":"g1-pro-tier"},"allowedTiers":[{"id":"free-tier","isDefault":true}]}),
+                "free-tier",
+            ),
+        ] {
+            *loaded.lock().unwrap() = response;
+            let (project, plan) = google
+                .onboard(SubscriptionProvider::Antigravity, "fixture-access", None)
+                .await
+                .unwrap();
+            assert_eq!(requested.lock().unwrap().last().unwrap(), expected_tier);
+            assert_eq!(project, "fixture-project");
+            assert_eq!(plan.as_deref(), Some("g1-pro-tier"));
+        }
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn completed_onboarding_without_a_project_is_an_activation_failure() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker_calls = calls.clone();
+        let app = axum::Router::new()
+            .route(
+                "/v1internal:loadCodeAssist",
+                axum::routing::post(|| async {
+                    axum::Json(json!({"currentTier": {"id": "standard-tier"}}))
+                }),
+            )
+            .route(
+                "/daily:onboardUser",
+                axum::routing::post(move || {
+                    let calls = worker_calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(json!({"done": true, "response": {"private": "fixture-secret"}}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let directory = tempfile::tempdir().unwrap();
+        let mut google = GoogleOAuth::load(
+            reqwest::Client::new(),
+            &directory.path().join("absent.json"),
+        );
+        google.codeassist_url = format!("{endpoint}/v1internal");
+        google.daily_url = format!("{endpoint}/daily");
+        google.poll_delay = Duration::ZERO;
+
+        let error = google
+            .onboard(SubscriptionProvider::Antigravity, "fixture-access", None)
+            .await
+            .unwrap_err();
+        task.abort();
+        let _ = task.await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            error.to_string(),
+            "Google did not return a Cloud project for this account; check account setup in Antigravity"
+        );
+        assert!(!format!("{error:?}").contains("fixture-secret"));
+    }
+
+    #[tokio::test]
+    async fn google_load_verification_stops_before_onboarding_without_exposing_provider_data() {
+        let verification_url =
+            "https://accounts.google.com/signin/continue?fixture=verification-challenge";
+        let loaded = Arc::new(std::sync::Mutex::new(Value::Null));
+        let worker_loaded = loaded.clone();
+        let onboard_calls = Arc::new(AtomicUsize::new(0));
+        let worker_calls = onboard_calls.clone();
+        let app = axum::Router::new()
+            .route(
+                "/v1internal:loadCodeAssist",
+                axum::routing::post(move || {
+                    let loaded = worker_loaded.clone();
+                    async move { axum::Json(loaded.lock().unwrap().clone()) }
+                }),
+            )
+            .route(
+                "/daily:onboardUser",
+                axum::routing::post(move || {
+                    let calls = worker_calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(json!({
+                            "done": true,
+                            "response": {"cloudaicompanionProject": "fixture-project"}
+                        }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut google = GoogleOAuth::load(
+            reqwest::Client::new(),
+            &directory.path().join("absent.json"),
+        );
+        google.codeassist_url = format!("{endpoint}/v1internal");
+        google.daily_url = format!("{endpoint}/daily");
+        google.poll_delay = Duration::ZERO;
+
+        for provider in [
+            SubscriptionProvider::Antigravity,
+            SubscriptionProvider::Gemini,
+        ] {
+            for url in [
+                Some(verification_url),
+                Some("https://evil.example/challenge"),
+                None,
+            ] {
+                *loaded.lock().unwrap() = json!({
+                    "currentTier": null,
+                    "ineligibleTiers": [{
+                        "reasonCode": "VALIDATION_REQUIRED",
+                        "reasonMessage": "provider-body-private",
+                        "validationUrl": url
+                    }]
+                });
+                let error = google
+                    .onboard(provider, "fixture-access", None)
+                    .await
+                    .unwrap_err();
+                assert!(error.is_verification_required());
+                assert_eq!(
+                    error.verification_url(),
+                    url.filter(|url| *url == verification_url)
+                );
+                for rendered in [error.to_string(), format!("{error:?}")] {
+                    assert!(!rendered.contains("provider-body-private"));
+                    assert!(!rendered.contains("verification-challenge"));
+                    assert!(!rendered.contains("evil.example"));
+                }
+            }
+        }
+        assert_eq!(onboard_calls.load(Ordering::SeqCst), 0);
+
+        // Eligibility for one tier can coexist with a verification gate for another.
+        // Keep the current eligible account connected, as Google's setup does.
+        for paid_tier in [Value::Null, json!({})] {
+            *loaded.lock().unwrap() = json!({
+                "currentTier": {"id": "standard-tier"},
+                "paidTier": paid_tier,
+                "cloudaicompanionProject": "fixture-existing-project",
+                "ineligibleTiers": [{
+                    "reasonCode": "VALIDATION_REQUIRED",
+                    "validationUrl": verification_url
+                }]
+            });
+            let result = google
+                .onboard(SubscriptionProvider::Antigravity, "fixture-access", None)
+                .await
+                .unwrap();
+            assert_eq!(
+                result,
+                (
+                    "fixture-existing-project".into(),
+                    Some("standard-tier".into())
+                )
+            );
+        }
+        assert_eq!(onboard_calls.load(Ordering::SeqCst), 0);
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[test]
+    fn google_completed_onboarding_classifies_only_trusted_permission_verification() {
+        let source = "https://daily-cloudcode-pa.googleapis.com/v1internal:onboardUser";
+        let verification_url = "https://accounts.google.com/signin/continue?fixture=challenge";
+        for code in [7, 403] {
+            let operation = json!({
+                "done": true,
+                "error": {
+                    "code": code,
+                    "message": "provider-body-private",
+                    "details": [{
+                        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                        "reason": "VALIDATION_REQUIRED",
+                        "domain": "cloudcode-pa.googleapis.com",
+                        "metadata": {"validation_link": verification_url}
+                    }]
+                }
+            });
+            let error = completed_onboarding_error(&operation, source).unwrap();
+            assert!(error.is_verification_required());
+            assert_eq!(error.verification_url(), Some(verification_url));
+            assert!(!error.to_string().contains("provider-body-private"));
+            assert!(!format!("{error:?}").contains("fixture=challenge"));
+
+            let error =
+                completed_onboarding_error(&operation, "https://evil.example/onboardUser").unwrap();
+            assert!(matches!(
+                error,
+                SubscriptionError::InvalidImport("Google account onboarding failed")
+            ));
+            let mut non_permission = operation;
+            non_permission["error"]["code"] = json!(13);
+            let error = completed_onboarding_error(&non_permission, source).unwrap();
+            assert!(matches!(
+                error,
+                SubscriptionError::InvalidImport("Google account onboarding failed")
+            ));
+        }
+        assert!(
+            completed_onboarding_error(&json!({"done": true, "response": {}}), source).is_none()
+        );
     }
 
     #[test]

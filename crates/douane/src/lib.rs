@@ -24,6 +24,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/accounts", get(management::accounts))
         .route("/accounts/import", post(management::import))
         .route(
+            "/accounts/{id}/verification",
+            get(management::account_verification),
+        )
+        .route(
             "/accounts/{id}",
             patch(management::update_account).delete(management::delete_account),
         )
@@ -50,6 +54,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/oauth/start", post(management::oauth_start))
         .route("/oauth/callback", post(management::oauth_callback))
         .route("/oauth/{id}", get(management::oauth_status))
+        .route(
+            "/oauth/{id}/verification",
+            get(management::oauth_verification),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             management::guard,

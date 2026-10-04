@@ -47,11 +47,19 @@ The dashboard starts with live empty states. Add accounts through Connecter un c
 - Grok uses device authorization. Enter the displayed code on the provider's page; the dashboard polls until the account is connected or the authorization expires.
 - OpenCode Go accepts the subscription bearer credential through the manual form. Its default upstream is `https://opencode.ai/zen/go`.
 - JSON import accepts native provider credential objects and supported CLIProxyAPI auth files. Drop files into the dashboard or select them in the connection dialog. Imports report each rejected file.
-- Gemini and Antigravity OAuth become available when their runtime OAuth client metadata is configured. Other supported imported account types include Kimi, Qwen and OpenAI-compatible upstreams.
+- Antigravity OAuth becomes available when its runtime OAuth client metadata is configured. Existing Gemini credential imports remain supported. Other imported account types include Kimi, Qwen and OpenAI-compatible upstreams.
 
 Google OAuth reads `oauth-clients.json` from the parent of `auth_dir`, outside the account credential directory. The object may contain `gemini` and `antigravity` entries with `client_id`, `client_secret` and optional `project_id`. Alternatively set `DOUANE_GEMINI_CLIENT_ID`, `DOUANE_GEMINI_CLIENT_SECRET`, `DOUANE_GEMINI_PROJECT_ID`, or the corresponding `DOUANE_ANTIGRAVITY_*` variables. Environment values take precedence. Restart after changing this startup configuration. The dashboard obtains OAuth availability from the service.
 
 Provider features depend on the account, plan and upstream. An unavailable quota stays unknown; douane does not fabricate an allowance. Credentials remain in local account files. SQLite stores request metadata, status, latency and token/cache counters, without conversation bodies or credential values. Click an account name to rename it. Emails start blurred and can be revealed individually.
+
+### Google account eligibility and verification
+
+Antigravity requires an eligible Google account. Google currently requires users to be at least 18 and in a supported region; its [FAQ](https://antigravity.google/docs/faq) explains eligibility and age verification. A paid subscription alone does not establish eligibility.
+
+If Google requests account verification, use Vérifier le compte Google in the account's quota card or connection dialog. The action opens Google's supplied verification page. After completing it, refresh the existing account's quotas or start a fresh connection for an account that has not yet been added.
+
+An incomplete activation returns `google_project_unavailable` when Google supplies no usable Cloud project. Check account eligibility before retrying. The connection dialog clears the consumed callback and offers a new authorization attempt; each retry needs its own callback URL. The error alone does not identify the eligibility reason. Provider diagnostics retain only known reason/status categories and structural flags, excluding tokens, account identifiers, challenge URLs and provider message text.
 
 ## Use a client
 
@@ -68,7 +76,7 @@ curl http://127.0.0.1:8787/v1/chat/completions \
   -d '{"model":"<model-id-from-v1-models>","messages":[{"role":"user","content":"Hello"}],"stream":true}'
 ```
 
-Boite and other OpenAI-compatible clients can use the same base URL, placeholder key and provider-prefixed model ID. Anthropic-compatible clients can call `/v1/messages`.
+Boite and other OpenAI-compatible clients can use the same base URL, placeholder key and provider-prefixed model ID. Boite's optional subscription proxy configuration also accepts the dashboard URL: it discovers proxy models and opens the configured dashboard from Limits. Anthropic-compatible clients can call `/v1/messages`.
 
 For Claude Code, set `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` and `ANTHROPIC_AUTH_TOKEN=douane`, then select a connected Claude model. Claude Code adds `/v1/messages` to the base URL. The dashboard's Configurer un outil page provides the client settings.
 
@@ -139,7 +147,7 @@ pnpm build
 Commit the refreshed `dash/build` alongside frontend source changes. Build Rust afterward to embed those assets. `pnpm dev` runs the dashboard development server; it needs the management API at the same origin or a proxy for `/admin/api`.
 
 ```sh
-cargo test --workspace --locked
+cargo test --workspace --all-targets --locked -j 8
 ```
 
 CI checks Rust on the declared minimum version and validates/builds Svelte. These checks use local test upstreams; they do not prove that a real subscription is authorized or that a provider has enabled a particular model for an account.

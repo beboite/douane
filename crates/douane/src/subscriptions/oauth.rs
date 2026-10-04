@@ -30,14 +30,18 @@ pub struct OAuthAttempt {
     pub status: String,
     pub account_id: Option<String>,
     pub error: Option<String>,
+    pub error_code: Option<&'static str>,
     pub user_code: Option<String>,
     pub interval: Option<u64>,
+    pub verification_required: bool,
+    pub verification_available: bool,
 }
 
 struct Pending {
     public: OAuthAttempt,
     verifier: String,
     device: Option<DeviceFlow>,
+    verification_url: Option<String>,
 }
 
 #[derive(Clone)]
@@ -150,13 +154,17 @@ impl OAuthManager {
             status: "pending".into(),
             account_id: None,
             error: None,
+            error_code: None,
             user_code: None,
             interval: None,
+            verification_required: false,
+            verification_available: false,
         };
         self.save_attempt(Pending {
             public: attempt.clone(),
             verifier,
             device: None,
+            verification_url: None,
         })
         .await;
         Ok(attempt)
@@ -194,13 +202,17 @@ impl OAuthManager {
             status: "pending".into(),
             account_id: None,
             error: None,
+            error_code: None,
             user_code: None,
             interval: None,
+            verification_required: false,
+            verification_available: false,
         };
         self.save_attempt(Pending {
             public: attempt.clone(),
             verifier,
             device: None,
+            verification_url: None,
         })
         .await;
         Ok(attempt)
@@ -229,15 +241,34 @@ impl OAuthManager {
         self.poll_device(id).await;
         let mut attempts = self.pending.lock().await;
         let attempt = attempts.get_mut(id)?;
-        if attempt.public.status == "pending"
-            && parse_timestamp(&attempt.public.expires_at)
-                .is_none_or(|t| t <= time::OffsetDateTime::now_utc())
+        if parse_timestamp(&attempt.public.expires_at)
+            .is_none_or(|t| t <= time::OffsetDateTime::now_utc())
         {
-            attempt.public.status = "expired".into();
-            attempt.device = None;
-            attempt.verifier.clear();
+            if attempt.public.status == "pending" {
+                attempt.public.status = "expired".into();
+                attempt.device = None;
+                attempt.verifier.clear();
+            }
+            attempt.verification_url = None;
+            attempt.public.verification_available = false;
         }
         Some(attempt.public.clone())
+    }
+
+    pub async fn verification_url(&self, id: &str) -> Option<String> {
+        let mut attempts = self.pending.lock().await;
+        let attempt = attempts.get_mut(id)?;
+        if parse_timestamp(&attempt.public.expires_at)
+            .is_none_or(|expires| expires <= time::OffsetDateTime::now_utc())
+        {
+            attempt.verification_url = None;
+            attempt.public.verification_available = false;
+            return None;
+        }
+        if attempt.public.status != "error" || !attempt.public.verification_required {
+            return None;
+        }
+        attempt.verification_url.clone()
     }
 
     pub async fn complete(
@@ -333,10 +364,27 @@ impl OAuthManager {
         if let Some(attempt) = self.pending.lock().await.get_mut(id) {
             attempt.device = None;
             attempt.verifier.clear();
+            attempt.verification_url = result
+                .as_ref()
+                .err()
+                .and_then(SubscriptionError::verification_url)
+                .map(str::to_owned);
+            attempt.public.verification_required = result
+                .as_ref()
+                .err()
+                .is_some_and(SubscriptionError::is_verification_required);
+            attempt.public.verification_available = attempt.verification_url.is_some();
+            attempt.public.error_code = match result {
+                Err(SubscriptionError::GoogleProjectUnavailable) => {
+                    Some("google_project_unavailable")
+                }
+                _ => None,
+            };
             match result {
                 Ok(account) => {
                     attempt.public.status = "complete".into();
                     attempt.public.account_id = Some(account.id.clone());
+                    attempt.public.error = None;
                 }
                 Err(error) => {
                     attempt.public.status = "error".into();
@@ -479,8 +527,11 @@ impl OAuthManager {
             status: "pending".into(),
             account_id: None,
             error: None,
+            error_code: None,
             user_code: Some(user_code),
             interval: Some(interval),
+            verification_required: false,
+            verification_available: false,
         };
         self.save_attempt(Pending {
             public: attempt.clone(),
@@ -491,6 +542,7 @@ impl OAuthManager {
                 next_poll: time::OffsetDateTime::now_utc(),
                 interval,
             }),
+            verification_url: None,
         })
         .await;
         Ok(attempt)
@@ -576,19 +628,114 @@ impl OAuthManager {
 pub(crate) async fn send_json(
     request: reqwest::RequestBuilder,
 ) -> Result<Value, SubscriptionError> {
-    let response = request
+    let mut response = request
         .timeout(Duration::from_secs(30))
         .header("Accept", "application/json")
         .send()
         .await
         .map_err(|_| SubscriptionError::Transport)?;
     if !response.status().is_success() {
-        return Err(SubscriptionError::Upstream(response.status().as_u16()));
+        let status = response.status();
+        let source = response.url().clone();
+        if status == reqwest::StatusCode::FORBIDDEN && is_google_cloudcode_url(&source) {
+            let mut body = Vec::new();
+            loop {
+                match response.chunk().await {
+                    Ok(Some(chunk)) if body.len() + chunk.len() <= GOOGLE_ERROR_BODY_LIMIT => {
+                        body.extend_from_slice(&chunk);
+                    }
+                    Ok(None) => break,
+                    _ => return Err(SubscriptionError::Upstream(status.as_u16())),
+                }
+            }
+            if let Some(error) = google_verification_error(status, &source, &body) {
+                return Err(error);
+            }
+        }
+        return Err(SubscriptionError::Upstream(status.as_u16()));
     }
     response
         .json::<Value>()
         .await
         .map_err(|_| SubscriptionError::InvalidResponse)
+}
+
+const GOOGLE_ERROR_BODY_LIMIT: usize = 65_536;
+
+pub(crate) fn validate_google_verification_url(value: &str) -> Option<String> {
+    if value.len() > 8192
+        || !value.is_ascii()
+        || value
+            .chars()
+            .any(|character| character.is_ascii_control() || character.is_whitespace())
+    {
+        return None;
+    }
+    let suffix = value.strip_prefix("https://accounts.google.com")?;
+    if suffix != "/signin/continue" && !suffix.starts_with("/signin/continue?") {
+        return None;
+    }
+    let url = reqwest::Url::parse(value).ok()?;
+    if url.scheme() != "https"
+        || url.host_str() != Some("accounts.google.com")
+        || url.path() != "/signin/continue"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
+fn is_google_cloudcode_url(url: &reqwest::Url) -> bool {
+    url.scheme() == "https"
+        && matches!(
+            url.host_str(),
+            Some(
+                "cloudcode-pa.googleapis.com"
+                    | "daily-cloudcode-pa.googleapis.com"
+                    | "daily-cloudcode-pa.sandbox.googleapis.com"
+            )
+        )
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none()
+}
+
+pub(crate) fn google_verification_error(
+    status: reqwest::StatusCode,
+    source: &reqwest::Url,
+    body: &[u8],
+) -> Option<SubscriptionError> {
+    if status != reqwest::StatusCode::FORBIDDEN
+        || !is_google_cloudcode_url(source)
+        || body.len() > GOOGLE_ERROR_BODY_LIMIT
+    {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let details = value.get("error")?.get("details")?.as_array()?;
+    let detail = details.iter().find(|detail| {
+        detail["@type"] == "type.googleapis.com/google.rpc.ErrorInfo"
+            && detail["reason"] == "VALIDATION_REQUIRED"
+    })?;
+    let help_url = details
+        .iter()
+        .filter(|detail| detail["@type"] == "type.googleapis.com/google.rpc.Help")
+        .filter_map(|detail| detail.get("links").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|link| link.get("url").and_then(Value::as_str))
+        .find_map(validate_google_verification_url);
+    let url = help_url.or_else(|| {
+        let metadata = detail.get("metadata")?;
+        ["validation_link", "validationUrl", "validation_url"]
+            .into_iter()
+            .filter_map(|key| metadata.get(key).and_then(Value::as_str))
+            .find_map(validate_google_verification_url)
+    });
+    Some(SubscriptionError::verification_required(url.as_deref()))
 }
 
 fn expiry_from_response(value: &Value) -> Option<String> {
@@ -706,6 +853,257 @@ fn validate_xai_endpoint(endpoint: &str) -> Result<String, SubscriptionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn missing_google_project_is_terminal_without_importing_an_account() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(AccountStore::open(directory.path()).unwrap());
+        let manager = OAuthManager::new(reqwest::Client::new(), store.clone());
+        let attempt = manager
+            .start(SubscriptionProvider::Codex, None)
+            .await
+            .unwrap();
+        manager
+            .finish_attempt(
+                &attempt.id,
+                &Err(SubscriptionError::GoogleProjectUnavailable),
+            )
+            .await;
+        let status = manager.status(&attempt.id).await.unwrap();
+        assert_eq!(status.status, "error");
+        assert_eq!(status.error_code, Some("google_project_unavailable"));
+        assert!(!status.verification_required);
+        assert!(!status.verification_available);
+        assert!(status.account_id.is_none());
+        assert!(store.list().await.is_empty());
+        assert!(
+            manager.pending.lock().await[&attempt.id]
+                .verifier
+                .is_empty()
+        );
+        assert!(matches!(
+            manager
+                .complete(&attempt.id, "consumed-code", &attempt.state)
+                .await,
+            Err(SubscriptionError::Expired)
+        ));
+        let retry = manager
+            .start(SubscriptionProvider::Codex, None)
+            .await
+            .unwrap();
+        assert_ne!(retry.id, attempt.id);
+        assert!(retry.error_code.is_none());
+        assert_eq!(retry.status, "pending");
+    }
+
+    #[tokio::test]
+    async fn oauth_verification_is_private_terminal_and_expires_without_persisting_tokens() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(AccountStore::open(directory.path()).unwrap());
+        let manager = OAuthManager::new(reqwest::Client::new(), store.clone());
+        let attempt = manager
+            .start(SubscriptionProvider::Codex, None)
+            .await
+            .unwrap();
+        let challenge = "https://accounts.google.com/signin/continue?challenge=private-fixture";
+        manager
+            .finish_attempt(
+                &attempt.id,
+                &Err(SubscriptionError::verification_required(Some(challenge))),
+            )
+            .await;
+        let status = manager.status(&attempt.id).await.unwrap();
+        assert_eq!(status.status, "error");
+        assert!(status.verification_required);
+        assert!(status.verification_available);
+        assert!(status.account_id.is_none());
+        assert_eq!(
+            manager.verification_url(&attempt.id).await.as_deref(),
+            Some(challenge)
+        );
+        assert!(
+            manager.pending.lock().await[&attempt.id]
+                .verifier
+                .is_empty()
+        );
+        assert!(store.list().await.is_empty());
+        let serialized = serde_json::to_string(&status).unwrap();
+        assert!(!serialized.contains("private-fixture"));
+        assert!(!serialized.contains("signin/continue"));
+        assert!(!format!("{status:?}").contains("private-fixture"));
+        assert!(matches!(
+            manager
+                .complete(&attempt.id, "fixture-code", &attempt.state)
+                .await,
+            Err(SubscriptionError::Expired)
+        ));
+
+        manager
+            .finish_attempt(
+                &attempt.id,
+                &Err(SubscriptionError::verification_required(None)),
+            )
+            .await;
+        let missing = manager.status(&attempt.id).await.unwrap();
+        assert!(missing.verification_required);
+        assert!(!missing.verification_available);
+        assert!(manager.verification_url(&attempt.id).await.is_none());
+
+        manager
+            .finish_attempt(
+                &attempt.id,
+                &Err(SubscriptionError::verification_required(Some(challenge))),
+            )
+            .await;
+        manager
+            .pending
+            .lock()
+            .await
+            .get_mut(&attempt.id)
+            .unwrap()
+            .public
+            .expires_at = "2020-01-01T00:00:00Z".into();
+        let expired = manager.status(&attempt.id).await.unwrap();
+        assert!(expired.verification_required);
+        assert!(!expired.verification_available);
+        assert!(manager.verification_url(&attempt.id).await.is_none());
+        assert!(manager.verification_url("unknown").await.is_none());
+    }
+
+    #[test]
+    fn google_verification_native_reason_is_actionable_and_redacted() {
+        let challenge = "https://accounts.google.com/signin/continue?challenge=private-fixture";
+        let body = serde_json::to_vec(&json!({"error":{
+            "status":"PERMISSION_DENIED",
+            "message":"untrusted private provider message",
+            "details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo",
+                "reason":"VALIDATION_REQUIRED","metadata":{"validationUrl":challenge}}]
+        }}))
+        .unwrap();
+        let source = reqwest::Url::parse(
+            "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+        )
+        .unwrap();
+        let error = google_verification_error(reqwest::StatusCode::FORBIDDEN, &source, &body)
+            .expect("native Google validation reason must survive quota refresh");
+        assert!(error.is_verification_required());
+        assert_eq!(error.verification_url(), Some(challenge));
+        assert!(error.to_string().contains("verification is required"));
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(!rendered.contains("private-fixture"));
+            assert!(!rendered.contains("accounts.google.com"));
+            assert!(!rendered.contains("untrusted private"));
+        }
+    }
+
+    #[test]
+    fn google_verification_help_and_metadata_aliases_preserve_only_valid_actions() {
+        let challenge = "https://accounts.google.com/signin/continue?challenge=private-fixture";
+        let source =
+            reqwest::Url::parse("https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist")
+                .unwrap();
+        for key in ["validation_link", "validationUrl", "validation_url"] {
+            let mut metadata = serde_json::Map::new();
+            metadata.insert(key.into(), json!(challenge));
+            let body = serde_json::to_vec(&json!({"error":{"details":[{
+                "@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"VALIDATION_REQUIRED","metadata":metadata
+            }]}})).unwrap();
+            let error =
+                google_verification_error(reqwest::StatusCode::FORBIDDEN, &source, &body).unwrap();
+            assert_eq!(error.verification_url(), Some(challenge));
+        }
+        for help_url in [challenge, "https://evil.test/challenge"] {
+            let body = serde_json::to_vec(&json!({"error":{"details":[
+                {"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"VALIDATION_REQUIRED"},
+                {"@type":"type.googleapis.com/google.rpc.Help","links":[{"url":help_url,"description":"private provider text"}]}
+            ]}})).unwrap();
+            let error =
+                google_verification_error(reqwest::StatusCode::FORBIDDEN, &source, &body).unwrap();
+            assert!(error.is_verification_required());
+            assert_eq!(
+                error.verification_url(),
+                (help_url == challenge).then_some(challenge)
+            );
+            assert!(!format!("{error:?}").contains("private"));
+        }
+    }
+
+    #[test]
+    fn google_verification_challenge_url_has_an_exact_allowlist() {
+        let good = "https://accounts.google.com/signin/continue?challenge=private-fixture";
+        assert_eq!(
+            validate_google_verification_url(good).as_deref(),
+            Some(good)
+        );
+        let oversized = format!("{good}{}", "x".repeat(8192));
+        for bad in [
+            "http://accounts.google.com/signin/continue",
+            "https://accounts.google.com.evil.test/signin/continue",
+            "https://evil.test/signin/continue",
+            "https://user@accounts.google.com/signin/continue",
+            "https://user:pass@accounts.google.com/signin/continue",
+            "https://accounts.google.com:443/signin/continue",
+            "https://accounts.google.com:8443/signin/continue",
+            "https://accounts.google.com/signin/continue#private-fragment",
+            "https://accounts.google.com/other",
+            "https://accounts.google.com/signin/continue/other",
+            "https://accounts.google.com/signin/./continue",
+            "https://accounts.google.com/signin/continue?challenge=x\n",
+            oversized.as_str(),
+        ] {
+            assert!(validate_google_verification_url(bad).is_none());
+            let error = SubscriptionError::verification_required(Some(bad));
+            assert!(error.is_verification_required());
+            assert!(error.verification_url().is_none());
+        }
+    }
+
+    #[test]
+    fn google_verification_reason_requires_known_host_status_and_structure() {
+        let body = serde_json::to_vec(&json!({"error":{"details":[{
+            "@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"VALIDATION_REQUIRED"
+        }]}}))
+        .unwrap();
+        let known =
+            reqwest::Url::parse("https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist")
+                .unwrap();
+        let error =
+            google_verification_error(reqwest::StatusCode::FORBIDDEN, &known, &body).unwrap();
+        assert!(error.is_verification_required());
+        assert!(error.verification_url().is_none());
+        for host in [
+            "https://cloudcode-pa.googleapis.com.evil.test",
+            "https://evil.test",
+            "http://cloudcode-pa.googleapis.com",
+        ] {
+            let source = reqwest::Url::parse(host).unwrap();
+            assert!(
+                google_verification_error(reqwest::StatusCode::FORBIDDEN, &source, &body).is_none()
+            );
+        }
+        for status in [
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::OK,
+        ] {
+            assert!(google_verification_error(status, &known, &body).is_none());
+        }
+        for invalid in [
+            json!({"error":{"message":"VALIDATION_REQUIRED"}}),
+            json!({"error":{"details":[{"reason":"VALIDATION_REQUIRED"}]}}),
+            json!({"error":{"details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"OTHER"}]}}),
+        ] {
+            let invalid = serde_json::to_vec(&invalid).unwrap();
+            assert!(
+                google_verification_error(reqwest::StatusCode::FORBIDDEN, &known, &invalid)
+                    .is_none()
+            );
+        }
+        let oversized = vec![b' '; 65_537];
+        assert!(
+            google_verification_error(reqwest::StatusCode::FORBIDDEN, &known, &oversized).is_none()
+        );
+    }
 
     #[test]
     fn accepts_pasted_callback_and_claude_fragment_with_state_validation() {

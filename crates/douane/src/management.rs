@@ -4,7 +4,7 @@ use axum::{
     extract::{Path, Query, Request, State},
     http::{StatusCode, header},
     middleware::Next,
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Redirect, Response},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -120,6 +120,38 @@ pub async fn guard(State(state): State<Arc<AppState>>, request: Request, next: N
 
 pub async fn accounts(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({"accounts":state.accounts.list().await}))
+}
+pub async fn account_verification(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    verification_redirect(state.quotas.verification_url(&id).await)
+}
+
+pub async fn oauth_verification(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    verification_redirect(state.oauth.verification_url(&id).await)
+}
+
+fn verification_redirect(url: Option<String>) -> Response {
+    let mut response = match url {
+        Some(url) => Redirect::temporary(&url).into_response(),
+        None => error(
+            StatusCode::NOT_FOUND,
+            "account verification is not available",
+        ),
+    };
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response.headers_mut().insert(
+        header::REFERRER_POLICY,
+        header::HeaderValue::from_static("no-referrer"),
+    );
+    response
 }
 pub async fn import(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
     let files = body
@@ -400,7 +432,6 @@ pub async fn providers(State(state): State<Arc<AppState>>) -> Json<Value> {
         {"id":"opencode_go","name":"OpenCode Go","oauth":false,"quota":true,"docs_url":"https://opencode.ai/docs/go/"},
         {"id":"xai","name":"Grok","oauth":true,"quota":true,"docs_url":"https://grok.com"},
         {"id":"antigravity","name":"Antigravity","oauth":true,"quota":true,"docs_url":"https://antigravity.google"},
-        {"id":"gemini","name":"Gemini","oauth":true,"quota":true,"docs_url":"https://geminicli.com"},
         {"id":"kimi","name":"Kimi","oauth":false,"quota":true,"docs_url":"https://kimi.com/code"},
         {"id":"qwen","name":"Qwen","oauth":false,"quota":false,"docs_url":"https://chat.qwen.ai"},
         {"id":"openai_compatible","name":"Compatible OpenAI","oauth":false,"quota":false,"docs_url":"https://platform.openai.com"}
@@ -539,4 +570,36 @@ pub async fn auth_file_models(
         .map(|m| json!({"id":m.id,"display_name":m.name,"context_length":m.context_length}))
         .collect();
     Json(json!({"models":models}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::BodyExt;
+
+    #[tokio::test]
+    async fn verification_redirect_exposes_challenge_only_as_no_store_location() {
+        let challenge = "https://accounts.google.com/signin/continue?challenge=private-fixture";
+        let response = verification_redirect(Some(challenge.into()));
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(response.headers()[header::LOCATION], challenge);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(response.headers()[header::REFERRER_POLICY], "no-referrer");
+        assert!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .is_empty()
+        );
+
+        let missing = verification_redirect(None);
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert!(!missing.headers().contains_key(header::LOCATION));
+        assert_eq!(missing.headers()[header::CACHE_CONTROL], "no-store");
+        let body = missing.into_body().collect().await.unwrap().to_bytes();
+        assert!(!String::from_utf8_lossy(&body).contains("private-fixture"));
+    }
 }

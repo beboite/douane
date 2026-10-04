@@ -8,7 +8,7 @@
 	import ChevronRight from '@lucide/svelte/icons/chevron-right';
 	import ProviderMark from './provider-mark.svelte';
 	import { copyText } from '$lib/clipboard';
-	import { management, importErrors, type Provider, type OAuthSession } from '$lib/management';
+	import { management, importErrors, type Provider, type OAuthSession, type OAuthStatus } from '$lib/management';
 	let { providers, close, completed, importFiles }: { providers: Provider[]; close: () => void; completed: () => void; importFiles: (files: FileList) => void } = $props();
 	let dialog: HTMLDialogElement;
 	let fileInput = $state<HTMLInputElement>();
@@ -35,12 +35,20 @@
 		finally { pending = false; }
 	}
 	function connected() { success = true; terminal = true; callback = ''; credential = ''; completed(); }
+	function requiredAction(attempt: OAuthSession, result: OAuthStatus) {
+		if (!mounted || session?.id !== attempt.id) return false;
+		if (!result.verification_required && !(attempt.provider === 'antigravity' && result.error_code === 'google_project_unavailable')) return false;
+		session = { ...attempt, error_code: result.error_code, verification_required: result.verification_required, verification_available: result.verification_available };
+		terminal = true; callback = ''; failure = ''; status = '';
+		return true;
+	}
 	async function check(manualCheck = true) {
 		const attempt = session; if (!attempt || pending || terminal) return attempt?.interval ?? 5;
 		pending = true; if (manualCheck) failure = '';
 		try {
 			const result = await management.oauth(attempt.id);
 			if (!mounted || session?.id !== attempt.id) return 5;
+			if (requiredAction(attempt, result)) return 5;
 			if ((result.account_id || result.account?.id) && ['complete','completed','connected','success'].includes(result.status)) connected();
 			else if (result.status === 'expired') { terminal = true; failure = 'Cette connexion a expiré. Choisissez le fournisseur pour recommencer.'; }
 			else if (result.error || result.status === 'error') { terminal = true; failure = result.error || "Le fournisseur a refusé la connexion. Recommencez pour réessayer."; }
@@ -61,7 +69,17 @@
 		event.preventDefault(); const attempt = session; if (!attempt || pending) return;
 		pending = true; failure = '';
 		try { const result = await management.oauthCallback(attempt.id,callback.trim(),attempt.state); if (!result.account?.id) throw new Error("Le serveur n'a pas confirmé l'ajout du compte."); if (mounted) connected(); }
-		catch (error) { if (mounted) failure = (error as Error).message; }
+		catch (error) {
+			if (mounted) failure = (error as Error).message;
+			try {
+				const result = await management.oauth(attempt.id);
+				if (mounted && session?.id === attempt.id) {
+					terminal = ['error','expired'].includes(result.status);
+					if (terminal) callback = '';
+					requiredAction(attempt, result);
+				}
+			} catch { /* Keep the original connection error if status is unavailable. */ }
+		}
 		finally { pending = false; }
 	}
 	async function saveCredential(event: SubmitEvent) {
@@ -79,12 +97,29 @@
 	{#if success}
 		<div class="connection-success"><span><Check size={24}/></span><h3>Compte connecté</h3><p>Votre abonnement est maintenant disponible dans douane.</p><button class="button primary" onclick={close}>Voir mes comptes</button></div>
 	{:else if session}
+		{#if session.verification_required}
+			<div class="oauth-flow">
+				<p>Google demande de vérifier ce compte avant la connexion.</p>
+				{#if session.verification_available}<a class="button primary" href={`/admin/api/oauth/${encodeURIComponent(session.id)}/verification`} target="_blank" rel="noopener noreferrer" data-sveltekit-reload>Vérifier le compte Google<ExternalLink size={16}/></a>{:else}<p>Ouvrez Antigravity avec ce compte pour terminer la vérification.</p>{/if}
+				<p>Une fois la vérification terminée, recommencez la connexion.</p>
+				<div class="flow-controls"><button class="button" disabled={pending} onclick={() => session && start(session.provider)}>Recommencer la connexion</button><button class="button subtle" disabled={pending} onclick={reset}>Choisir un autre fournisseur</button></div>
+			</div>
+		{:else if session.provider === 'antigravity' && session.error_code === 'google_project_unavailable'}
+			<div class="oauth-flow" role="status">
+				<h3>Activation Antigravity incomplète</h3>
+				<p>La connexion Google a réussi, mais Google n'a pas fourni le projet nécessaire à ce compte.</p>
+				<p>Pour une première utilisation, ouvrez l'application Antigravity avec ce compte et terminez l'accueil. Si Antigravity refuse aussi la connexion, suivez le message affiché par Google.</p>
+				<a class="button" href="https://antigravity.google/docs/getting-started" target="_blank" rel="noopener noreferrer external">Ouvrir le guide Antigravity<ExternalLink size={16}/></a>
+				<div class="flow-controls"><button class="button primary" disabled={pending} onclick={() => session && start(session.provider)}>Recommencer la connexion</button><button class="button subtle" disabled={pending} onclick={reset}>Choisir un autre fournisseur</button></div>
+			</div>
+		{:else}
 		<div class="oauth-flow">
 			{#if session.user_code}<p>Ouvrez la page Grok et saisissez ce code pour autoriser la connexion.</p><div class="device-code"><span>{session.user_code}</span><button class="icon-button" onclick={copyCode} aria-label="Copier le code">{#if codeCopied}<Check size={16}/>{:else}<Copy size={16}/>{/if}</button></div>{:else}<p>Ouvrez la page du fournisseur et autorisez la connexion.</p>{/if}
 			<a class="button primary" href={session.url} target="_blank" rel="noopener noreferrer external" data-sveltekit-reload>Ouvrir la connexion<ExternalLink size={14}/></a>
 			{#if !session.user_code}<p class="flow-hint">Si le retour vers localhost ne charge pas, copiez son URL complète. Claude peut aussi afficher un code à coller ici.</p><form onsubmit={finish}><label for="callback">URL de retour ou code de connexion</label><input id="callback" type="text" placeholder="URL de retour ou code#state" bind:value={callback} required maxlength="8192" autocomplete="off" spellcheck="false"/><button class="button primary" disabled={pending || terminal || !callback.trim()}>Terminer la connexion</button></form>{/if}
 			<div class="flow-controls"><button class="button" disabled={pending || terminal} onclick={() => check()}>Vérifier la connexion</button><button class="button subtle" disabled={pending} onclick={reset}>Choisir un autre fournisseur</button></div>{#if status}<p class="muted small" role="status">{status}</p>{/if}
 		</div>
+		{/if}
 	{:else if manual}
 		<div class="oauth-flow"><p>Ajoutez le jeton de connexion de votre abonnement. Il disparaît de ce formulaire après l'enregistrement.</p><form onsubmit={saveCredential}><label for="account-name">Nom du compte</label><input id="account-name" bind:value={accountName} placeholder="Mon abonnement" required/><label for="credential">Jeton de connexion</label><input id="credential" type="password" bind:value={credential} required autocomplete="off" spellcheck="false"/><label for="endpoint">Adresse du fournisseur</label><input id="endpoint" type="url" bind:value={endpoint} required placeholder="https://votre-fournisseur/v1"/><button class="button primary" disabled={pending || !credential.trim()}>Ajouter le compte</button></form><button class="button subtle" style="margin-top:15px" disabled={pending} onclick={reset}>Choisir un autre fournisseur</button></div>
 	{:else}

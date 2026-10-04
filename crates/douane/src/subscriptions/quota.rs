@@ -30,6 +30,10 @@ pub struct QuotaSnapshot {
     pub subscription: Option<SubscriptionTier>,
     #[serde(default)]
     pub credits: Vec<QuotaCredits>,
+    #[serde(default)]
+    pub verification_required: bool,
+    #[serde(default)]
+    pub verification_available: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -85,6 +89,7 @@ pub struct QuotaService {
     store: Arc<AccountStore>,
     oauth: Arc<OAuthManager>,
     cache: RwLock<BTreeMap<String, QuotaSnapshot>>,
+    verification_urls: RwLock<BTreeMap<String, String>>,
 }
 
 impl QuotaService {
@@ -103,6 +108,7 @@ impl QuotaService {
             store,
             oauth,
             cache: RwLock::new(BTreeMap::new()),
+            verification_urls: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -127,6 +133,14 @@ impl QuotaService {
         self.cache.read().await.get(id).cloned()
     }
 
+    pub async fn verification_url(&self, id: &str) -> Option<String> {
+        if self.store.get(id).await.is_none() {
+            self.verification_urls.write().await.remove(id);
+            return None;
+        }
+        self.verification_urls.read().await.get(id).cloned()
+    }
+
     pub async fn refresh(&self, id: &str) -> Result<QuotaSnapshot, SubscriptionError> {
         let account = self
             .store
@@ -137,6 +151,25 @@ impl QuotaService {
             Ok(credential) => self.fetch(&credential).await,
             Err(error) => Err(error),
         };
+        self.complete_refresh(id, &account, result).await
+    }
+
+    async fn complete_refresh(
+        &self,
+        id: &str,
+        account: &AccountCredential,
+        result: Result<Observation, SubscriptionError>,
+    ) -> Result<QuotaSnapshot, SubscriptionError> {
+        let verification_url = result
+            .as_ref()
+            .err()
+            .and_then(SubscriptionError::verification_url)
+            .map(str::to_owned);
+        let verification_required = result
+            .as_ref()
+            .err()
+            .is_some_and(SubscriptionError::is_verification_required);
+        let verification_available = verification_url.is_some();
         let snapshot = match result {
             Ok(observation) => {
                 let snapshot = QuotaSnapshot {
@@ -149,6 +182,8 @@ impl QuotaService {
                         .subscription
                         .or_else(|| account.summary().subscription),
                     credits: observation.credits,
+                    verification_required: false,
+                    verification_available: false,
                 };
                 self.apply_observation(id, &snapshot, observation.plan, &account.updated_at)
                     .await?;
@@ -182,10 +217,19 @@ impl QuotaService {
                         .and_then(|v| v.subscription.clone())
                         .or_else(|| account.summary().subscription),
                     credits: previous.map(|v| v.credits).unwrap_or_default(),
+                    verification_required,
+                    verification_available,
                 }
             }
         };
-        self.cache.write().await.insert(id.into(), snapshot.clone());
+        let mut cache = self.cache.write().await;
+        let mut verification_urls = self.verification_urls.write().await;
+        if let Some(url) = verification_url {
+            verification_urls.insert(id.into(), url);
+        } else {
+            verification_urls.remove(id);
+        }
+        cache.insert(id.into(), snapshot.clone());
         Ok(snapshot)
     }
 
@@ -974,6 +1018,98 @@ mod tests {
         parse_timestamp("2026-10-03T12:00:00Z").unwrap()
     }
 
+    #[tokio::test]
+    async fn verification_action_lifecycle_preserves_observations_and_clears_on_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(AccountStore::open(directory.path()).unwrap());
+        let summary = store.import(json!({"type":"antigravity","access_token":"fixture","project_id":"fixture-project"}), None).await.unwrap();
+        let account = store.get(&summary.id).await.unwrap();
+        let service = QuotaService::new(reqwest::Client::new(), store.clone());
+        let observation = || Observation {
+            windows: parse_antigravity(
+                &json!({"groups":[{"displayName":"Models","buckets":[{"remainingFraction":0.3,"resetTime":"2030-10-04T12:00:00Z"}]}]}),
+                observed(),
+            ),
+            plan: None,
+            subscription: None,
+            credits: Vec::new(),
+            organization_id: None,
+        };
+        let first = service
+            .complete_refresh(&summary.id, &account, Ok(observation()))
+            .await
+            .unwrap();
+        assert!(!first.verification_required);
+        assert!(!first.verification_available);
+        assert!(service.verification_url(&summary.id).await.is_none());
+
+        let challenge = "https://accounts.google.com/signin/continue?challenge=private-fixture";
+        let blocked = service
+            .complete_refresh(
+                &summary.id,
+                &account,
+                Err(SubscriptionError::verification_required(Some(challenge))),
+            )
+            .await
+            .unwrap();
+        assert!(blocked.verification_required);
+        assert!(blocked.verification_available);
+        assert_eq!(blocked.updated_at, first.updated_at);
+        assert_eq!(blocked.windows[0].remaining_percent, Some(30.0));
+        assert_eq!(
+            service.verification_url(&summary.id).await.as_deref(),
+            Some(challenge)
+        );
+        let public = serde_json::to_string(&service.list().await).unwrap();
+        assert!(!public.contains("private-fixture"));
+        assert!(!public.contains("accounts.google.com"));
+        assert!(!format!("{blocked:?}").contains("private-fixture"));
+
+        let without_action = service
+            .complete_refresh(
+                &summary.id,
+                &account,
+                Err(SubscriptionError::verification_required(Some(
+                    "https://evil.test/challenge",
+                ))),
+            )
+            .await
+            .unwrap();
+        assert!(without_action.verification_required);
+        assert!(!without_action.verification_available);
+        assert!(service.verification_url(&summary.id).await.is_none());
+
+        service
+            .complete_refresh(
+                &summary.id,
+                &account,
+                Err(SubscriptionError::verification_required(Some(challenge))),
+            )
+            .await
+            .unwrap();
+        let recovered = service
+            .complete_refresh(&summary.id, &account, Ok(observation()))
+            .await
+            .unwrap();
+        assert!(!recovered.verification_required);
+        assert!(!recovered.verification_available);
+        assert!(recovered.error.is_none());
+        assert!(service.verification_url(&summary.id).await.is_none());
+
+        service
+            .complete_refresh(
+                &summary.id,
+                &account,
+                Err(SubscriptionError::verification_required(Some(challenge))),
+            )
+            .await
+            .unwrap();
+        store.delete(&summary.id).await.unwrap();
+        assert!(service.verification_url(&summary.id).await.is_none());
+        assert!(service.list().await.is_empty());
+        assert!(service.verification_urls.read().await.is_empty());
+    }
+
     #[test]
     fn credits_preserve_provider_units_balances_and_unknown_limits() {
         let codex = parse_credits(
@@ -1013,6 +1149,8 @@ mod tests {
         let old: QuotaSnapshot = serde_json::from_value(json!({"account_id":"fixture","provider":"codex","windows":[],"updated_at":"2026-10-03T12:00:00Z","error":null})).unwrap();
         assert!(old.subscription.is_none());
         assert!(old.credits.is_empty());
+        assert!(!old.verification_required);
+        assert!(!old.verification_available);
         assert!(
             parse_credits(
                 SubscriptionProvider::OpencodeGo,
@@ -1084,6 +1222,8 @@ mod tests {
             error: None,
             subscription: None,
             credits: Vec::new(),
+            verification_required: false,
+            verification_available: false,
         };
         assert_eq!(snapshot.weekly_reset(), None);
         assert_eq!(snapshot.weekly_remaining_percent(), None);
@@ -1125,6 +1265,8 @@ mod tests {
             error: None,
             subscription: None,
             credits: Vec::new(),
+            verification_required: false,
+            verification_available: false,
         };
         assert_eq!(snapshot.weekly_remaining_percent(), Some(94.0));
         assert_eq!(snapshot.weekly_reset(), Some("2026-10-09T21:16:33Z"));
@@ -1209,6 +1351,8 @@ mod tests {
             error: None,
             subscription: None,
             credits: Vec::new(),
+            verification_required: false,
+            verification_available: false,
         };
         store
             .mark_error(&account.id, Some("fixture transient failure".into()))
@@ -1295,6 +1439,8 @@ mod tests {
             error: None,
             subscription: None,
             credits: Vec::new(),
+            verification_required: false,
+            verification_available: false,
         };
         service
             .apply_observation(&account.id, &snapshot, None, &account.updated_at)
