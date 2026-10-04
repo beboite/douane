@@ -28,6 +28,9 @@ request_timeout_seconds = 180
 
 [settings.provider_strategies]
 codex = "reset-first"
+
+[settings.quota_display]
+antigravity = "average"
 ```
 
 ```sh
@@ -78,12 +81,15 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 
 Boite and other OpenAI-compatible clients can use the same base URL, placeholder key and provider-prefixed model ID. Boite's optional subscription proxy configuration also accepts the dashboard URL: it discovers proxy models and opens the configured dashboard from Limits. Anthropic-compatible clients can call `/v1/messages`.
 
+`GET /v1/quotas` gives Boite the quotas it draws as native bars. It accepts the same client authentication as `/v1/models` and lists each provider that has accounts: Claude, Codex and Antigravity first, then the others. Each provider is shown per account by default. On the Quotas page, Dans Boite / les clients can switch a provider to Moyenne des comptes. That provider then returns one entry: the mean remaining percentage of each window, the earliest reset and summed credits (`null` when an account does not report a value). The choice is stored in `settings.quota_display`. Account labels mask email domains, and the response contains no credentials or provider bodies. A Douane version without this route answers 404, and Boite then falls back to the dashboard.
+
 For Claude Code, set `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` and `ANTHROPIC_AUTH_TOKEN=douane`, then select a connected Claude model. Claude Code adds `/v1/messages` to the base URL. The dashboard's Configurer un outil page provides the client settings.
 
 | Endpoint | Support |
 | --- | --- |
 | `GET /health` | Service health |
 | `GET /v1/models` | Available models |
+| `GET /v1/quotas` | Quotas per provider, per account or averaged, for Boite |
 | `POST /v1/chat/completions` | Chat Completions, including streaming |
 | `POST /v1/messages` | Anthropic Messages, including streaming |
 | `POST /v1/responses` | Responses, including streaming |

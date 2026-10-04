@@ -35,6 +35,16 @@ pub struct Settings {
     pub quota_refresh_seconds: u64,
     pub request_timeout_seconds: u64,
     pub default_provider: Option<String>,
+    /// How `/v1/quotas` presents each provider's accounts. Absent means per account.
+    pub quota_display: BTreeMap<String, QuotaDisplay>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QuotaDisplay {
+    #[default]
+    Accounts,
+    Average,
 }
 
 impl Default for Server {
@@ -56,6 +66,7 @@ impl Default for Settings {
             quota_refresh_seconds: 300,
             request_timeout_seconds: 180,
             default_provider: None,
+            quota_display: BTreeMap::new(),
         }
     }
 }
@@ -123,7 +134,22 @@ impl Settings {
                 bail!("unknown default provider");
             }
         }
+        if self.quota_display.keys().any(|p| {
+            crate::subscriptions::SubscriptionProvider::parse(p).map(|p| p.as_str()) != Some(p)
+        }) {
+            bail!("unknown quota display provider");
+        }
         Ok(())
+    }
+
+    pub fn quota_display(
+        &self,
+        provider: crate::subscriptions::SubscriptionProvider,
+    ) -> QuotaDisplay {
+        self.quota_display
+            .get(provider.as_str())
+            .copied()
+            .unwrap_or_default()
     }
 }
 impl Config {

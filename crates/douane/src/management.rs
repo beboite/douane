@@ -379,6 +379,15 @@ pub async fn public_models(
     let data:Vec<_>=state.models.read().await.iter().filter(|m|m.enabled&&ready.contains(&m.provider)&&query.provider.as_ref().is_none_or(|p|p.split(',').any(|p|p==m.provider.as_str()))).map(|m|json!({"id":m.id,"object":"model","created":0,"owned_by":m.provider.as_str(),"name":m.name,"label":m.name,"context_length":m.context_length,"thinking":m.thinking,"supported_endpoint_types":["anthropic","openai","openai-response"],"supports_websockets":true})).collect();
     Json(json!({"object":"list","data":data}))
 }
+pub async fn public_quotas(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let settings = state.config.read().await.settings.clone();
+    Json(crate::quota_view::overview(
+        state.accounts.list().await,
+        state.quotas.list().await,
+        &settings,
+        crate::subscriptions::now(),
+    ))
+}
 pub async fn calls(State(state): State<Arc<AppState>>, Query(q): Query<Params>) -> Json<Value> {
     Json(json!({"calls":state.ledger.calls(q.limit.unwrap_or(100)).await}))
 }
@@ -427,22 +436,22 @@ pub async fn update_settings(
 }
 pub async fn providers(State(state): State<Arc<AppState>>) -> Json<Value> {
     let mut result = json!({"providers":[
-        {"id":"claude","name":"Claude","oauth":true,"quota":true,"docs_url":"https://claude.ai/settings/usage"},
-        {"id":"codex","name":"Codex","oauth":true,"quota":true,"docs_url":"https://chatgpt.com/codex/settings/usage"},
-        {"id":"opencode_go","name":"OpenCode Go","oauth":false,"quota":true,"docs_url":"https://opencode.ai/docs/go/"},
-        {"id":"xai","name":"Grok","oauth":true,"quota":true,"docs_url":"https://grok.com"},
-        {"id":"antigravity","name":"Antigravity","oauth":true,"quota":true,"docs_url":"https://antigravity.google"},
-        {"id":"kimi","name":"Kimi","oauth":false,"quota":true,"docs_url":"https://kimi.com/code"},
-        {"id":"qwen","name":"Qwen","oauth":false,"quota":false,"docs_url":"https://chat.qwen.ai"},
-        {"id":"openai_compatible","name":"Compatible OpenAI","oauth":false,"quota":false,"docs_url":"https://platform.openai.com"}
+        {"id":"claude","oauth":true,"quota":true,"docs_url":"https://claude.ai/settings/usage"},
+        {"id":"codex","oauth":true,"quota":true,"docs_url":"https://chatgpt.com/codex/settings/usage"},
+        {"id":"opencode_go","oauth":false,"quota":true,"docs_url":"https://opencode.ai/docs/go/"},
+        {"id":"xai","oauth":true,"quota":true,"docs_url":"https://grok.com"},
+        {"id":"antigravity","oauth":true,"quota":true,"docs_url":"https://antigravity.google"},
+        {"id":"kimi","oauth":false,"quota":true,"docs_url":"https://kimi.com/code"},
+        {"id":"qwen","oauth":false,"quota":false,"docs_url":"https://chat.qwen.ai"},
+        {"id":"openai_compatible","oauth":false,"quota":false,"docs_url":"https://platform.openai.com"}
     ]});
     for provider in result["providers"].as_array_mut().unwrap() {
-        provider["oauth"] = json!(
-            provider["id"]
-                .as_str()
-                .and_then(SubscriptionProvider::parse)
-                .is_some_and(|p| state.oauth.supports(p))
-        );
+        let id = provider["id"]
+            .as_str()
+            .and_then(SubscriptionProvider::parse)
+            .unwrap();
+        provider["name"] = json!(crate::quota_view::provider_name(id));
+        provider["oauth"] = json!(state.oauth.supports(id));
     }
     Json(result)
 }

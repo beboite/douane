@@ -2,6 +2,7 @@
 pub mod affinity;
 pub mod ledger;
 pub mod management;
+pub mod quota_view;
 pub mod relay;
 pub mod scheduler;
 pub mod settings;
@@ -88,6 +89,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/health", get(management::health))
         .route("/v1/models", get(management::public_models))
+        .route("/v1/quotas", get(management::public_quotas))
         .route("/v1/messages", post(relay::forward))
         .route("/v1/chat/completions", post(relay::forward))
         .route("/v1/responses", post(relay::forward).get(socket::upgrade))

@@ -15,3 +15,7 @@ request_timeout_seconds = 180
 # claude = "reset-first"
 # codex = "smart"
 
+# How /v1/quotas presents each provider: "accounts" (default) or "average".
+[settings.quota_display]
+# antigravity = "average"
+

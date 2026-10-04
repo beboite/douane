@@ -14,7 +14,8 @@ export type Model = { id: string; provider: string; name?: string; context_lengt
 export type Call = { id: string | number; started_at: string; model: string; provider: string; account_id?: string | null; status: number; latency_ms?: number; input_tokens?: number; output_tokens?: number; cache_read_tokens?: number; cache_write_tokens?: number; error?: string | null };
 export type Status = { version: string; uptime_seconds: number; in_flight: number; requests: number; errors: number; accounts: number; enabled_accounts: number; providers: number; input_tokens: number; output_tokens: number; cache_read_tokens?: number; cache_write_tokens?: number; client_api_base_url?: string | null };
 export type Strategy = 'round-robin' | 'fill-first' | 'reset-first' | 'smart';
-export type Settings = { strategy: Strategy; quota_refresh_seconds: number; request_timeout_seconds: number; default_provider: string | null; provider_strategies?: Record<string, Strategy> };
+export type QuotaDisplay = 'accounts' | 'average';
+export type Settings = { strategy: Strategy; quota_refresh_seconds: number; request_timeout_seconds: number; default_provider: string | null; provider_strategies?: Record<string, Strategy>; quota_display?: Record<string, QuotaDisplay> };
 export type OAuthSession = { id: string; provider: string; url: string; state: string; redirect_uri: string; expires_at: string; status: string; account_id?: string | null; error?: string | null; user_code?: string | null; interval?: number | null; error_code?: string | null; verification_required?: boolean; verification_available?: boolean };
 export type OAuthStatus = Partial<OAuthSession> & { status: string; account?: Account };
 export type ImportError = string | { name?: string | null; error: string };
@@ -60,7 +61,7 @@ export const management = {
 	oauth: (id: string) => request<OAuthStatus>(`/oauth/${encodeURIComponent(id)}`),
 	oauthCallback: (id: string, code: string, state: string) => request<{ account: Account }>('/oauth/callback', { method: 'POST', body: JSON.stringify({ id, code, state }) }),
 	setModelEnabled: (id: string, enabled: boolean) => request(`/models/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ enabled }) }),
-	settingsSave: (settings: Settings) => request<Settings>('/settings', { method: 'PATCH', body: JSON.stringify(settings) })
+	settingsSave: (settings: Partial<Settings>) => request<Settings>('/settings', { method: 'PATCH', body: JSON.stringify(settings) })
 };
 
 export const providerNames: Record<string, string> = {

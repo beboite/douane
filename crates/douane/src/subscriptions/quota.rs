@@ -129,6 +129,14 @@ impl QuotaService {
             .collect()
     }
 
+    #[cfg(test)]
+    pub(crate) async fn insert_for_test(&self, snapshot: QuotaSnapshot) {
+        self.cache
+            .write()
+            .await
+            .insert(snapshot.account_id.clone(), snapshot);
+    }
+
     pub async fn get(&self, id: &str) -> Option<QuotaSnapshot> {
         self.cache.read().await.get(id).cloned()
     }

@@ -9,8 +9,8 @@
 	import PrivateEmail from './private-email.svelte';
 	import AccountResets from './account-resets.svelte';
 	import EmptyState from './empty-state.svelte';
-	import { providerName, formatDate, resetLabel, creditValue, usageLabel, privateLabel, accountStatus, accountWarning, type Account, type Quota } from '$lib/management';
-	let { accounts, quotas, busy, refresh, connect, rename, resetUpdated }: { accounts: Account[]; quotas: Quota[]; busy: string; refresh: (id?: string) => void; connect: () => void; rename: (account: Account, name: string) => Promise<void>; resetUpdated: () => Promise<void> } = $props();
+	import { providerName, formatDate, resetLabel, creditValue, usageLabel, privateLabel, accountStatus, accountWarning, type Account, type Quota, type Settings, type QuotaDisplay } from '$lib/management';
+	let { accounts, quotas, busy, refresh, connect, rename, resetUpdated, settings, setQuotaDisplay }: { accounts: Account[]; quotas: Quota[]; busy: string; refresh: (id?: string) => void; connect: () => void; rename: (account: Account, name: string) => Promise<void>; resetUpdated: () => Promise<void>; settings: Settings | null; setQuotaDisplay: (provider: string, display: QuotaDisplay) => Promise<void> } = $props();
 	let provider = $state('all');
 	let search = $state('');
 	let sort = $state('name');
@@ -18,6 +18,8 @@
 	let providerIds = $derived([...new Set(accounts.map(a => a.provider))].sort((a, b) => (order.indexOf(a) < 0 ? 99 : order.indexOf(a)) - (order.indexOf(b) < 0 ? 99 : order.indexOf(b)) || providerName(a).localeCompare(providerName(b))));
 	let filtered = $derived(accounts.filter(a => (provider === 'all' || !providerIds.includes(provider) || a.provider === provider) && `${a.name} ${a.email ?? ''}`.toLowerCase().includes(search.toLowerCase())).sort((a,b) => sort === 'remaining' ? (remaining(a.id) ?? 101) - (remaining(b.id) ?? 101) : a.name.localeCompare(b.name)));
 	let groups = $derived(providerIds.map(id => ({ id, accounts: filtered.filter(a => a.provider === id) })).filter(group => group.accounts.length));
+	function display(id: string): QuotaDisplay { return settings?.quota_display?.[id] ?? 'accounts'; }
+	async function chooseDisplay(id: string, select: HTMLSelectElement) { await setQuotaDisplay(id, select.value as QuotaDisplay); select.value = display(id); }
 	function remaining(id: string) { const values = quotas.find(q => q.account_id === id)?.windows.map(w => w.remaining_percent).filter((v): v is number => v != null) ?? []; return values.length ? Math.min(...values) : null; }
 </script>
 
@@ -41,7 +43,7 @@
 	<div class="provider-groups">
 		{#each groups as group (group.id)}
 			<section class="provider-group" aria-label="Quotas {providerName(group.id)}">
-				<header class="provider-heading"><ProviderMark provider={group.id} size={29}/><h2>{providerName(group.id)}</h2><span>{group.accounts.length} {group.accounts.length === 1 ? 'compte' : 'comptes'}</span></header>
+				<header class="provider-heading"><ProviderMark provider={group.id} size={29}/><h2>{providerName(group.id)}</h2><span>{group.accounts.length} {group.accounts.length === 1 ? 'compte' : 'comptes'}</span>{#if settings}<label class="display-choice" title="Affichage des quotas {providerName(group.id)} dans Boite et les clients de /v1/quotas"><span>Dans Boite / les clients</span><select value={display(group.id)} disabled={!!busy} onchange={(event) => chooseDisplay(group.id, event.currentTarget)}><option value="accounts">Détail par compte</option><option value="average">Moyenne des comptes</option></select></label>{/if}</header>
 				<div class="ledger">
 					{#each group.accounts as account (account.id)}
 						{@const quota = quotas.find(q => q.account_id === account.id)}
@@ -69,6 +71,8 @@
 	.provider-heading { display: flex; align-items: center; gap: 12px; margin: 0 0 14px; }
 	.provider-heading h2 { font-family: var(--font-display); font-size: 23px; font-weight: 600; }
 	.provider-heading>span { margin-left: auto; font-size: 15px; color: var(--muted); }
+	.display-choice { display: flex; align-items: center; gap: 10px; margin-left: 10px; font-size: 15px; color: var(--muted); }
+	.display-choice select { background: var(--surface); font-size: 15px; }
 	.quota-row { display: grid; grid-template-columns: minmax(220px,.8fr) minmax(320px,1.8fr) auto; gap: 26px; padding: 25px 24px; border-bottom: 1px solid var(--border); align-items: center; }
 	.quota-row:last-child { border-bottom: 0; }
 	.account-identity { min-width: 0; }
@@ -88,5 +92,5 @@
 	.credit-window strong>span { font-weight: 400; }
 	.credit-window>p { margin: 8px 0 0; color: var(--muted); font-size: 15px; }
 	@media(max-width:1250px) { .quota-row { grid-template-columns: minmax(190px,.7fr) minmax(260px,1.3fr); gap: 22px; }.account-state { grid-column: 1/-1; margin-top: -8px; } }
-	@media(max-width:650px) { .quota-toolbar { flex-wrap: nowrap; margin: 18px 0 25px; gap: 10px; }.quota-toolbar>select { max-width: 140px; padding: 0 8px; }.quota-toolbar>.search-input { min-width: 0; width: auto; }.provider-groups { gap: 28px; }.provider-heading h2 { font-size: 22px; }.quota-row { grid-template-columns: 1fr; gap: 22px; padding: 20px 18px; }.quota-windows { grid-template-columns: 1fr; gap: 23px; }.account-state { grid-column: auto; justify-content: space-between; margin-top: 0; }.credit-window>div { flex-wrap: wrap; } }
+	@media(max-width:650px) { .quota-toolbar { flex-wrap: nowrap; margin: 18px 0 25px; gap: 10px; }.quota-toolbar>select { max-width: 140px; padding: 0 8px; }.quota-toolbar>.search-input { min-width: 0; width: auto; }.provider-groups { gap: 28px; }.provider-heading { flex-wrap: wrap; }.provider-heading h2 { font-size: 22px; }.display-choice { flex-basis: 100%; justify-content: space-between; margin-left: 0; }.display-choice select { max-width: 200px; padding: 0 8px; }.quota-row { grid-template-columns: 1fr; gap: 22px; padding: 20px 18px; }.quota-windows { grid-template-columns: 1fr; gap: 23px; }.account-state { grid-column: auto; justify-content: space-between; margin-top: 0; }.credit-window>div { flex-wrap: wrap; } }
 </style>
