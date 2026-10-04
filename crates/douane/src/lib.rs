@@ -91,6 +91,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/models", get(management::public_models))
         .route("/v1/quotas", get(management::public_quotas))
         .route("/v1/messages", post(relay::forward))
+        .route("/v1/messages/count_tokens", post(relay::forward))
         .route("/v1/chat/completions", post(relay::forward))
         .route("/v1/responses", post(relay::forward).get(socket::upgrade))
         .route("/v1/responses/compact", post(relay::forward))

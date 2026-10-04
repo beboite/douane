@@ -59,6 +59,8 @@ pub enum SubscriptionError {
     InvalidRedirect,
     #[error("account has no refresh token")]
     NoRefreshToken,
+    #[error("the provider revoked this account's session; reconnect the account")]
+    SessionRevoked,
     #[error("provider OAuth client is not configured")]
     OAuthNotConfigured,
 }

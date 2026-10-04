@@ -264,7 +264,8 @@ pub async fn forward(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let from = if uri.path().ends_with("/messages") {
+    let count_tokens = uri.path().ends_with("/messages/count_tokens");
+    let from = if uri.path().ends_with("/messages") || count_tokens {
         Dialect::Messages
     } else if uri.path().ends_with("/chat/completions") {
         Dialect::Chat
@@ -282,6 +283,8 @@ pub async fn forward(
     };
     value["model"] = json!(model);
     let mut last_status = StatusCode::BAD_GATEWAY;
+    // The last native refusal, returned as is when every account refused.
+    let mut last_native: Option<Response> = None;
     for candidate in candidates {
         let mut account = match state.oauth.credential(&candidate.id).await {
             Ok(a) => a,
@@ -303,12 +306,24 @@ pub async fn forward(
             }
             url.push_str("/compact");
         }
+        if count_tokens {
+            if account.provider != SubscriptionProvider::Claude {
+                return error(
+                    StatusCode::NOT_FOUND,
+                    "token counting is offered only by Claude accounts",
+                );
+            }
+            url.push_str("/count_tokens");
+        }
         let mut translated = match translate::request(&value, from, to) {
             Ok(v) => v,
             Err(e) => return error(StatusCode::BAD_REQUEST, &e),
         };
         let codex_sse =
             account.provider == SubscriptionProvider::Codex && !uri.path().ends_with("/compact");
+        // Same dialect: the agent talks to its own provider and reads its
+        // answers, limits and refusals exactly as a direct subscription would.
+        let native = from == to;
         if codex_sse {
             translated["stream"] = json!(true);
             translated["store"] = json!(false);
@@ -380,6 +395,11 @@ pub async fn forward(
         };
         last_status = response.status();
         call.call.status = last_status.as_u16();
+        let passed = if native {
+            passthrough_headers(response.headers())
+        } else {
+            HeaderMap::new()
+        };
         if !last_status.is_success() {
             call.fail(match last_status {
                 StatusCode::TOO_MANY_REQUESTS => "upstream quota or rate limit reached",
@@ -389,16 +409,14 @@ pub async fn forward(
                 _ => "upstream request refused",
             });
             if last_status == StatusCode::TOO_MANY_REQUESTS || last_status.is_server_error() {
-                let wait = response
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(30);
+                let wait = cooldown_seconds(response.headers(), unix_now()).unwrap_or(30);
                 let _ = state
                     .accounts
                     .cooldown(&account.id, wait, "upstream temporarily unavailable")
                     .await;
+                if native {
+                    last_native = native_refusal(last_status, passed, response).await;
+                }
                 continue;
             }
             if matches!(
@@ -411,10 +429,18 @@ pub async fn forward(
                     .await;
                 continue;
             }
-            let _ = state
-                .accounts
-                .mark_error(&account.id, Some("upstream request refused".into()))
-                .await;
+            // A native refusal of the request itself (too long, invalid) is the
+            // agent's to read and act on, compaction included; the account is fine.
+            if native {
+                if let Some(refusal) = native_refusal(last_status, passed, response).await {
+                    return refusal;
+                }
+            } else {
+                let _ = state
+                    .accounts
+                    .mark_error(&account.id, Some("upstream request refused".into()))
+                    .await;
+            }
             return error(
                 last_status,
                 call.call
@@ -439,7 +465,9 @@ pub async fn forward(
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|v| v.contains("text/event-stream"));
         if stream && is_sse {
-            return stream_response(response, from, to, model, call);
+            let mut streamed = stream_response(response, from, to, model, call);
+            streamed.headers_mut().extend(passed);
+            return streamed;
         }
         let result = if is_sse {
             collect_response(response, to, &mut call).await
@@ -466,12 +494,92 @@ pub async fn forward(
             }
         };
         call.complete = true;
-        return Json(result).into_response();
+        let mut answer = Json(result).into_response();
+        answer.headers_mut().extend(passed);
+        return answer;
+    }
+    if let Some(refusal) = last_native {
+        return refusal;
     }
     error(
         last_status,
         "all accounts for this provider are unavailable; check their quotas and connection status",
     )
+}
+
+pub(crate) fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// How long a refusing account rests, from what its provider says: an
+/// explicit `retry-after`, else the reset of the exhausted subscription
+/// window. Retrying an exhausted window every 30 seconds only adds refusals
+/// to the account's record.
+pub(crate) fn cooldown_seconds(headers: &HeaderMap, now: u64) -> Option<u64> {
+    let number = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+    };
+    if let Some(seconds) = number("retry-after") {
+        return Some(seconds.ceil() as u64);
+    }
+    if headers
+        .get("anthropic-ratelimit-unified-status")
+        .and_then(|v| v.to_str().ok())
+        == Some("rejected")
+        && let Some(reset) = number("anthropic-ratelimit-unified-reset")
+    {
+        return Some((reset as u64).saturating_sub(now).max(1));
+    }
+    ["primary", "secondary"].iter().find_map(|window| {
+        let used = number(&format!("x-codex-{window}-used-percent"))?;
+        (used >= 100.0)
+            .then(|| number(&format!("x-codex-{window}-reset-after-seconds")))
+            .flatten()
+            .map(|seconds| seconds.ceil() as u64)
+    })
+}
+
+/// Response headers an agent reads from its own provider: rate-limit state
+/// (Claude's unified limits drive its fast-mode fallback and usage warnings,
+/// Codex's drive its status line) and request ids. No cookie, no credential.
+pub(crate) fn passthrough_headers(upstream: &HeaderMap) -> HeaderMap {
+    let mut out = HeaderMap::new();
+    for (name, value) in upstream {
+        let name_text = name.as_str();
+        if name_text.starts_with("anthropic-ratelimit-")
+            || name_text.starts_with("x-codex-")
+            || name_text.starts_with("x-ratelimit-")
+            || matches!(name_text, "request-id" | "x-request-id" | "retry-after")
+        {
+            out.append(name.clone(), value.clone());
+        }
+    }
+    out
+}
+
+/// The provider's own JSON refusal with its status and limit headers, or
+/// nothing when its body is not a bounded JSON document.
+async fn native_refusal(
+    status: StatusCode,
+    headers: HeaderMap,
+    response: reqwest::Response,
+) -> Option<Response> {
+    let body = read_bounded(response, 256 * 1024).await.ok()?;
+    serde_json::from_slice::<Value>(&body).ok()?;
+    let mut refusal = (status, Body::from(body)).into_response();
+    refusal.headers_mut().extend(headers);
+    refusal.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/json"),
+    );
+    Some(refusal)
 }
 
 pub(crate) async fn read_bounded(
@@ -784,6 +892,40 @@ impl Drop for CallGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_exhausted_window_rests_until_the_provider_reset() {
+        let headers = |pairs: &[(&'static str, &'static str)]| {
+            let mut map = HeaderMap::new();
+            for (name, value) in pairs {
+                map.insert(*name, value.parse().unwrap());
+            }
+            map
+        };
+        assert_eq!(
+            cooldown_seconds(&headers(&[("retry-after", "12")]), 0),
+            Some(12)
+        );
+        let claude = headers(&[
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-reset", "1000"),
+        ]);
+        assert_eq!(cooldown_seconds(&claude, 400), Some(600));
+        let codex = headers(&[
+            ("x-codex-primary-used-percent", "62"),
+            ("x-codex-primary-reset-after-seconds", "100"),
+            ("x-codex-secondary-used-percent", "100"),
+            ("x-codex-secondary-reset-after-seconds", "7200"),
+        ]);
+        assert_eq!(cooldown_seconds(&codex, 0), Some(7200));
+        assert_eq!(
+            cooldown_seconds(
+                &headers(&[("anthropic-ratelimit-unified-status", "allowed")]),
+                0
+            ),
+            None
+        );
+    }
 
     fn fixture_account(provider: SubscriptionProvider) -> AccountCredential {
         serde_json::from_value(json!({

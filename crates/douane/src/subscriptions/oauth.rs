@@ -59,6 +59,10 @@ pub struct OAuthManager {
     codex_token_url: String,
     claude_token_url: String,
     google: GoogleOAuth,
+    /// Refresh tokens a provider has revoked, by account. Asking again gets the
+    /// same answer and only looks like abuse on the account; a reconnect
+    /// stores a new token, which is asked normally.
+    revoked: std::sync::Mutex<BTreeMap<String, String>>,
 }
 
 impl OAuthManager {
@@ -71,6 +75,7 @@ impl OAuthManager {
             codex_token_url: "https://auth.openai.com/oauth/token".into(),
             claude_token_url: "https://platform.claude.com/v1/oauth/token".into(),
             google,
+            revoked: std::sync::Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -402,6 +407,14 @@ impl OAuthManager {
         self.refresh(id, true).await
     }
 
+    fn is_revoked(&self, id: &str, refresh_token: &str) -> bool {
+        self.revoked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .is_some_and(|revoked| revoked == refresh_token)
+    }
+
     async fn refresh(&self, id: &str, force: bool) -> Result<AccountCredential, SubscriptionError> {
         let initial = self
             .store
@@ -434,6 +447,9 @@ impl OAuthManager {
             .refresh_token
             .as_deref()
             .ok_or(SubscriptionError::NoRefreshToken)?;
+        if self.is_revoked(id, refresh_token) {
+            return Err(SubscriptionError::SessionRevoked);
+        }
         let request = match account.provider {
             SubscriptionProvider::Codex => self.client.post(&self.codex_token_url).form(&[
                 ("grant_type", "refresh_token"), ("client_id", CODEX_CLIENT), ("refresh_token", refresh_token), ("scope", "openid profile email"),
@@ -451,10 +467,16 @@ impl OAuthManager {
                 .form(&[("grant_type", "refresh_token"), ("client_id", "17e5f671-d194-4dfb-9706-5516cb48c098"), ("refresh_token", refresh_token)]),
             _ => return Err(SubscriptionError::Unsupported),
         };
-        let result = send_json(request).await;
+        let result = send_refresh(request).await;
         let response = match result {
             Ok(response) => response,
             Err(error) => {
+                if matches!(error, SubscriptionError::SessionRevoked) {
+                    self.revoked
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(id.into(), refresh_token.into());
+                }
                 let _ = self.store.mark_error(id, Some(error.to_string())).await;
                 return Err(error);
             }
@@ -661,6 +683,63 @@ pub(crate) async fn send_json(
 }
 
 const GOOGLE_ERROR_BODY_LIMIT: usize = 65_536;
+const REFRESH_ERROR_BODY_LIMIT: usize = 16_384;
+
+/// Token refresh with a bounded look at the OAuth error code. A revoked or
+/// reused refresh token cannot recover by retrying, so it surfaces as
+/// `SessionRevoked` instead of a bare HTTP status. The body is never logged
+/// or stored: only the standard `error` code is read.
+async fn send_refresh(request: reqwest::RequestBuilder) -> Result<Value, SubscriptionError> {
+    let mut response = request
+        .timeout(Duration::from_secs(30))
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(|_| SubscriptionError::Transport)?;
+    let status = response.status();
+    if status.is_success() {
+        return response
+            .json::<Value>()
+            .await
+            .map_err(|_| SubscriptionError::InvalidResponse);
+    }
+    if matches!(status.as_u16(), 400 | 401) {
+        let mut body = Vec::new();
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) if body.len() + chunk.len() <= REFRESH_ERROR_BODY_LIMIT => {
+                    body.extend_from_slice(&chunk)
+                }
+                Ok(None) => break,
+                _ => return Err(SubscriptionError::Upstream(status.as_u16())),
+            }
+        }
+        if refresh_error_is_revocation(&body) {
+            return Err(SubscriptionError::SessionRevoked);
+        }
+    }
+    Err(SubscriptionError::Upstream(status.as_u16()))
+}
+
+pub(crate) fn refresh_error_is_revocation(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    let code = value.get("error").and_then(|error| {
+        error
+            .as_str()
+            .or_else(|| error.get("code").and_then(Value::as_str))
+    });
+    matches!(
+        code,
+        Some(
+            "invalid_grant"
+                | "refresh_token_reused"
+                | "refresh_token_expired"
+                | "refresh_token_invalidated"
+        )
+    )
+}
 
 pub(crate) fn validate_google_verification_url(value: &str) -> Option<String> {
     if value.len() > 8192
@@ -853,6 +932,25 @@ fn validate_xai_endpoint(endpoint: &str) -> Result<String, SubscriptionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn revoked_refresh_tokens_are_terminal() {
+        assert!(refresh_error_is_revocation(
+            br#"{"error":"invalid_grant","error_description":"Bad Request"}"#
+        ));
+        assert!(refresh_error_is_revocation(
+            br#"{"error":{"code":"refresh_token_reused","message":"x"}}"#
+        ));
+        assert!(!refresh_error_is_revocation(
+            br#"{"error":"invalid_request","error_description":"client_secret is missing."}"#
+        ));
+        assert!(!refresh_error_is_revocation(b"<html>bad gateway</html>"));
+        assert!(
+            SubscriptionError::SessionRevoked
+                .to_string()
+                .contains("reconnect")
+        );
+    }
 
     #[tokio::test]
     async fn missing_google_project_is_terminal_without_importing_an_account() {
@@ -1193,6 +1291,53 @@ mod tests {
                 .as_deref(),
             Some("rotated-2")
         );
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn a_revoked_refresh_token_is_not_sent_again_until_the_account_reconnects() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = calls.clone();
+        let app = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let calls = server_calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        axum::Json(json!({"error":"invalid_grant"})),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(AccountStore::open(directory.path()).unwrap());
+        let summary = store.import(json!({"type":"codex","access_token":"old","refresh_token":"revoked-refresh","expired":"2020-01-01T00:00:00Z"}), None).await.unwrap();
+        let mut manager = OAuthManager::new(reqwest::Client::new(), store.clone());
+        manager.codex_token_url = endpoint;
+        for _ in 0..3 {
+            assert!(matches!(
+                manager.credential(&summary.id).await,
+                Err(SubscriptionError::SessionRevoked)
+            ));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        store
+            .modify(&summary.id, |account| {
+                account.refresh_token = Some("reconnected-refresh".into())
+            })
+            .await
+            .unwrap();
+        assert!(manager.credential(&summary.id).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
         task.abort();
         let _ = task.await;
     }

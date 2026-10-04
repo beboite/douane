@@ -260,11 +260,9 @@ async fn connect_pool(
                         seconds: 15,
                         reason: "websocket upstream connection failed",
                     });
-                if let Some(seconds) = response
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse().ok())
+                // Rest until the provider's own reset, as the HTTP relay does.
+                if let Some(seconds) =
+                    crate::relay::cooldown_seconds(response.headers(), crate::relay::unix_now())
                 {
                     failure.seconds = seconds;
                 }

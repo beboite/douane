@@ -92,12 +92,13 @@ For Claude Code, set `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` and `ANTHROPIC_A
 | `GET /v1/quotas` | Quotas per provider, per account or averaged, for Boite |
 | `POST /v1/chat/completions` | Chat Completions, including streaming |
 | `POST /v1/messages` | Anthropic Messages, including streaming |
+| `POST /v1/messages/count_tokens` | Claude token counting, relayed to the provider |
 | `POST /v1/responses` | Responses, including streaming |
 | `POST /v1/responses/compact` | Native compaction on compatible Responses upstreams |
 | `GET /v1/responses` with WebSocket upgrade | Native Codex/Responses sessions and a streaming HTTP bridge for other subscriptions |
 | `/admin/api/*` | Accounts, quotas, models, request history, settings and OAuth |
 
-HTTP requests can translate between Chat Completions, Messages and Responses. Translation covers the implemented text, tool and image forms; provider-specific extensions are not a promise of full protocol equivalence. Native WebSocket sessions keep one eligible upstream account. Quota and authentication failures make that account temporarily unavailable. A full request can retry on another account before any response event reaches the client. Started output and concurrent requests are never replayed automatically. A continuation that cannot use its original account returns `previous_response_not_found`, allowing the client to reconnect and resend the full conversation.
+HTTP requests can translate between Chat Completions, Messages and Responses. Translation covers the implemented text, tool and image forms; provider-specific extensions are not a promise of full protocol equivalence. Native WebSocket sessions keep one eligible upstream account. Quota and authentication failures make that account temporarily unavailable. A full request can retry on another account before any response event reaches the client. Started output and concurrent requests are never replayed automatically. A refused account rests until the provider's own reset: its `retry-after`, Claude's rejected unified window or Codex's exhausted window, else 30 seconds. A same-dialect request returns the provider's rate-limit headers and request ID, and a client error such as an oversized prompt comes back as the provider wrote it without marking the account. A refresh token the provider revoked is not sent again until the account is reconnected. A continuation that cannot use its original account returns `previous_response_not_found`, allowing the client to reconnect and resend the full conversation.
 
 The HTTP bridge processes queued responses in order, supports cancellation and retains up to eight responses within 64 MiB for incremental conversations. After reconnecting, an unavailable previous response also returns `previous_response_not_found`. Native sockets send periodic heartbeats in both directions, detect silent peers and bound blocked writes.
 

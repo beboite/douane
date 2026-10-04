@@ -60,6 +60,8 @@ struct Mock {
     omit_native_lane: AtomicBool,
     omit_content_type: AtomicBool,
     items_before_empty_completion: AtomicBool,
+    refusal: Mutex<Option<(u16, Value)>>,
+    limit_headers: AtomicBool,
 }
 
 struct Server {
@@ -99,6 +101,10 @@ impl Fixture {
                 .route("/responses", post(mock_http).get(mock_upgrade))
                 .route("/v1/responses", post(mock_http).get(mock_upgrade))
                 .route("/v1/chat/completions", post(mock_http))
+                .route(
+                    "/v1/messages/count_tokens",
+                    post(|| async { axum::Json(json!({"input_tokens":12})) }),
+                )
                 .route(
                     "/v1/models",
                     get(|| async { axum::Json(json!({"data":[{"id":"gpt-test"}]})) }),
@@ -251,6 +257,18 @@ async fn mock_http(
         )
             .into_response();
     }
+    if let Some((status, body)) = mock.refusal.lock().unwrap().clone() {
+        return (
+            StatusCode::from_u16(status).unwrap(),
+            [
+                ("x-codex-primary-used-percent", "42"),
+                ("request-id", "fixture-request"),
+                ("set-cookie", "upstream-session=fixture"),
+            ],
+            axum::Json(body),
+        )
+            .into_response();
+    }
     let mut data = if uri.path().ends_with("chat/completions") {
         [json!({"id":"chat-fixture","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}),
          json!({"id":"chat-fixture","choices":[{"index":0,"delta":{"content":TEXT},"finish_reason":null}]}),
@@ -290,6 +308,7 @@ async fn mock_http(
         .collect();
     let hold = mock.hold_http.load(Ordering::Relaxed);
     let omit_content_type = mock.omit_content_type.load(Ordering::Relaxed);
+    let probe_limits = mock.limit_headers.load(Ordering::Relaxed);
     let probe = HoldProbe { mock, hold };
     let stream = futures_util::stream::unfold((chunks, probe), |(mut chunks, probe)| async move {
         if probe.hold && chunks.len() <= 2 {
@@ -302,11 +321,20 @@ async fn mock_http(
     if omit_content_type {
         return Body::from_stream(stream).into_response();
     }
-    (
+    let mut response = (
         [("content-type", "text/event-stream")],
         Body::from_stream(stream),
     )
-        .into_response()
+        .into_response();
+    if probe_limits {
+        response
+            .headers_mut()
+            .insert("x-codex-primary-used-percent", "17".parse().unwrap());
+        response
+            .headers_mut()
+            .insert("set-cookie", "upstream-session=fixture".parse().unwrap());
+    }
+    response
 }
 
 struct HoldProbe {
@@ -1678,4 +1706,56 @@ async fn http_subscription_websocket_streams_history_cancellation_and_warmup() {
         3
     );
     assert_eq!(fixture.state.ledger.in_flight.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn native_answers_keep_the_provider_limits_and_refusals_without_blaming_the_account() {
+    let fixture = Fixture::new(&[("codex", "alpha")], Strategy::FillFirst).await;
+    let request = json!({"model":"gpt-test","input":"hello","stream":false});
+
+    fixture.mock.limit_headers.store(true, Ordering::Relaxed);
+    let answer = fixture
+        .post("/v1/responses", "limits", request.clone())
+        .await;
+    assert_eq!(answer.status(), StatusCode::OK);
+    assert_eq!(answer.headers()["x-codex-primary-used-percent"], "17");
+    assert!(answer.headers().get("set-cookie").is_none());
+
+    let refusal = json!({"error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"prompt is too long"}});
+    *fixture.mock.refusal.lock().unwrap() = Some((400, refusal.clone()));
+    let refused = fixture.post("/v1/responses", "refused", request).await;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(refused.headers()["x-codex-primary-used-percent"], "42");
+    assert_eq!(refused.headers()["request-id"], "fixture-request");
+    assert!(refused.headers().get("set-cookie").is_none());
+    assert_eq!(refused.json::<Value>().await.unwrap(), refusal);
+    let account = fixture
+        .state
+        .accounts
+        .list()
+        .await
+        .into_iter()
+        .next()
+        .unwrap();
+    assert!(
+        account.last_error.is_none(),
+        "a refused request leaves the account healthy"
+    );
+}
+
+#[tokio::test]
+async fn claude_token_counting_reaches_the_provider() {
+    let fixture = Fixture::new(&[("claude", "alpha")], Strategy::FillFirst).await;
+    let counted = fixture
+        .post(
+            "/v1/messages/count_tokens",
+            "count",
+            json!({"model":"gpt-test","messages":[{"role":"user","content":"hello"}]}),
+        )
+        .await;
+    assert_eq!(counted.status(), StatusCode::OK);
+    assert_eq!(
+        counted.json::<Value>().await.unwrap(),
+        json!({"input_tokens":12})
+    );
 }
