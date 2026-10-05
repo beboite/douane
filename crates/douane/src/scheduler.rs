@@ -18,6 +18,8 @@ pub struct Candidate {
     pub id: String,
     pub remaining_percent: Option<f64>,
     pub weekly_reset: Option<i64>,
+    /// Subscription windows are empty but the provider bills usage credits.
+    pub credits_only: bool,
 }
 
 #[derive(Default)]
@@ -34,16 +36,22 @@ impl Scheduler {
         candidates: &[Candidate],
         now: i64,
     ) -> Vec<String> {
+        // Usage credits cost money: they serve only after every account with
+        // subscription quota, in a stable order that drains one balance first.
+        let mut paid: Vec<&Candidate> = candidates.iter().filter(|a| a.credits_only).collect();
+        paid.sort_by(|a, b| a.id.cmp(&b.id));
         let mut available: Vec<&Candidate> = candidates
             .iter()
+            .filter(|a| !a.credits_only)
             .filter(|a| {
                 a.remaining_percent.is_none_or(|n| n > 0.0)
                     || a.weekly_reset.is_some_and(|t| t <= now)
             })
             .collect();
         available.sort_by(|a, b| a.id.cmp(&b.id));
+        let paid = paid.into_iter().map(|a| a.id.clone());
         if available.is_empty() {
-            return vec![];
+            return paid.collect();
         }
         match strategy {
             Strategy::FillFirst => {}
@@ -111,7 +119,11 @@ impl Scheduler {
                 }
             }
         }
-        available.into_iter().map(|a| a.id.clone()).collect()
+        available
+            .into_iter()
+            .map(|a| a.id.clone())
+            .chain(paid)
+            .collect()
     }
 }
 
@@ -123,6 +135,13 @@ mod tests {
             id: id.into(),
             remaining_percent: remaining,
             weekly_reset: reset,
+            credits_only: false,
+        }
+    }
+    fn paid(id: &str, reset: Option<i64>) -> Candidate {
+        Candidate {
+            credits_only: true,
+            ..account(id, Some(0.0), reset)
         }
     }
     #[test]
@@ -243,5 +262,34 @@ mod tests {
             Scheduler::default().order("codex", Strategy::Smart, &a, 11),
             vec!["a"]
         );
+    }
+    #[test]
+    fn usage_credits_serve_only_after_subscription_quota() {
+        for strategy in [
+            Strategy::RoundRobin,
+            Strategy::FillFirst,
+            Strategy::ResetFirst,
+            Strategy::Smart,
+        ] {
+            let mut s = Scheduler::default();
+            let a = vec![
+                paid("credits-b", Some(3600)),
+                account("quota", Some(5.0), Some(6 * 86400)),
+                paid("credits-a", Some(3600)),
+                account("empty", Some(0.0), Some(3600)),
+            ];
+            for _ in 0..10 {
+                assert_eq!(
+                    s.order("codex", strategy, &a, 0),
+                    vec!["quota", "credits-a", "credits-b"],
+                    "{strategy:?}"
+                );
+            }
+            let only_paid = vec![
+                paid("credits", Some(3600)),
+                account("empty", Some(0.0), Some(3600)),
+            ];
+            assert_eq!(s.order("codex", strategy, &only_paid, 0), vec!["credits"]);
+        }
     }
 }

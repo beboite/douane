@@ -250,19 +250,7 @@ impl AppState {
                 continue;
             }
             let eligible = self.accounts.eligible(provider, Some(model)).await;
-            if let Some(key) = session {
-                let pinned = self
-                    .affinity
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get(provider.as_str(), key);
-                if let Some(index) = pinned.and_then(|id| eligible.iter().position(|a| a.id == id))
-                {
-                    let mut pinned = eligible;
-                    pinned.swap(0, index);
-                    return Ok((model.into(), pinned));
-                }
-            }
+            let now = time::OffsetDateTime::now_utc();
             let mut candidates = vec![];
             for a in &eligible {
                 let quota = self.quotas.get(&a.id).await;
@@ -277,7 +265,27 @@ impl AppState {
                         .and_then(|q| q.weekly_reset())
                         .and_then(crate::subscriptions::parse_timestamp)
                         .map(|t| t.unix_timestamp()),
+                    credits_only: quota.as_ref().is_some_and(|q| q.credits_only(now)),
                 });
+            }
+            if let Some(key) = session {
+                let pinned = self
+                    .affinity
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(provider.as_str(), key);
+                // A pin holds unless it would spend usage credits while another
+                // account still has subscription quota.
+                let any_quota = candidates.iter().any(|c| !c.credits_only);
+                if let Some(index) = pinned.and_then(|id| {
+                    candidates
+                        .iter()
+                        .position(|c| c.id == id && (!c.credits_only || !any_quota))
+                }) {
+                    let mut pinned = eligible;
+                    pinned.swap(0, index);
+                    return Ok((model.into(), pinned));
+                }
             }
             let strategy = config
                 .settings
@@ -312,6 +320,32 @@ impl AppState {
         }
     }
 
+    /// The account would pay with usage credits although another eligible
+    /// account of its provider still has subscription quota for `model`.
+    pub async fn credits_avoidable(&self, account: &AccountCredential, model: &str) -> bool {
+        let now = time::OffsetDateTime::now_utc();
+        if !self
+            .quotas
+            .get(&account.id)
+            .await
+            .is_some_and(|q| q.credits_only(now))
+        {
+            return false;
+        }
+        for other in self.accounts.eligible(account.provider, Some(model)).await {
+            if other.id != account.id
+                && !self
+                    .quotas
+                    .get(&other.id)
+                    .await
+                    .is_some_and(|q| q.credits_only(now))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     pub async fn refresh_quotas(&self, id: Option<&str>) {
         use futures_util::{StreamExt, stream};
         let ids: Vec<String> = self
@@ -327,5 +361,85 @@ impl AppState {
                 let _ = self.quotas.refresh(&id).await;
             })
             .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::subscriptions::{QuotaCredits, QuotaSnapshot, QuotaWindow};
+    use serde_json::json;
+
+    fn credits_only(id: &str) -> QuotaSnapshot {
+        QuotaSnapshot {
+            account_id: id.into(),
+            provider: SubscriptionProvider::Codex,
+            windows: vec![QuotaWindow {
+                id: "weekly".into(),
+                label: "Codex Weekly".into(),
+                remaining_percent: Some(0.0),
+                reset_at: Some("2099-01-01T00:00:00Z".into()),
+                used: Some(100.0),
+                limit: Some(100.0),
+            }],
+            updated_at: crate::subscriptions::now(),
+            error: None,
+            subscription: None,
+            credits: vec![QuotaCredits {
+                id: "codex-credits".into(),
+                label: "Credits".into(),
+                used: None,
+                limit: None,
+                remaining: Some(10.0),
+                unit: "credits".into(),
+                reset_at: None,
+                unlimited: Some(false),
+                enabled: Some(true),
+            }],
+            verification_required: false,
+            verification_available: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_leaves_usage_credits_only_for_subscription_quota() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.server.auth_dir = directory.path().join("auth");
+        config.server.database = directory.path().join("requests.sqlite");
+        let state = AppState::new(config, None).unwrap();
+        let mut ids = vec![];
+        for name in ["paid", "quota"] {
+            let account = state
+                .accounts
+                .import(
+                    json!({"type":"codex","access_token":"fixture","account_id":name,"name":name}),
+                    None,
+                )
+                .await
+                .unwrap();
+            ids.push(account.id);
+        }
+        state.quotas.insert_for_test(credits_only(&ids[0])).await;
+        state
+            .affinity
+            .lock()
+            .unwrap()
+            .bind("codex", "session", &ids[0]);
+        let paid = state.accounts.get(&ids[0]).await.unwrap();
+        async fn first(state: &AppState) -> String {
+            let (_, accounts) = state
+                .candidates("gpt-5.5", Some("codex"), Some("session"))
+                .await
+                .unwrap();
+            accounts[0].id.clone()
+        }
+        assert_eq!(first(&state).await, ids[1]);
+        assert!(state.credits_avoidable(&paid, "gpt-5.5").await);
+
+        // Once no subscription quota remains, the pinned account pays.
+        state.accounts.set_enabled(&ids[1], false).await.unwrap();
+        assert_eq!(first(&state).await, ids[0]);
+        assert!(!state.credits_avoidable(&paid, "gpt-5.5").await);
     }
 }

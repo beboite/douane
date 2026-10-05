@@ -82,6 +82,38 @@ impl QuotaSnapshot {
             .filter_map(|window| window.remaining_percent)
             .reduce(f64::min)
     }
+
+    /// The provider reported a paid balance that keeps serving requests once
+    /// the subscription windows are empty: Codex credits or Claude extra usage.
+    /// Only an explicit `enabled: true` counts; an unknown balance on an
+    /// enabled pool is the provider's to refuse, a known zero is not usable.
+    pub fn usable_credits(&self) -> bool {
+        self.credits.iter().any(|credits| {
+            credits.enabled == Some(true)
+                && (credits.unlimited == Some(true)
+                    || credits.remaining.is_none_or(|remaining| remaining > 0.0))
+        })
+    }
+
+    /// A subscription-wide window is empty and has not reset yet.
+    pub fn window_exhausted(&self, now: time::OffsetDateTime) -> bool {
+        self.windows.iter().any(|window| {
+            is_global(&window.id)
+                && window
+                    .remaining_percent
+                    .is_some_and(|percent| percent <= 0.0)
+                && window
+                    .reset_at
+                    .as_deref()
+                    .and_then(parse_timestamp)
+                    .is_none_or(|reset| reset > now)
+        })
+    }
+
+    /// Requests would be paid from credits rather than the subscription.
+    pub fn credits_only(&self, now: time::OffsetDateTime) -> bool {
+        self.window_exhausted(now) && self.usable_credits()
+    }
 }
 
 pub struct QuotaService {
@@ -441,6 +473,10 @@ impl QuotaService {
                 account.exhausted_until = None;
                 account.exhausted_without_reset = false;
                 account.model_exhaustion.clear();
+                // Empty subscription windows do not stop an account whose
+                // provider bills the overflow to usage credits. The scheduler
+                // still keeps it behind accounts with subscription quota left.
+                let credits = snapshot.usable_credits();
                 for window in &snapshot.windows {
                     if !window
                         .remaining_percent
@@ -453,6 +489,9 @@ impl QuotaService {
                         continue;
                     }
                     if is_global(&window.id) {
+                        if credits {
+                            continue;
+                        }
                         if let Some(reset) = reset {
                             let previous =
                                 account.exhausted_until.as_deref().and_then(parse_timestamp);
@@ -1478,5 +1517,74 @@ mod tests {
                 .await
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn codex_usage_credits_keep_an_exhausted_account_selectable() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(AccountStore::open(directory.path()).unwrap());
+        let account = store
+            .import(json!({"type":"codex","access_token":"fixture"}), None)
+            .await
+            .unwrap();
+        let service = QuotaService::new(reqwest::Client::new(), store.clone());
+        let usage = |credits: Value| {
+            json!({
+                "rate_limit": {
+                    "primary_window": {"used_percent": 100, "limit_window_seconds": 18000, "reset_at": 1_900_000_000},
+                    "secondary_window": {"used_percent": 100, "limit_window_seconds": 604800, "reset_at": 1_900_000_000}
+                },
+                "credits": credits
+            })
+        };
+        let observe = |value: Value| QuotaSnapshot {
+            account_id: account.id.clone(),
+            provider: SubscriptionProvider::Codex,
+            windows: parse_codex(&value, observed()),
+            updated_at: now(),
+            error: None,
+            subscription: None,
+            credits: parse_credits(SubscriptionProvider::Codex, &value, observed()),
+            verification_required: false,
+            verification_available: false,
+        };
+        let later = parse_timestamp("2031-01-01T00:00:00Z").unwrap();
+        let eligible = || async {
+            store
+                .eligible(SubscriptionProvider::Codex, Some("gpt-5.5"))
+                .await
+                .len()
+        };
+        for (credits, selectable) in [
+            (
+                json!({"has_credits":true,"unlimited":false,"balance":"42.5"}),
+                true,
+            ),
+            (
+                json!({"has_credits":true,"unlimited":true,"balance":null}),
+                true,
+            ),
+            (
+                json!({"has_credits":true,"unlimited":false,"balance":"0"}),
+                false,
+            ),
+            (
+                json!({"has_credits":false,"unlimited":false,"balance":"10"}),
+                false,
+            ),
+            (Value::Null, false),
+        ] {
+            let snapshot = observe(usage(credits.clone()));
+            assert!(snapshot.window_exhausted(observed()), "{credits}");
+            assert_eq!(snapshot.credits_only(observed()), selectable, "{credits}");
+            assert!(!snapshot.window_exhausted(later), "{credits}");
+            service
+                .apply_observation(&account.id, &snapshot, None, &account.updated_at)
+                .await
+                .unwrap();
+            assert_eq!(eligible().await, usize::from(selectable), "{credits}");
+            let status = store.get(&account.id).await.unwrap().summary().status;
+            assert_eq!(status == "exhausted", !selectable, "{credits}");
+        }
     }
 }
