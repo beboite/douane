@@ -20,6 +20,9 @@ use axum::{
 use state::AppState;
 use std::sync::Arc;
 
+/// The largest request body any route accepts.
+pub const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
+
 pub fn router(state: Arc<AppState>) -> Router {
     let management = Router::new()
         .route("/accounts", get(management::accounts))
@@ -105,8 +108,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .nest("/admin/api", management)
         .nest("/v0/management", compatible.clone())
         .nest("/v8/management", compatible)
+        // Axum's extractors stop at 2 MiB unless told otherwise, which
+        // rejected Claude Code requests carrying a few screenshots before
+        // this 64 MiB limit was ever reached.
+        .layer(axum::extract::DefaultBodyLimit::disable())
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
-            64 * 1024 * 1024,
+            MAX_REQUEST_BODY,
         ))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
