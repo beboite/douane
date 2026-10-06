@@ -455,12 +455,10 @@ impl QuotaService {
                     .and_then(parse_timestamp)
                     .is_some_and(|until| until > current);
                 // A successful authenticated quota read supersedes an older
-                // generic failure, but cannot dismiss an error recorded while
-                // the request was in flight or an active inference cooldown.
-                if account.updated_at == account_version
-                    && account.last_error.as_deref() == Some("provider request failed")
-                    && !cooling
-                {
+                // failure, the reason an expired cooldown left behind included,
+                // but cannot dismiss an error recorded while the request was in
+                // flight or an active inference cooldown.
+                if account.updated_at == account_version && !cooling {
                     account.last_error = None;
                 }
                 if let Some(plan) = plan {
@@ -1379,7 +1377,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_quota_clears_only_an_older_generic_error_without_active_cooldown() {
+    async fn successful_quota_clears_an_older_error_without_active_cooldown() {
         let directory = tempfile::tempdir().unwrap();
         let store = Arc::new(AccountStore::open(directory.path()).unwrap());
         let account = store
@@ -1439,6 +1437,28 @@ mod tests {
         assert_eq!(after.summary().status, "cooldown");
         assert_eq!(after.cooldown_until, cooling.cooldown_until);
         assert_eq!(after.last_error, cooling.last_error);
+
+        // An inference cooldown keeps its reason once it expires; the next
+        // successful read is what returns the account to ready.
+        store
+            .mark_cooldown(&account.id, 10, "upstream connection failed")
+            .await
+            .unwrap();
+        store
+            .modify(&account.id, |account| {
+                account.cooldown_until = Some("2020-01-01T00:00:00Z".into())
+            })
+            .await
+            .unwrap();
+        let expired = store.get(&account.id).await.unwrap();
+        assert_eq!(expired.summary().status, "error");
+        service
+            .apply_observation(&account.id, &snapshot, None, &expired.updated_at)
+            .await
+            .unwrap();
+        let recovered = store.get(&account.id).await.unwrap();
+        assert_eq!(recovered.summary().status, "ready");
+        assert!(recovered.last_error.is_none());
 
         store
             .modify(&account.id, |account| account.cooldown_until = None)
