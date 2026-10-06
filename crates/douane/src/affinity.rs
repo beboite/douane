@@ -1,4 +1,5 @@
-//! Bounded, idle-expiring account affinity. Quota refresh never reassigns live sessions.
+//! Bounded, idle-expiring account affinity. Whether a pin still holds is the
+//! strategy's call, in `AppState::candidates`.
 
 use axum::http::HeaderMap;
 use serde_json::Value;

@@ -60,16 +60,16 @@
 	function navigate(next: string) { screen = next; mobileOpen = false; failure = ''; notice = ''; location.hash = next; window.scrollTo(0,0); }
 	function hashChange() { const hash = location.hash.slice(1); if (groups.flatMap(g => g.items).some(item => item.id === hash)) screen = hash; }
 	async function mutate(name: string, action: () => Promise<unknown>, message = '') {
-		if (busy) return; busy = name; failure = ''; notice = '';
-		try { await action(); if (loadingRequest) await loadingRequest; await load(true); notice = message; }
-		catch (error) { failure = (error as Error).message; }
+		if (busy) return false; busy = name; failure = ''; notice = '';
+		try { await action(); if (loadingRequest) await loadingRequest; await load(true); notice = message; return true; }
+		catch (error) { failure = (error as Error).message; return false; }
 		finally { busy = ''; }
 	}
 	function refresh(id?: string) { return mutate('quotas', () => management.refreshQuotas(id)); }
-	function setQuotaDisplay(provider: string, display: QuotaDisplay) {
+	async function setQuotaDisplay(provider: string, display: QuotaDisplay) {
 		const next = { ...settings?.quota_display };
 		if (display === 'average') next[provider] = display; else delete next[provider];
-		return mutate('settings', () => management.settingsSave({ quota_display: next }), 'Affichage dans Boite enregistré.');
+		await mutate('settings', () => management.settingsSave({ quota_display: next }), 'Affichage dans Boite enregistré.');
 	}
 	async function rename(account: Account, name: string) {
 		if (busy) throw new Error('Une action est déjà en cours.');

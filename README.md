@@ -114,10 +114,10 @@ Choose a global strategy in Réglages and optionally override it per provider:
 | --- | --- |
 | `round-robin` | Rotate through eligible accounts |
 | `fill-first` | Keep selecting the first eligible account until it becomes unavailable |
-| `reset-first` | Prefer the nearest known weekly reset |
+| `reset-first` | Use the account with the nearest known weekly reset; other accounts serve only while it is unavailable |
 | `smart` | Give 90% of new assignments to the account whose weekly reset arrives first within 48 hours, until exhausted; otherwise weight by remaining quota/time with 20% equal rotation |
 
-Conversation identifiers keep an existing conversation on the same eligible account, which helps preserve upstream cache affinity. Changing a strategy affects new conversations; it does not rebalance active ones. Disabled, exhausted or temporarily unavailable accounts can cause failover to another eligible account of the same provider. Request history reports cache reads and writes when the provider returns them, without estimating prices or promising a latency improvement.
+Conversation identifiers keep an existing conversation on the same eligible account, which helps preserve upstream cache affinity. Changing a strategy affects new conversations; it does not rebalance active ones, except under `reset-first`: a conversation on any other account returns to the nearest reset as soon as that account is eligible, at the cost of one cache rebuild. Accounts with the same reset keep their conversations. A strategy picked in Réglages is saved on click. Disabled, exhausted or temporarily unavailable accounts can cause failover to another eligible account of the same provider. Request history reports cache reads and writes when the provider returns them, without estimating prices or promising a latency improvement.
 
 The quota view groups accounts by provider, shows local reset dates, and displays subscription tiers and extra credits reported by the provider. Claude and Codex can expose banked resets. Consuming one requires confirmation in the dashboard. A retry retains the same request and credit, including after a service restart, so a double click cannot consume another reset. Reset availability is read through `GET /admin/api/accounts/{id}/resets`; redemption uses `POST /admin/api/accounts/{id}/resets/redeem` with `confirmation: true` and a UUID `request_id` reused for retries.
 

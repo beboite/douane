@@ -28,7 +28,42 @@ pub struct Scheduler {
     credits: HashMap<(String, String), f64>,
 }
 
+fn reset_rank(account: &Candidate, now: i64) -> i64 {
+    account
+        .weekly_reset
+        .filter(|t| *t > now)
+        .unwrap_or(i64::MAX)
+}
+
 impl Scheduler {
+    /// Reset-first spends the nearest weekly reset before any other account: a
+    /// conversation pinned elsewhere, by an earlier strategy or a failover,
+    /// returns to it as soon as it is eligible, and only an equal reset keeps
+    /// the pin. Every other strategy keeps a pin while its account is eligible.
+    pub fn pin_holds(strategy: Strategy, candidates: &[Candidate], pinned: &str, now: i64) -> bool {
+        if strategy != Strategy::ResetFirst {
+            return true;
+        }
+        // Reset-first orders without touching scheduler state.
+        let order = Self::default().order("", strategy, candidates, now);
+        let Some(top) = order.first() else {
+            return true;
+        };
+        if top == pinned {
+            return true;
+        }
+        let find = |id: &str| candidates.iter().find(|c| c.id == id);
+        order.iter().any(|id| id == pinned)
+            && match (find(top), find(pinned)) {
+                (Some(top), Some(pinned)) => {
+                    !top.credits_only
+                        && !pinned.credits_only
+                        && reset_rank(top, now) == reset_rank(pinned, now)
+                }
+                _ => false,
+            }
+    }
+
     pub fn order(
         &mut self,
         provider: &str,
@@ -61,9 +96,7 @@ impl Scheduler {
                 available.rotate_left(offset);
                 *cursor = cursor.wrapping_add(1);
             }
-            Strategy::ResetFirst => {
-                available.sort_by_key(|a| a.weekly_reset.filter(|t| *t > now).unwrap_or(i64::MAX))
-            }
+            Strategy::ResetFirst => available.sort_by_key(|a| reset_rank(a, now)),
             Strategy::Smart => {
                 // The nearest reset owns 90% of new assignments during its last
                 // 48 hours, including its final allowance. Outside that window,
@@ -172,6 +205,40 @@ mod tests {
             Scheduler::default().order("claude", Strategy::ResetFirst, &a, 0),
             vec!["soon", "later"]
         );
+    }
+    #[test]
+    fn reset_first_returns_pins_to_the_nearest_reset() {
+        let a = vec![
+            account("later", Some(90.0), Some(900)),
+            account("soon", Some(30.0), Some(300)),
+            account("tied", Some(50.0), Some(300)),
+            account("empty", Some(0.0), Some(100)),
+        ];
+        let holds = |strategy, pinned| Scheduler::pin_holds(strategy, &a, pinned, 0);
+        assert!(holds(Strategy::ResetFirst, "soon"));
+        assert!(
+            holds(Strategy::ResetFirst, "tied"),
+            "an equal reset keeps the cache"
+        );
+        assert!(!holds(Strategy::ResetFirst, "later"));
+        assert!(!holds(Strategy::ResetFirst, "empty"));
+        for strategy in [Strategy::FillFirst, Strategy::RoundRobin, Strategy::Smart] {
+            assert!(holds(strategy, "later"), "{strategy:?}");
+        }
+        // Once the top account is unavailable, the failover pin holds.
+        let rest = &a[..1];
+        assert!(Scheduler::pin_holds(Strategy::ResetFirst, rest, "later", 0));
+        // The quota account outranks a pin that would spend usage credits.
+        let b = vec![
+            paid("credits", Some(100)),
+            account("quota", Some(5.0), Some(900)),
+        ];
+        assert!(!Scheduler::pin_holds(
+            Strategy::ResetFirst,
+            &b,
+            "credits",
+            0
+        ));
     }
     #[test]
     fn smart_consumes_every_account_and_favors_the_next_reset() {

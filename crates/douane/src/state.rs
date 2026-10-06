@@ -268,6 +268,13 @@ impl AppState {
                     credits_only: quota.as_ref().is_some_and(|q| q.credits_only(now)),
                 });
             }
+            let strategy = config
+                .settings
+                .provider_strategies
+                .get(provider.as_str())
+                .copied()
+                .unwrap_or(config.settings.strategy);
+            let now = now.unix_timestamp();
             if let Some(key) = session {
                 let pinned = self
                     .affinity
@@ -275,34 +282,26 @@ impl AppState {
                     .unwrap_or_else(|e| e.into_inner())
                     .get(provider.as_str(), key);
                 // A pin holds unless it would spend usage credits while another
-                // account still has subscription quota.
+                // account still has subscription quota, or reset-first has an
+                // eligible account with an earlier weekly reset.
                 let any_quota = candidates.iter().any(|c| !c.credits_only);
                 if let Some(index) = pinned.and_then(|id| {
-                    candidates
-                        .iter()
-                        .position(|c| c.id == id && (!c.credits_only || !any_quota))
+                    candidates.iter().position(|c| {
+                        c.id == id
+                            && (!c.credits_only || !any_quota)
+                            && Scheduler::pin_holds(strategy, &candidates, &id, now)
+                    })
                 }) {
                     let mut pinned = eligible;
                     pinned.swap(0, index);
                     return Ok((model.into(), pinned));
                 }
             }
-            let strategy = config
-                .settings
-                .provider_strategies
-                .get(provider.as_str())
-                .copied()
-                .unwrap_or(config.settings.strategy);
             let order = self
                 .scheduler
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .order(
-                    provider.as_str(),
-                    strategy,
-                    &candidates,
-                    time::OffsetDateTime::now_utc().unix_timestamp(),
-                );
+                .order(provider.as_str(), strategy, &candidates, now);
             for id in order {
                 if let Some(a) = eligible.iter().find(|a| a.id == id) {
                     ordered.push(a.clone());
@@ -367,6 +366,7 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scheduler::Strategy;
     use crate::subscriptions::{QuotaCredits, QuotaSnapshot, QuotaWindow};
     use serde_json::json;
 
@@ -399,6 +399,73 @@ mod tests {
             verification_required: false,
             verification_available: false,
         }
+    }
+
+    fn weekly(id: &str, reset: &str) -> QuotaSnapshot {
+        QuotaSnapshot {
+            windows: vec![QuotaWindow {
+                id: "weekly".into(),
+                label: "Codex Weekly".into(),
+                remaining_percent: Some(60.0),
+                reset_at: Some(reset.into()),
+                used: Some(40.0),
+                limit: Some(100.0),
+            }],
+            credits: vec![],
+            ..credits_only(id)
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_first_moves_a_pinned_session_to_the_nearest_reset() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.server.auth_dir = directory.path().join("auth");
+        config.server.database = directory.path().join("requests.sqlite");
+        let state = AppState::new(config, None).unwrap();
+        let mut ids = vec![];
+        for name in ["later", "soon"] {
+            let account = state
+                .accounts
+                .import(
+                    json!({"type":"codex","access_token":"fixture","account_id":name,"name":name}),
+                    None,
+                )
+                .await
+                .unwrap();
+            ids.push(account.id);
+        }
+        let (later, soon) = (ids[0].clone(), ids[1].clone());
+        state
+            .quotas
+            .insert_for_test(weekly(&later, "2099-01-08T00:00:00Z"))
+            .await;
+        state
+            .quotas
+            .insert_for_test(weekly(&soon, "2099-01-01T00:00:00Z"))
+            .await;
+        // A failover or an earlier strategy left the conversation on "later".
+        state
+            .affinity
+            .lock()
+            .unwrap()
+            .bind("codex", "session", &later);
+        async fn first(state: &AppState, strategy: Strategy) -> String {
+            state.config.write().await.settings.strategy = strategy;
+            let (_, accounts) = state
+                .candidates("gpt-5.5", Some("codex"), Some("session"))
+                .await
+                .unwrap();
+            accounts[0].id.clone()
+        }
+        for strategy in [Strategy::Smart, Strategy::RoundRobin, Strategy::FillFirst] {
+            assert_eq!(first(&state, strategy).await, later, "{strategy:?}");
+        }
+        assert_eq!(first(&state, Strategy::ResetFirst).await, soon);
+
+        // While the nearest reset is unavailable, the pin stays on "later".
+        state.accounts.set_enabled(&soon, false).await.unwrap();
+        assert_eq!(first(&state, Strategy::ResetFirst).await, later);
     }
 
     #[tokio::test]
