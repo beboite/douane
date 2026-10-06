@@ -3,7 +3,7 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -62,6 +62,8 @@ struct Mock {
     items_before_empty_completion: AtomicBool,
     refusal: Mutex<Option<(u16, Value)>>,
     limit_headers: AtomicBool,
+    /// Milliseconds between the HTTP body's chunks; a few by default.
+    chunk_pause_ms: AtomicU64,
 }
 
 struct Server {
@@ -309,15 +311,21 @@ async fn mock_http(
     let hold = mock.hold_http.load(Ordering::Relaxed);
     let omit_content_type = mock.omit_content_type.load(Ordering::Relaxed);
     let probe_limits = mock.limit_headers.load(Ordering::Relaxed);
+    // The first chunk comes at once: the pause is the silence inside the body.
+    let pause = Duration::from_millis(mock.chunk_pause_ms.load(Ordering::Relaxed).max(3));
+    let total = chunks.len();
     let probe = HoldProbe { mock, hold };
-    let stream = futures_util::stream::unfold((chunks, probe), |(mut chunks, probe)| async move {
-        if probe.hold && chunks.len() <= 2 {
-            std::future::pending::<()>().await;
-        }
-        let chunk = chunks.pop_front()?;
-        tokio::time::sleep(Duration::from_millis(3)).await;
-        Some((Ok::<_, std::io::Error>(chunk), (chunks, probe)))
-    });
+    let stream =
+        futures_util::stream::unfold((chunks, probe), move |(mut chunks, probe)| async move {
+            if probe.hold && chunks.len() <= 2 {
+                std::future::pending::<()>().await;
+            }
+            let chunk = chunks.pop_front()?;
+            if chunks.len() < total {
+                tokio::time::sleep(pause).await;
+            }
+            Some((Ok::<_, std::io::Error>(chunk), (chunks, probe)))
+        });
     if omit_content_type {
         return Body::from_stream(stream).into_response();
     }
@@ -677,6 +685,91 @@ async fn codex_stream_without_content_type_is_still_read_as_events() {
         let text = response.text().await.unwrap();
         assert!(text.contains(TEXT), "{path} {body}: {text}");
     }
+}
+
+#[tokio::test]
+async fn the_request_timeout_bounds_upstream_silence_not_the_whole_stream() {
+    let fixture = Fixture::new(&[("codex", "alpha")], Strategy::FillFirst).await;
+    fixture
+        .state
+        .config
+        .write()
+        .await
+        .settings
+        .request_timeout_seconds = 1;
+    // Three 400 ms gaps: the answer outlasts the timeout, no silence does.
+    fixture.mock.chunk_pause_ms.store(400, Ordering::Relaxed);
+    let requests = [
+        (
+            "/v1/responses",
+            json!({"model":"gpt-test","input":"hello","stream":true}),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model":"gpt-test","messages":[{"role":"user","content":"hello"}],"stream":true}),
+        ),
+        (
+            "/v1/responses",
+            json!({"model":"gpt-test","input":"hello","stream":false}),
+        ),
+    ];
+    for (path, body) in requests {
+        let started = std::time::Instant::now();
+        let response = fixture.post(path, "conversation-slow", body.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK, "{path} {body}");
+        let text = response.text().await.unwrap();
+        assert!(started.elapsed() > Duration::from_secs(1), "{path} {body}");
+        assert!(text.contains(TEXT), "{path} {body}: {text}");
+        assert!(!text.contains("event: error"), "{path} {body}: {text}");
+    }
+    let calls = fixture.calls(3).await;
+    assert!(calls.iter().all(|call| call.error.is_none()), "{calls:?}");
+}
+
+#[tokio::test]
+async fn an_upstream_silent_past_the_request_timeout_ends_as_stalled() {
+    let fixture = Fixture::new(&[("codex", "alpha")], Strategy::FillFirst).await;
+    fixture
+        .state
+        .config
+        .write()
+        .await
+        .settings
+        .request_timeout_seconds = 1;
+    fixture.mock.chunk_pause_ms.store(2_500, Ordering::Relaxed);
+    let streamed = fixture
+        .post(
+            "/v1/responses",
+            "conversation-stalled",
+            json!({"model":"gpt-test","input":"hello","stream":true}),
+        )
+        .await;
+    assert_eq!(streamed.status(), StatusCode::OK);
+    let text = streamed.text().await.unwrap();
+    assert!(text.contains("event: error"), "{text}");
+    assert!(text.contains("upstream stream stalled"), "{text}");
+    let collected = fixture
+        .post(
+            "/v1/responses",
+            "conversation-stalled",
+            json!({"model":"gpt-test","input":"hello","stream":false}),
+        )
+        .await;
+    assert_eq!(collected.status(), StatusCode::BAD_GATEWAY);
+    assert!(
+        collected
+            .text()
+            .await
+            .unwrap()
+            .contains("upstream stream stalled")
+    );
+    let calls = fixture.calls(2).await;
+    assert!(
+        calls
+            .iter()
+            .all(|call| call.error.as_deref() == Some("upstream stream stalled")),
+        "{calls:?}"
+    );
 }
 
 #[tokio::test]

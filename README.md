@@ -24,6 +24,8 @@ database = "douane.sqlite"
 [settings]
 strategy = "smart"
 quota_refresh_seconds = 300
+# Longest wait for the upstream to answer, then for each next piece of its stream.
+# A long answer keeps streaming as long as the upstream stays active.
 request_timeout_seconds = 180
 
 [settings.provider_strategies]

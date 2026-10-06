@@ -15,7 +15,7 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::{
     sync::{Arc, atomic::Ordering},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 pub fn error(status: StatusCode, message: &str) -> Response {
@@ -361,16 +361,20 @@ pub async fn forward(
         };
         let mut call = CallGuard::new(state.ledger.clone(), &account, &model);
         let mut retry_auth = true;
+        // The setting bounds each wait on the upstream, never the whole answer:
+        // a long generation keeps streaming as long as its events keep coming.
+        let idle = Duration::from_secs(state.config.read().await.settings.request_timeout_seconds);
         let response = loop {
-            let timeout = state.config.read().await.settings.request_timeout_seconds;
-            let result = state
+            let send = state
                 .client
                 .post(&url)
-                .timeout(std::time::Duration::from_secs(timeout))
                 .headers(upstream_headers(&account, &headers))
                 .body(bytes.clone())
-                .send()
-                .await;
+                .send();
+            let result = match tokio::time::timeout(idle, send).await {
+                Ok(sent) => sent.map_err(|_| "upstream connection failed"),
+                Err(_) => Err("upstream did not answer in time"),
+            };
             match result {
                 Ok(r) if r.status() == StatusCode::UNAUTHORIZED && retry_auth => {
                     retry_auth = false;
@@ -384,12 +388,9 @@ pub async fn forward(
         };
         let response = match response {
             Ok(r) => r,
-            Err(_) => {
-                call.fail("upstream connection failed");
-                let _ = state
-                    .accounts
-                    .cooldown(&account.id, 10, "upstream connection failed")
-                    .await;
+            Err(e) => {
+                call.fail(e);
+                let _ = state.accounts.cooldown(&account.id, 10, e).await;
                 continue;
             }
         };
@@ -415,7 +416,7 @@ pub async fn forward(
                     .cooldown(&account.id, wait, "upstream temporarily unavailable")
                     .await;
                 if native {
-                    last_native = native_refusal(last_status, passed, response).await;
+                    last_native = native_refusal(last_status, passed, response, idle).await;
                 }
                 continue;
             }
@@ -432,7 +433,7 @@ pub async fn forward(
             // A native refusal of the request itself (too long, invalid) is the
             // agent's to read and act on, compaction included; the account is fine.
             if native {
-                if let Some(refusal) = native_refusal(last_status, passed, response).await {
+                if let Some(refusal) = native_refusal(last_status, passed, response, idle).await {
                     return refusal;
                 }
             } else {
@@ -465,14 +466,14 @@ pub async fn forward(
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|v| v.contains("text/event-stream"));
         if stream && is_sse {
-            let mut streamed = stream_response(response, from, to, model, call);
+            let mut streamed = stream_response(response, from, to, model, call, idle);
             streamed.headers_mut().extend(passed);
             return streamed;
         }
         let result = if is_sse {
-            collect_response(response, to, &mut call).await
+            collect_response(response, to, &mut call, idle).await
         } else {
-            match read_bounded(response, 32 * 1024 * 1024).await {
+            match read_bounded(response, 32 * 1024 * 1024, idle).await {
                 Ok(b) => serde_json::from_slice::<Value>(&b)
                     .map_err(|_| "upstream returned invalid JSON".into()),
                 Err(e) => Err(e),
@@ -570,8 +571,9 @@ async fn native_refusal(
     status: StatusCode,
     headers: HeaderMap,
     response: reqwest::Response,
+    idle: Duration,
 ) -> Option<Response> {
-    let body = read_bounded(response, 256 * 1024).await.ok()?;
+    let body = read_bounded(response, 256 * 1024, idle).await.ok()?;
     serde_json::from_slice::<Value>(&body).ok()?;
     let mut refusal = (status, Body::from(body)).into_response();
     refusal.headers_mut().extend(headers);
@@ -582,14 +584,36 @@ async fn native_refusal(
     Some(refusal)
 }
 
+/// The upstream went quiet for longer than the request timeout.
+const STALLED: &str = "upstream stream stalled";
+
+/// The next piece of an upstream body. Silence longer than `idle` ends the
+/// body as `STALLED`; a transport failure ends it as `interrupted`.
+async fn next_chunk<S>(
+    body: &mut S,
+    idle: Duration,
+    interrupted: &str,
+) -> Option<Result<Bytes, String>>
+where
+    S: futures_util::Stream<Item = reqwest::Result<Bytes>> + Unpin,
+{
+    match tokio::time::timeout(idle, body.next()).await {
+        Ok(Some(Ok(chunk))) => Some(Ok(chunk)),
+        Ok(Some(Err(_))) => Some(Err(interrupted.into())),
+        Ok(None) => None,
+        Err(_) => Some(Err(STALLED.into())),
+    }
+}
+
 pub(crate) async fn read_bounded(
     response: reqwest::Response,
     cap: usize,
+    idle: Duration,
 ) -> Result<Vec<u8>, String> {
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| "upstream body interrupted")?;
+    while let Some(chunk) = next_chunk(&mut stream, idle, "upstream body interrupted").await {
+        let chunk = chunk?;
         if bytes.len() + chunk.len() > cap {
             return Err("upstream response exceeds size limit".into());
         }
@@ -602,12 +626,13 @@ async fn collect_response(
     response: reqwest::Response,
     to: Dialect,
     call: &mut CallGuard,
+    idle: Duration,
 ) -> Result<Value, String> {
     let mut decoder = Frames::default();
     let mut upstream = response.bytes_stream();
     let mut collected = Collected::default();
-    while let Some(chunk) = upstream.next().await {
-        for frame in decoder.feed(&chunk.map_err(|_| "upstream stream interrupted")?)? {
+    while let Some(chunk) = next_chunk(&mut upstream, idle, "upstream stream interrupted").await {
+        for frame in decoder.feed(&chunk?)? {
             collected.frame(&frame, to, call)?;
         }
     }
@@ -665,6 +690,7 @@ fn stream_response(
     to: Dialect,
     model: String,
     call: CallGuard,
+    idle: Duration,
 ) -> Response {
     let bridge = if from == to {
         None
@@ -680,12 +706,12 @@ fn stream_response(
     );
     let stream = futures_util::stream::unfold(
         state,
-        |(mut upstream, mut frames, mut bridge, mut call, mut done)| async move {
+        move |(mut upstream, mut frames, mut bridge, mut call, mut done)| async move {
             if done {
                 return None;
             }
             loop {
-                let next = upstream.next().await;
+                let next = next_chunk(&mut upstream, idle, "upstream stream interrupted").await;
                 let output: Result<Option<Bytes>, String> = match next {
                     Some(Ok(chunk)) => match frames.feed(&chunk) {
                         Ok(events) => {
@@ -713,7 +739,7 @@ fn stream_response(
                         }
                         Err(e) => Err(e),
                     },
-                    Some(Err(_)) => Err("upstream stream interrupted".into()),
+                    Some(Err(e)) => Err(e),
                     None => {
                         done = true;
                         if let Some(b) = bridge.as_mut() {
