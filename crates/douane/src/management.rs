@@ -363,6 +363,7 @@ pub struct Params {
     pub provider: Option<String>,
     pub name: Option<String>,
     pub state: Option<String>,
+    pub ids: Option<String>,
 }
 pub async fn public_models(
     State(state): State<Arc<AppState>>,
@@ -376,8 +377,74 @@ pub async fn public_models(
         .filter(|a| a.enabled)
         .map(|a| a.provider)
         .collect();
-    let data:Vec<_>=state.models.read().await.iter().filter(|m|m.enabled&&ready.contains(&m.provider)&&query.provider.as_ref().is_none_or(|p|p.split(',').any(|p|p==m.provider.as_str()))).map(|m|json!({"id":m.id,"object":"model","created":0,"owned_by":m.provider.as_str(),"name":m.name,"label":m.name,"context_length":m.context_length,"thinking":m.thinking,"supported_endpoint_types":["anthropic","openai","openai-response"],"supports_websockets":true})).collect();
+    let upstream = query.ids.as_deref() == Some("upstream");
+    let models = state.models.read().await;
+    let mut listed:Vec<_>=models.iter().filter(|m|m.enabled&&ready.contains(&m.provider)&&query.provider.as_ref().is_none_or(|p|p.split(',').any(|p|p==m.provider.as_str()))).collect();
+    if upstream {
+        // The provider's own view: its ids, and its order. A client that
+        // starts on the first model of a list, as the Grok CLI does, then
+        // starts on the provider's default.
+        listed.sort_by_key(|m| {
+            (
+                m.provider.as_str(),
+                crate::state::catalog_rank(m.provider, &m.upstream_id),
+            )
+        });
+    }
+    let data: Vec<_> = listed
+        .into_iter()
+        .map(|m| public_model(m, upstream))
+        .collect();
     Json(json!({"object":"list","data":data}))
+}
+/// One row of the client model list. `context_window` and `reasoning_efforts`
+/// repeat `context_length` and `thinking.levels` under the names the Grok CLI
+/// reads from an endpoint's list: without them it assumes a 256,000 token
+/// window and offers no effort. `upstream` names the model as its provider
+/// does, for a client that knows its own models by those names.
+fn public_model(model: &crate::state::Model, upstream: bool) -> Value {
+    let id = if upstream && !model.upstream_id.is_empty() {
+        &model.upstream_id
+    } else {
+        &model.id
+    };
+    json!({"id":id,"object":"model","created":0,"owned_by":model.provider.as_str(),"name":model.name,"label":model.name,"context_length":model.context_length,"context_window":model.context_length,"thinking":model.thinking,"reasoning_efforts":reasoning_efforts(model.thinking.as_ref()),"supported_endpoint_types":["anthropic","openai","openai-response"],"supports_websockets":true})
+}
+/// A model's effort levels as the Grok CLI lists them: highest first, `high`
+/// flagged as the default when the model offers it. Null without levels.
+fn reasoning_efforts(thinking: Option<&Value>) -> Option<Value> {
+    let levels: Vec<&str> = thinking?
+        .get("levels")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    if levels.is_empty() {
+        return None;
+    }
+    Some(
+        levels
+            .iter()
+            .rev()
+            .map(|level| {
+                let label = match *level {
+                    "xhigh" => "Extra high".to_owned(),
+                    other => {
+                        let mut letters = other.chars();
+                        letters
+                            .next()
+                            .map(|first| first.to_uppercase().chain(letters).collect())
+                            .unwrap_or_default()
+                    }
+                };
+                let mut entry = json!({"value": level, "label": label});
+                if *level == "high" {
+                    entry["default"] = json!(true);
+                }
+                entry
+            })
+            .collect(),
+    )
 }
 pub async fn public_quotas(State(state): State<Arc<AppState>>) -> Json<Value> {
     let settings = state.config.read().await.settings.clone();
@@ -610,5 +677,98 @@ mod tests {
         assert_eq!(missing.headers()[header::CACHE_CONTROL], "no-store");
         let body = missing.into_body().collect().await.unwrap().to_bytes();
         assert!(!String::from_utf8_lossy(&body).contains("private-fixture"));
+    }
+
+    #[test]
+    fn model_rows_carry_the_window_and_efforts_the_grok_cli_reads() {
+        let model = |thinking: Option<Value>| crate::state::Model {
+            id: "xai/grok-test".into(),
+            provider: SubscriptionProvider::Xai,
+            name: "Grok Test".into(),
+            context_length: Some(500_000),
+            max_output_tokens: None,
+            enabled: true,
+            upstream_id: "grok-test".into(),
+            thinking,
+        };
+        let scaled = model(Some(
+            json!({"levels":["none","low","high","xhigh"],"zero_allowed":true}),
+        ));
+        let row = public_model(&scaled, false);
+        assert_eq!(row["id"], "xai/grok-test");
+        assert_eq!(public_model(&scaled, true)["id"], "grok-test");
+        assert_eq!(row["context_length"], 500_000);
+        assert_eq!(row["context_window"], 500_000);
+        assert_eq!(
+            row["thinking"]["levels"],
+            json!(["none", "low", "high", "xhigh"])
+        );
+        assert_eq!(
+            row["reasoning_efforts"],
+            json!([
+                {"value":"xhigh","label":"Extra high"},
+                {"value":"high","label":"High","default":true},
+                {"value":"low","label":"Low"},
+                {"value":"none","label":"None"}
+            ])
+        );
+        // A model without a level scale offers no effort, and none is flagged
+        // when `high` is not on the scale.
+        for thinking in [None, Some(json!({"min":1024,"max":128000}))] {
+            assert_eq!(
+                public_model(&model(thinking), false)["reasoning_efforts"],
+                Value::Null
+            );
+        }
+        let unflagged = public_model(&model(Some(json!({"levels":["minimal","low"]}))), false);
+        assert_eq!(
+            unflagged["reasoning_efforts"],
+            json!([{"value":"low","label":"Low"},{"value":"minimal","label":"Minimal"}])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_view_lists_its_own_ids_in_its_own_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = crate::settings::Config::default();
+        config.server.auth_dir = directory.path().join("auth");
+        config.server.database = directory.path().join("requests.sqlite");
+        let state = AppState::new(config, None).unwrap();
+        state
+            .accounts
+            .import(
+                json!({"type":"xai","access_token":"fixture-access","account_id":"fixture-identity"}),
+                None,
+            )
+            .await
+            .unwrap();
+        state.refresh_models().await;
+        let ids = |ids: Option<&str>| {
+            let query = Params {
+                provider: Some("xai".into()),
+                ids: ids.map(Into::into),
+                ..Params::default()
+            };
+            let state = state.clone();
+            async move {
+                let Json(body) = public_models(State(state), Query(query)).await;
+                body["data"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| row["id"].as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>()
+            }
+        };
+        let catalog: Vec<String> = crate::state::catalog()
+            .iter()
+            .filter(|model| model.provider == SubscriptionProvider::Xai)
+            .map(|model| model.id.clone())
+            .collect();
+        assert!(catalog.len() > 1);
+        assert_eq!(ids(Some("upstream")).await, catalog);
+        let mut prefixed: Vec<String> = catalog.iter().map(|id| format!("xai/{id}")).collect();
+        prefixed.sort();
+        assert_eq!(ids(None).await, prefixed);
     }
 }

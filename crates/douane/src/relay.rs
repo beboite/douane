@@ -282,6 +282,14 @@ pub async fn forward(
         Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, &e),
     };
     value["model"] = json!(model);
+    // The Grok CLI repeats its model in a header, which gets the provider's id
+    // as the body does: xAI does not know the gateway's prefix.
+    let mut headers = headers;
+    if headers.contains_key("x-grok-model-override") {
+        if let Ok(named) = model.parse() {
+            headers.insert("x-grok-model-override", named);
+        }
+    }
     let mut last_status = StatusCode::BAD_GATEWAY;
     // The last native refusal, returned as is when every account refused.
     let mut last_native: Option<Response> = None;

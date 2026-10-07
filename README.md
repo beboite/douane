@@ -87,10 +87,12 @@ Boite and other OpenAI-compatible clients can use the same base URL, placeholder
 
 For Claude Code, set `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` and `ANTHROPIC_AUTH_TOKEN=douane`, then select a connected Claude model. Claude Code adds `/v1/messages` to the base URL. The dashboard's Configurer un outil page provides the client settings.
 
+For the Grok CLI, set `XAI_API_KEY=douane`, point `GROK_MODELS_BASE_URL` and `GROK_XAI_API_BASE_URL` at `http://127.0.0.1:8787/v1`, and set `GROK_MODELS_LIST_URL=http://127.0.0.1:8787/v1/models?provider=xai&ids=upstream`. The `provider` parameter keeps one provider's models, or several separated by commas, and `ids=upstream` lists them as xAI does, without the `xai/` prefix and with xAI's default first: the CLI starts on the first model of the list. It also reads each model's context window and effort scale there. A session stored by `grok login` takes precedence over the key and would be sent to Douane in its place: set `GROK_AUTH_PATH` to a file that does not exist to leave it out.
+
 | Endpoint | Support |
 | --- | --- |
 | `GET /health` | Service health |
-| `GET /v1/models` | Available models |
+| `GET /v1/models` | Available models, optionally of the providers named in `provider` and under their provider's own ids and order with `ids=upstream` |
 | `GET /v1/quotas` | Quotas per provider, per account or averaged, for Boite |
 | `POST /v1/chat/completions` | Chat Completions, including streaming |
 | `POST /v1/messages` | Anthropic Messages, including streaming |

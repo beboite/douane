@@ -17,6 +17,7 @@ pub fn session_key(headers: &HeaderMap, body: &Value) -> Option<String> {
         "thread-id",
         "x-codex-thread-id",
         "x-claude-code-session-id",
+        "x-grok-session-id",
     ]
     .iter()
     .find_map(|key| {
@@ -135,6 +136,10 @@ mod tests {
             session_key(&h, &json!({})),
             session_key(&HeaderMap::new(), &json!({"prompt_cache_key":"same"}))
         );
+        // The Grok CLI names its session in a header of its own and sends no cache key.
+        let mut grok = HeaderMap::new();
+        grok.insert("x-grok-session-id", "same".parse().unwrap());
+        assert_eq!(session_key(&grok, &json!({})), session_key(&h, &json!({})));
     }
     #[test]
     fn response_flood_does_not_evict_conversation_pins() {

@@ -1683,6 +1683,25 @@ async fn native_websocket_heartbeat_expires_silent_downstream_with_healthy_upstr
 }
 
 #[tokio::test]
+async fn grok_cli_model_header_reaches_the_provider_with_its_own_id() {
+    let fixture = Fixture::new(&[("xai", "grok-cli")], Strategy::FillFirst).await;
+    let response = fixture
+        .client
+        .post(format!("{}/v1/chat/completions", fixture.gateway.url))
+        .header("x-grok-model-override", "xai/gpt-test")
+        .json(&json!({"model":"xai/gpt-test","messages":[{"role":"user","content":"hello"}],"stream":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.unwrap();
+    let received = fixture.received();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].body["model"], "gpt-test");
+    assert_eq!(received[0].headers["x-grok-model-override"], "gpt-test");
+}
+
+#[tokio::test]
 async fn http_subscription_websocket_streams_history_cancellation_and_warmup() {
     let fixture = Fixture::new(&[("xai", "compatible")], Strategy::FillFirst).await;
     let mut socket = fixture.socket("conversation-compatible").await;

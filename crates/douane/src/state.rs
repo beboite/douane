@@ -37,6 +37,24 @@ fn yes() -> bool {
     true
 }
 
+/// The bundled catalog, each provider's models in that provider's own order.
+pub(crate) fn catalog() -> &'static [Model] {
+    static CATALOG: std::sync::OnceLock<Vec<Model>> = std::sync::OnceLock::new();
+    CATALOG.get_or_init(|| {
+        serde_json::from_str(include_str!("../data/models.json")).unwrap_or_default()
+    })
+}
+
+/// A model's place in its provider's own list, the provider's default first.
+/// A model the catalog does not name comes after the ones it does.
+pub(crate) fn catalog_rank(provider: SubscriptionProvider, upstream_id: &str) -> usize {
+    catalog()
+        .iter()
+        .filter(|model| model.provider == provider)
+        .position(|model| model.id == upstream_id)
+        .unwrap_or(usize::MAX)
+}
+
 pub struct AppState {
     pub config: RwLock<Config>,
     pub config_path: Option<PathBuf>,
@@ -97,8 +115,7 @@ impl AppState {
     }
 
     pub async fn refresh_models(&self) {
-        let bundled: Vec<Model> =
-            serde_json::from_str(include_str!("../data/models.json")).unwrap_or_default();
+        let bundled = catalog();
         let mut models: BTreeMap<String, Model> = BTreeMap::new();
         let disabled = self.config.read().await.disabled_models.clone();
         for summary in self.accounts.list().await {
