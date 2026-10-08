@@ -526,4 +526,25 @@ mod tests {
         assert_eq!(first(&state).await, ids[0]);
         assert!(!state.credits_avoidable(&paid, "gpt-5.5").await);
     }
+
+    #[tokio::test]
+    async fn claude_haiku_5_5_goes_to_a_claude_account() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.server.auth_dir = directory.path().join("auth");
+        config.server.database = directory.path().join("requests.sqlite");
+        let state = AppState::new(config, None).unwrap();
+        let claude = state
+            .accounts
+            .import(json!({"type":"claude","access_token":"fixture"}), None)
+            .await
+            .unwrap();
+        state.refresh_models().await;
+        let (upstream, accounts) = state
+            .candidates("claude-haiku-5-5", None, None)
+            .await
+            .unwrap();
+        assert_eq!(upstream, "claude-haiku-5-5");
+        assert_eq!(accounts[0].id, claude.id);
+    }
 }
