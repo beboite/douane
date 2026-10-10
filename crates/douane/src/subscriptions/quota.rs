@@ -821,7 +821,8 @@ fn parse_claude(value: &Value, observed: time::OffsetDateTime) -> Vec<QuotaWindo
             let used = number(window.get("percent"));
             let model = window.pointer("/scope/model/id").and_then(Value::as_str);
             let kind = text(window, &["kind", "group"]).unwrap_or_else(|| format!("limit-{index}"));
-            let id = if kind.contains("5") || kind.contains("five") {
+            // Claude names its five-hour window "session" in this list.
+            let id = if kind.contains("5") || kind.contains("five") || kind.contains("session") {
                 "five-hour".into()
             } else if kind.contains("7") || kind.contains("week") {
                 model
@@ -1061,6 +1062,28 @@ mod tests {
 
     fn observed() -> time::OffsetDateTime {
         parse_timestamp("2026-10-03T12:00:00Z").unwrap()
+    }
+
+    #[test]
+    fn claude_session_limit_is_the_five_hour_window_not_a_third_one() {
+        let reset = "2026-10-03T16:00:00Z";
+        let windows = parse_claude(
+            &json!({
+                "five_hour": {"utilization": 53, "resets_at": reset},
+                "seven_day": {"utilization": 32, "resets_at": "2026-10-07T23:00:00Z"},
+                "limits": [{"kind": "session", "percent": 53, "resets_at": reset}]
+            }),
+            observed(),
+        );
+        let ids: Vec<_> = windows.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["five-hour", "seven-day"]);
+        // Without the legacy field, the session limit still reads as five hours.
+        let only = parse_claude(
+            &json!({"limits": [{"kind": "session", "percent": 10, "resets_at": reset}]}),
+            observed(),
+        );
+        assert_eq!(only[0].id, "five-hour");
+        assert_eq!(only[0].remaining_percent, Some(90.0));
     }
 
     #[tokio::test]
