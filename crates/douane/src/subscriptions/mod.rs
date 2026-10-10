@@ -14,6 +14,7 @@ pub use quota::{QuotaCredits, QuotaService, QuotaSnapshot, QuotaWindow};
 pub use reset::{ResetError, ResetManager, ResetOutcome, ResetRedemption, ResetStatus};
 pub use store::{
     AccountCredential, AccountStore, AccountSummary, SubscriptionProvider, SubscriptionTier,
+    valid_reserve,
 };
 
 pub struct GoogleVerification {
@@ -63,6 +64,8 @@ pub enum SubscriptionError {
     SessionRevoked,
     #[error("provider OAuth client is not configured")]
     OAuthNotConfigured,
+    #[error("reserve_percent must be greater than 0 and less than 100, or null/0 to clear")]
+    InvalidReserve,
 }
 
 impl SubscriptionError {

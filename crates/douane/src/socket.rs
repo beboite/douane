@@ -478,8 +478,11 @@ async fn run(mut downstream: WebSocket, state: Arc<AppState>, headers: HeaderMap
                                 break;
                             }
                             if pending == 0 { attempted.clear(); }
-                            let usable = state.accounts.get(&account.id).await.is_some_and(|a| account_eligible(&a, &requested))
-                                && !state.credits_avoidable(&account, &requested).await;
+                            let usable = match state.accounts.get(&account.id).await.filter(|a| account_eligible(a, &requested)) {
+                                Some(current) => !state.reserve_excludes(&current).await
+                                    && !state.credits_avoidable(&current, &requested).await,
+                                None => false,
+                            };
                             if !usable {
                                 if has_previous(&body) {
                                     previous_not_found(&mut downstream, &body).await;

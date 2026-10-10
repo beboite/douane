@@ -136,6 +136,7 @@ pub struct AccountSummary {
     pub enabled: bool,
     pub status: String,
     pub last_error: Option<String>,
+    pub reserve_percent: Option<f64>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -181,9 +182,24 @@ pub struct AccountCredential {
     pub(crate) token_endpoint: Option<String>,
     #[serde(default)]
     pub(crate) model_exhaustion: BTreeMap<String, Option<String>>,
+    /// Share of every account-wide quota window that douane leaves unused.
+    #[serde(default)]
+    pub(crate) reserve_percent: Option<f64>,
+}
+
+/// A reserve is a share strictly between 0 and 100.
+pub fn valid_reserve(percent: f64) -> bool {
+    percent.is_finite() && percent > 0.0 && percent < 100.0
 }
 
 impl AccountCredential {
+    /// The stored reserve, ignored when a hand-edited file holds a value
+    /// outside the accepted range.
+    pub(crate) fn reserve(&self) -> Option<f64> {
+        self.reserve_percent
+            .filter(|percent| valid_reserve(*percent))
+    }
+
     pub(crate) fn summary(&self) -> AccountSummary {
         let current = time::OffsetDateTime::now_utc();
         let active = |until: &Option<String>| {
@@ -223,6 +239,7 @@ impl AccountCredential {
             enabled: self.enabled,
             status: status.into(),
             last_error: self.last_error.clone(),
+            reserve_percent: self.reserve(),
             created_at: self.created_at.clone(),
             updated_at: self.updated_at.clone(),
         }
@@ -321,6 +338,7 @@ impl AccountStore {
             account.id = previous.id.clone();
             account.created_at = previous.created_at.clone();
             account.enabled = previous.enabled;
+            account.reserve_percent = previous.reserve_percent;
             if !explicit_name {
                 account.name = previous.name.clone();
             }
@@ -346,18 +364,29 @@ impl AccountStore {
         self.modify(id, |account| account.enabled = enabled).await
     }
 
+    /// `reserve` is `Some(None)` to remove the reserve, `None` to keep it.
     pub async fn update(
         &self,
         id: &str,
         name: Option<String>,
         enabled: Option<bool>,
+        reserve: Option<Option<f64>>,
     ) -> Result<AccountSummary, SubscriptionError> {
+        if reserve
+            .flatten()
+            .is_some_and(|percent| !valid_reserve(percent))
+        {
+            return Err(SubscriptionError::InvalidReserve);
+        }
         self.modify(id, |account| {
             if let Some(name) = name {
                 account.name = name;
             }
             if let Some(enabled) = enabled {
                 account.enabled = enabled;
+            }
+            if let Some(reserve) = reserve {
+                account.reserve_percent = reserve;
             }
         })
         .await
@@ -411,6 +440,7 @@ impl AccountStore {
             .ok_or(SubscriptionError::NotFound)?;
         account.enabled = previous.enabled;
         account.name = previous.name.clone();
+        account.reserve_percent = previous.reserve_percent;
         account.plan = previous.plan.clone().or(account.plan);
         account.subscription = previous.subscription.clone().or(account.subscription);
         account.organization_id = previous.organization_id.clone().or(account.organization_id);
@@ -755,6 +785,7 @@ fn parse_import(
         client_secret: text(&value, &["client_secret"]).or_else(|| text(token, &["client_secret"])),
         token_endpoint: text(&value, &["token_endpoint"]),
         model_exhaustion: BTreeMap::new(),
+        reserve_percent: None,
     };
     apply_identity(&mut account);
     account.name = name
@@ -893,15 +924,40 @@ mod tests {
         let imported = store.import(json!({"type":"claude","access_token":"fixture-private","account_id":"fixture-account"}), None).await.unwrap();
         let stale = store.get(&imported.id).await.unwrap();
         let updated = store
-            .update(&imported.id, Some("New label".into()), Some(false))
+            .update(
+                &imported.id,
+                Some("New label".into()),
+                Some(false),
+                Some(Some(5.0)),
+            )
             .await
             .unwrap();
         assert_eq!(updated.name, "New label");
         assert!(!updated.enabled);
+        assert_eq!(updated.reserve_percent, Some(5.0));
         store.update_credential(stale).await.unwrap();
         let reopened = AccountStore::open(directory.path()).unwrap();
         assert_eq!(reopened.list().await[0].name, "New label");
         assert!(!reopened.list().await[0].enabled);
+        assert_eq!(reopened.list().await[0].reserve_percent, Some(5.0));
+        // A reimport keeps the reserve; an explicit removal clears it.
+        reopened.import(json!({"type":"claude","access_token":"rotated-fixture","account_id":"fixture-account"}), None).await.unwrap();
+        assert_eq!(reopened.list().await[0].reserve_percent, Some(5.0));
+        let cleared = reopened
+            .update(&imported.id, None, None, Some(None))
+            .await
+            .unwrap();
+        assert_eq!(cleared.reserve_percent, None);
+        // The store refuses a reserve outside 0 < percent < 100.
+        for invalid in [-1.0, 0.0, 100.0, f64::NAN, f64::INFINITY] {
+            assert!(matches!(
+                reopened
+                    .update(&imported.id, None, None, Some(Some(invalid)))
+                    .await,
+                Err(SubscriptionError::InvalidReserve)
+            ));
+        }
+        assert_eq!(reopened.list().await[0].reserve_percent, None);
     }
 
     #[test]

@@ -77,6 +77,9 @@
 		try { const result = await management.renameAccount(account.id, name); accounts = accounts.map(item => item.id === account.id ? result.account : item); }
 		finally { busy = ''; }
 	}
+	function setReserve(account: Account, reserve: number | null) {
+		return mutate('reserve', () => management.setAccountReserve(account.id, reserve), reserve == null ? 'Réserve retirée.' : 'Réserve enregistrée.');
+	}
 	async function importFiles(files: FileList) {
 		const selected = Array.from(files);
 		await mutate('import',async () => {
@@ -105,7 +108,7 @@
 			{#if failure}<div class="notice error" role="alert"><span>{failure}</span><button class="button small" onclick={() => load()} disabled={loading}>Réessayer</button></div>{/if}
 			{#if notice}<div class="notice success" role="status">{notice}<button class="icon-button" onclick={() => notice = ''} aria-label="Fermer la notification"><X size={14}/></button></div>{/if}
 			{#if loading && !summary}<div class="loading-state" role="status"><RefreshCw size={18} class="spinning"/><span>Chargement de vos abonnements...</span></div>{/if}
-			{#if screen === 'quotas'}<QuotasView {accounts} {quotas} {busy} {refresh} {rename} {settings} {setQuotaDisplay} resetUpdated={() => load(true)} connect={() => connectOpen = true}/>
+			{#if screen === 'quotas'}<QuotasView {accounts} {quotas} {busy} {refresh} {rename} {setReserve} {settings} {setQuotaDisplay} resetUpdated={() => load(true)} connect={() => connectOpen = true}/>
 			{:else if screen === 'accounts'}<AccountsView {accounts} {quotas} {busy} {rename} connect={() => connectOpen = true} {importFiles} toggle={(account) => mutate('account',() => management.setAccountEnabled(account.id,!account.enabled),account.enabled ? 'Compte désactivé.' : 'Compte activé.')} remove={(account) => mutate('account',() => management.deleteAccount(account.id),'Compte supprimé.')}/>
 			{:else if screen === 'settings'}{#if settings}{#key JSON.stringify(settings)}<SettingsView {settings} {providers} {busy} save={(next) => mutate('settings',() => management.settingsSave(next),'Réglages enregistrés.')}/>{/key}{:else}<div class="page-heading"><div><h1>Réglages</h1><p class="page-description">Les réglages seront disponibles lorsque le serveur répondra.</p></div></div>{/if}
 			{:else}{#key screen}<DataViews {screen} {summary} {calls} {models} {accounts} {busy} {navigate} toggleModel={(model) => mutate('model',() => management.setModelEnabled(model.id,model.enabled === false),'Modèle mis à jour.')}/>{/key}{/if}

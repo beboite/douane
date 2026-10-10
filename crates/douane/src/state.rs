@@ -69,6 +69,8 @@ pub struct AppState {
     pub affinity: Mutex<crate::affinity::Affinity>,
     pub management_token: Option<String>,
     pub config_write: tokio::sync::Mutex<()>,
+    /// Last background quota refresh started for an account near its reserve.
+    reserve_refresh: Mutex<BTreeMap<String, std::time::Instant>>,
 }
 
 impl AppState {
@@ -111,6 +113,7 @@ impl AppState {
             affinity: Mutex::new(crate::affinity::Affinity::default()),
             management_token,
             config_write: tokio::sync::Mutex::new(()),
+            reserve_refresh: Mutex::new(BTreeMap::new()),
         }))
     }
 
@@ -266,11 +269,14 @@ impl AppState {
             {
                 continue;
             }
-            let eligible = self.accounts.eligible(provider, Some(model)).await;
             let now = time::OffsetDateTime::now_utc();
+            let mut eligible = vec![];
             let mut candidates = vec![];
-            for a in &eligible {
+            for a in self.accounts.eligible(provider, Some(model)).await {
                 let quota = self.quotas.get(&a.id).await;
+                if self.reserve_excludes_with(&a, quota.as_ref(), now) {
+                    continue;
+                }
                 candidates.push(Candidate {
                     id: a.id.clone(),
                     remaining_percent: quota.as_ref().and_then(|q| {
@@ -284,6 +290,7 @@ impl AppState {
                         .map(|t| t.unix_timestamp()),
                     credits_only: quota.as_ref().is_some_and(|q| q.credits_only(now)),
                 });
+                eligible.push(a);
             }
             let strategy = config
                 .settings
@@ -355,11 +362,75 @@ impl AppState {
                     .get(&other.id)
                     .await
                     .is_some_and(|q| q.credits_only(now))
+                && !self.reserve_reached(&other).await
             {
                 return true;
             }
         }
         false
+    }
+
+    /// Douane leaves the account's reserve unused: an account-wide quota
+    /// window at or below it takes the account out of rotation until that
+    /// window resets. Unknown quotas never trigger it. This check only reads;
+    /// request routing uses [`Self::reserve_excludes`].
+    pub async fn reserve_reached(&self, account: &AccountCredential) -> bool {
+        let snapshot = self.quotas.get(&account.id).await;
+        reserve_reached_in(
+            account.reserve(),
+            snapshot.as_ref(),
+            time::OffsetDateTime::now_utc(),
+        )
+    }
+
+    /// Routing check for the reserve. Close to or at the reserve, a snapshot
+    /// older than a minute also starts a background quota refresh, so the
+    /// account leaves rotation in time and returns soon after its reset.
+    pub async fn reserve_excludes(&self, account: &AccountCredential) -> bool {
+        let snapshot = self.quotas.get(&account.id).await;
+        self.reserve_excludes_with(account, snapshot.as_ref(), time::OffsetDateTime::now_utc())
+    }
+
+    fn reserve_excludes_with(
+        &self,
+        account: &AccountCredential,
+        snapshot: Option<&crate::subscriptions::QuotaSnapshot>,
+        now: time::OffsetDateTime,
+    ) -> bool {
+        let (Some(reserve), Some(snapshot)) = (account.reserve(), snapshot) else {
+            return false;
+        };
+        let near = snapshot
+            .lowest_account_window(now)
+            .is_some_and(|lowest| lowest <= reserve + 10.0);
+        let stale = crate::subscriptions::parse_timestamp(&snapshot.updated_at)
+            .is_none_or(|at| now - at > time::Duration::minutes(1));
+        if near && stale {
+            self.refresh_soon(&account.id);
+        }
+        reserve_reached_in(Some(reserve), Some(snapshot), now)
+    }
+
+    fn refresh_soon(&self, id: &str) {
+        let started = std::time::Instant::now();
+        let throttle = std::time::Duration::from_secs(60);
+        {
+            let mut last = self
+                .reserve_refresh
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            // Expired entries go, so deleted accounts do not accumulate.
+            last.retain(|_, at| started.duration_since(*at) < throttle);
+            if last.contains_key(id) {
+                return;
+            }
+            last.insert(id.to_owned(), started);
+        }
+        let quotas = self.quotas.clone();
+        let id = id.to_owned();
+        tokio::spawn(async move {
+            let _ = quotas.refresh(&id).await;
+        });
     }
 
     pub async fn refresh_quotas(&self, id: Option<&str>) {
@@ -378,6 +449,19 @@ impl AppState {
             })
             .await;
     }
+}
+
+/// A valid reserve and a snapshot whose account-wide window sits at or below
+/// it. Shared by routing and the management listing.
+pub fn reserve_reached_in(
+    reserve: Option<f64>,
+    snapshot: Option<&crate::subscriptions::QuotaSnapshot>,
+    now: time::OffsetDateTime,
+) -> bool {
+    reserve
+        .filter(|percent| crate::subscriptions::valid_reserve(*percent))
+        .zip(snapshot)
+        .is_some_and(|(reserve, snapshot)| snapshot.reserve_reached(reserve, now))
 }
 
 #[cfg(test)]
@@ -546,5 +630,116 @@ mod tests {
             .unwrap();
         assert_eq!(upstream, "claude-haiku-5-5");
         assert_eq!(accounts[0].id, claude.id);
+    }
+
+    #[tokio::test]
+    async fn an_account_at_its_reserve_leaves_rotation_and_releases_its_pin() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.server.auth_dir = directory.path().join("auth");
+        config.server.database = directory.path().join("requests.sqlite");
+        let state = AppState::new(config, None).unwrap();
+        let mut ids = vec![];
+        for name in ["kept", "spare"] {
+            let account = state
+                .accounts
+                .import(
+                    json!({"type":"codex","access_token":"fixture","account_id":name,"name":name}),
+                    None,
+                )
+                .await
+                .unwrap();
+            ids.push(account.id);
+        }
+        let (kept, spare) = (ids[0].clone(), ids[1].clone());
+        let mut low = weekly(&kept, "2099-01-01T00:00:00Z");
+        low.windows[0].remaining_percent = Some(5.0);
+        state.quotas.insert_for_test(low).await;
+        state
+            .quotas
+            .insert_for_test(weekly(&spare, "2099-01-08T00:00:00Z"))
+            .await;
+        state
+            .affinity
+            .lock()
+            .unwrap()
+            .bind("codex", "session", &kept);
+        async fn order(state: &AppState) -> Result<Vec<String>, String> {
+            state
+                .candidates("gpt-5.5", Some("codex"), Some("session"))
+                .await
+                .map(|(_, accounts)| accounts.into_iter().map(|a| a.id).collect())
+        }
+        // Without a reserve, 5% left is still spent.
+        assert_eq!(order(&state).await.unwrap()[0], kept);
+
+        state
+            .accounts
+            .update(&kept, None, None, Some(Some(5.0)))
+            .await
+            .unwrap();
+        assert_eq!(order(&state).await.unwrap(), vec![spare.clone()]);
+        let reserved = state.accounts.get(&kept).await.unwrap();
+        assert!(state.reserve_reached(&reserved).await);
+
+        // The reserve is a hard floor: no other account means no request.
+        state.accounts.set_enabled(&spare, false).await.unwrap();
+        assert!(order(&state).await.is_err());
+
+        // Above the reserve, the account serves again.
+        state
+            .accounts
+            .update(&kept, None, None, Some(Some(4.0)))
+            .await
+            .unwrap();
+        assert_eq!(order(&state).await.unwrap(), vec![kept]);
+    }
+
+    #[tokio::test]
+    async fn a_stale_reached_reserve_refreshes_and_a_bad_stored_value_is_ignored() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.server.auth_dir = directory.path().join("auth");
+        config.server.database = directory.path().join("requests.sqlite");
+        let state = AppState::new(config, None).unwrap();
+        let account = state
+            .accounts
+            .import(
+                json!({"type":"codex","access_token":"fixture","account_id":"low"}),
+                None,
+            )
+            .await
+            .unwrap();
+        state
+            .accounts
+            .update(&account.id, None, None, Some(Some(5.0)))
+            .await
+            .unwrap();
+        let mut low = weekly(&account.id, "2099-01-01T00:00:00Z");
+        low.windows[0].remaining_percent = Some(2.0);
+        low.updated_at = "2026-01-01T00:00:00Z".into();
+        state.quotas.insert_for_test(low).await;
+        let credential = state.accounts.get(&account.id).await.unwrap();
+        // The listing check reads only.
+        assert!(state.reserve_reached(&credential).await);
+        assert!(state.reserve_refresh.lock().unwrap().is_empty());
+        // Removing the account keeps the spawned refresh off the network.
+        state.accounts.delete(&account.id).await.unwrap();
+        assert!(state.reserve_excludes(&credential).await);
+        assert!(
+            state
+                .reserve_refresh
+                .lock()
+                .unwrap()
+                .contains_key(&account.id)
+        );
+
+        // A hand-edited file outside 0 < reserve < 100 never parks the account.
+        let mut edited = credential.clone();
+        for invalid in [150.0, f64::INFINITY, f64::NAN, -3.0] {
+            edited.reserve_percent = Some(invalid);
+            assert!(!state.reserve_reached(&edited).await, "{invalid}");
+            assert_eq!(edited.summary().reserve_percent, None);
+        }
     }
 }

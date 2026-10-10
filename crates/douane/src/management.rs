@@ -119,7 +119,32 @@ pub async fn guard(State(state): State<Arc<AppState>>, request: Request, next: N
 }
 
 pub async fn accounts(State(state): State<Arc<AppState>>) -> Json<Value> {
-    Json(json!({"accounts":state.accounts.list().await}))
+    let now = time::OffsetDateTime::now_utc();
+    let mut accounts = vec![];
+    for summary in state.accounts.list().await {
+        accounts.push(account_value(&state, summary, now).await);
+    }
+    Json(json!({"accounts":accounts}))
+}
+
+/// An account summary with its reserve state, as listed and as returned after
+/// a change. `reserve_measured` is null until a quota read has succeeded and
+/// false only when the provider reports no account-wide window.
+async fn account_value(
+    state: &AppState,
+    summary: crate::subscriptions::AccountSummary,
+    now: time::OffsetDateTime,
+) -> Value {
+    let snapshot = state.quotas.get(&summary.id).await;
+    let measured = snapshot
+        .as_ref()
+        .filter(|q| !(q.windows.is_empty() && q.error.is_some()))
+        .map(|q| q.reports_account_window());
+    let reached = crate::state::reserve_reached_in(summary.reserve_percent, snapshot.as_ref(), now);
+    let mut value = json!(summary);
+    value["reserve_measured"] = json!(measured);
+    value["reserve_reached"] = json!(reached);
+    value
 }
 pub async fn account_verification(
     State(state): State<Arc<AppState>>,
@@ -211,6 +236,13 @@ pub async fn import(State(state): State<Arc<AppState>>, Json(body): Json<Value>)
 pub struct AccountPatch {
     name: Option<String>,
     enabled: Option<bool>,
+    /// Absent keeps the reserve; `null` or `0` removes it.
+    #[serde(default, deserialize_with = "present")]
+    reserve_percent: Option<Option<f64>>,
+}
+
+fn present<'de, D: serde::Deserializer<'de>>(value: D) -> Result<Option<Option<f64>>, D::Error> {
+    Option::<f64>::deserialize(value).map(Some)
 }
 
 pub async fn update_account(
@@ -227,16 +259,38 @@ pub async fn update_account(
             "name must contain 1 to 120 characters without control characters",
         );
     }
-    if name.is_none() && body.enabled.is_none() {
-        return error(StatusCode::BAD_REQUEST, "provide a name or enabled state");
+    let reserve = body
+        .reserve_percent
+        .map(|reserve| reserve.filter(|percent| *percent != 0.0));
+    if reserve
+        .flatten()
+        .is_some_and(|percent| !crate::subscriptions::valid_reserve(percent))
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            &crate::subscriptions::SubscriptionError::InvalidReserve.to_string(),
+        );
     }
-    match state.accounts.update(&id, name, body.enabled).await {
-        Ok(a) => Json(json!({"account":a})).into_response(),
+    if name.is_none() && body.enabled.is_none() && reserve.is_none() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "provide a name, enabled state or reserve",
+        );
+    }
+    match state
+        .accounts
+        .update(&id, name, body.enabled, reserve)
+        .await
+    {
+        Ok(a) => {
+            let account = account_value(&state, a, time::OffsetDateTime::now_utc()).await;
+            Json(json!({ "account": account })).into_response()
+        }
         Err(e) => error(
-            if matches!(e, crate::subscriptions::SubscriptionError::NotFound) {
-                StatusCode::NOT_FOUND
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
+            match e {
+                crate::subscriptions::SubscriptionError::NotFound => StatusCode::NOT_FOUND,
+                crate::subscriptions::SubscriptionError::InvalidReserve => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
             },
             &e.to_string(),
         ),
@@ -618,6 +672,7 @@ pub async fn patch_auth_file(
         Json(AccountPatch {
             name: None,
             enabled: Some(!body["disabled"].as_bool().unwrap_or(false)),
+            reserve_percent: None,
         }),
     )
     .await
@@ -653,6 +708,116 @@ mod tests {
     use super::*;
     use http_body_util::BodyExt;
 
+    #[tokio::test]
+    async fn account_listing_reports_reserve_state_per_quota_shape() {
+        use crate::subscriptions::{QuotaSnapshot, QuotaWindow};
+        let directory = tempfile::TempDir::new().unwrap();
+        let mut config = crate::settings::Config::default();
+        config.server.auth_dir = directory.path().join("auth");
+        config.server.database = directory.path().join("requests.sqlite");
+        let state = AppState::new(config, None).unwrap();
+        let window = |id: &str, remaining: f64, reset: &str| QuotaWindow {
+            id: id.into(),
+            label: id.into(),
+            remaining_percent: Some(remaining),
+            reset_at: Some(reset.into()),
+            used: None,
+            limit: Some(100.0),
+        };
+        let snapshot = |id: &str, windows: Vec<QuotaWindow>, error: Option<&str>| QuotaSnapshot {
+            account_id: id.into(),
+            provider: SubscriptionProvider::Claude,
+            windows,
+            updated_at: crate::subscriptions::now(),
+            error: error.map(Into::into),
+            subscription: None,
+            credits: vec![],
+            verification_required: false,
+            verification_available: false,
+        };
+        let later = "2099-01-01T00:00:00Z";
+        let past = "2020-01-01T00:00:00Z";
+        // name, stored quota (windows, error), expected measured, expected reached
+        let cases: Vec<(&str, Option<(Vec<QuotaWindow>, Option<&str>)>, Value, bool)> = vec![
+            (
+                "low",
+                Some((vec![window("five-hour", 3.0, later)], None)),
+                json!(true),
+                true,
+            ),
+            (
+                "scoped",
+                Some((vec![window("seven-day-opus", 0.0, later)], None)),
+                json!(false),
+                false,
+            ),
+            (
+                "reset",
+                Some((vec![window("five-hour", 1.0, past)], None)),
+                json!(true),
+                false,
+            ),
+            (
+                "failed",
+                Some((vec![], Some("provider request failed"))),
+                Value::Null,
+                false,
+            ),
+            ("unread", None, Value::Null, false),
+        ];
+        let mut ids = vec![];
+        for (name, quota, _, _) in &cases {
+            let account = state
+                .accounts
+                .import(
+                    json!({"type":"claude","access_token":"fixture","account_id":name,"name":name}),
+                    None,
+                )
+                .await
+                .unwrap();
+            state
+                .accounts
+                .update(&account.id, None, None, Some(Some(5.0)))
+                .await
+                .unwrap();
+            if let Some((windows, error)) = quota {
+                state
+                    .quotas
+                    .insert_for_test(snapshot(&account.id, windows.clone(), *error))
+                    .await;
+            }
+            ids.push(account.id);
+        }
+        let Json(body) = accounts(State(state.clone())).await;
+        for ((name, _, measured, reached), id) in cases.iter().zip(&ids) {
+            let row = body["accounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["id"] == *id)
+                .unwrap();
+            assert_eq!(row["reserve_measured"], *measured, "{name}");
+            assert_eq!(row["reserve_reached"], *reached, "{name}");
+        }
+        // A change returns the same enriched shape as the listing.
+        let response = update_account(
+            State(state.clone()),
+            Path(ids[0].clone()),
+            Json(AccountPatch {
+                name: Some("Renamed".into()),
+                enabled: None,
+                reserve_percent: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["account"]["name"], "Renamed");
+        assert_eq!(body["account"]["reserve_measured"], true);
+        assert_eq!(body["account"]["reserve_reached"], true);
+    }
     #[tokio::test]
     async fn verification_redirect_exposes_challenge_only_as_no_store_location() {
         let challenge = "https://accounts.google.com/signin/continue?challenge=private-fixture";

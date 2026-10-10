@@ -3,6 +3,7 @@ export type Account = {
 	id: string; name: string; provider: string; email?: string | null; plan?: string | null;
 	subscription?: Subscription | null;
 	enabled: boolean; status: string; last_error?: string | null; updated_at?: string | null;
+	reserve_percent?: number | null; reserve_measured?: boolean | null; reserve_reached?: boolean;
 };
 export type QuotaWindow = { id: string; label: string; remaining_percent: number | null; reset_at?: string | null };
 export type Subscription = { id: string; label: string; multiplier?: number | null; source: string };
@@ -54,6 +55,7 @@ export const management = {
 	importCredential: (credential: { type: string; name: string; access_token: string; base_url: string }) => request<ImportResult>('/accounts/import', { method: 'POST', body: JSON.stringify(credential) }),
 	setAccountEnabled: (id: string, enabled: boolean) => request(`/accounts/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ enabled }) }),
 	renameAccount: (id: string, name: string) => request<{ account: Account }>(`/accounts/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ name }) }),
+	setAccountReserve: (id: string, reserve_percent: number | null) => request<{ account: Account }>(`/accounts/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ reserve_percent }) }),
 	accountResets: (id: string) => request<ResetAvailability>(`/accounts/${encodeURIComponent(id)}/resets`),
 	redeemReset: (id: string, request_id: string) => request<ResetResult>(`/accounts/${encodeURIComponent(id)}/resets/redeem`, { method: 'POST', body: JSON.stringify({ confirmation: true, request_id }) }),
 	deleteAccount: (id: string) => request(`/accounts/${encodeURIComponent(id)}`, { method: 'DELETE' }),

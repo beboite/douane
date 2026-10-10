@@ -343,6 +343,7 @@ mod tests {
             enabled: status != "disabled",
             status: status.into(),
             last_error: (status == "error").then(|| "provider request failed".into()),
+            reserve_percent: None,
             created_at: "2026-10-01T00:00:00Z".into(),
             updated_at: "2026-10-01T00:00:00Z".into(),
         }

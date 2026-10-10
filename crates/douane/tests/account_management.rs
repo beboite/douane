@@ -87,6 +87,93 @@ async fn rename_is_persistent_and_invalid_patches_do_not_partially_apply() {
 }
 
 #[tokio::test]
+async fn reserve_patch_sets_validates_and_clears_the_floor() {
+    let directory = TempDir::new().unwrap();
+    let mut config = Config::default();
+    config.server.auth_dir = directory.path().join("auth");
+    config.server.database = directory.path().join("requests.sqlite");
+    let state = AppState::new(config.clone(), None).unwrap();
+    let account = state
+        .accounts
+        .import(
+            json!({"type":"claude","access_token":"fixture-token"}),
+            None,
+        )
+        .await
+        .unwrap();
+    let app = douane::router(state.clone());
+    let path = format!("/admin/api/accounts/{}", account.id);
+    let patch = |value: Value| {
+        Request::builder()
+            .method("PATCH")
+            .uri(&path)
+            .header("content-type", "application/json")
+            .body(Body::from(value.to_string()))
+            .unwrap()
+    };
+    let reserve = || async {
+        AccountStore::open(&config.server.auth_dir)
+            .unwrap()
+            .list()
+            .await[0]
+            .reserve_percent
+    };
+
+    let response = app
+        .clone()
+        .oneshot(patch(json!({"reserve_percent":5})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["account"]["reserve_percent"], 5.0);
+    assert_eq!(reserve().await, Some(5.0));
+
+    let original = state.accounts.list().await[0].name.clone();
+    for (value, status) in [
+        (json!(-1), StatusCode::BAD_REQUEST),
+        (json!(100), StatusCode::BAD_REQUEST),
+        (json!(250.5), StatusCode::BAD_REQUEST),
+        (json!("5"), StatusCode::UNPROCESSABLE_ENTITY),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(patch(json!({"reserve_percent":value,"name":"Changed"})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{value}");
+        assert_eq!(reserve().await, Some(5.0));
+        assert_eq!(state.accounts.list().await[0].name, original);
+    }
+
+    // Renaming keeps the reserve; null and zero remove it.
+    let response = app
+        .clone()
+        .oneshot(patch(json!({"name":"Perso"})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(reserve().await, Some(5.0));
+    for clear in [json!(null), json!(0)] {
+        let setup = app
+            .clone()
+            .oneshot(patch(json!({"reserve_percent":12.5})))
+            .await
+            .unwrap();
+        assert_eq!(setup.status(), StatusCode::OK);
+        assert_eq!(reserve().await, Some(12.5));
+        let response = app
+            .clone()
+            .oneshot(patch(json!({"reserve_percent":clear})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(reserve().await, None, "{clear}");
+    }
+}
+
+#[tokio::test]
 async fn reset_redemption_requires_explicit_confirmation_and_a_valid_request_id() {
     let directory = TempDir::new().unwrap();
     let mut config = Config::default();
