@@ -3,6 +3,8 @@
 	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
 	import Plus from '@lucide/svelte/icons/plus';
 	import ExternalLink from '@lucide/svelte/icons/external-link';
+	import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
+	import Star from '@lucide/svelte/icons/star';
 	import ProviderMark from './provider-mark.svelte';
 	import QuotaMeter from './quota-meter.svelte';
 	import AccountName from './account-name.svelte';
@@ -10,17 +12,28 @@
 	import AccountResets from './account-resets.svelte';
 	import AccountReserve from './account-reserve.svelte';
 	import EmptyState from './empty-state.svelte';
-	import { providerName, formatDate, resetLabel, creditValue, usageLabel, privateLabel, accountStatus, accountWarning, type Account, type Quota, type Settings, type QuotaDisplay } from '$lib/management';
-	let { accounts, quotas, busy, refresh, connect, rename, setReserve, resetUpdated, settings, setQuotaDisplay }: { accounts: Account[]; quotas: Quota[]; busy: string; refresh: (id?: string) => void; connect: () => void; rename: (account: Account, name: string) => Promise<void>; setReserve: (account: Account, reserve: number | null) => Promise<boolean>; resetUpdated: () => Promise<void>; settings: Settings | null; setQuotaDisplay: (provider: string, display: QuotaDisplay) => Promise<void> } = $props();
+	import { providerName, formatDate, resetLabel, creditValue, usageLabel, privateLabel, accountStatus, accountWarning, type Account, type Quota, type QuotaWindow, type Settings, type QuotaDisplay, type QuotaWindowChoice } from '$lib/management';
+	let { accounts, quotas, busy, refresh, connect, rename, setReserve, resetUpdated, settings, setQuotaDisplay, setQuotaWindows }: { accounts: Account[]; quotas: Quota[]; busy: string; refresh: (id?: string) => void; connect: () => void; rename: (account: Account, name: string) => Promise<void>; setReserve: (account: Account, reserve: number | null) => Promise<boolean>; resetUpdated: () => Promise<void>; settings: Settings | null; setQuotaDisplay: (provider: string, display: QuotaDisplay) => Promise<void>; setQuotaWindows: (provider: string, choice: QuotaWindowChoice) => Promise<void> } = $props();
 	let provider = $state('all');
 	let search = $state('');
 	let sort = $state('name');
+	let windowsOpen = $state<string | null>(null);
 	const order = ['claude', 'codex', 'opencode_go', 'xai'];
 	let providerIds = $derived([...new Set(accounts.map(a => a.provider))].sort((a, b) => (order.indexOf(a) < 0 ? 99 : order.indexOf(a)) - (order.indexOf(b) < 0 ? 99 : order.indexOf(b)) || providerName(a).localeCompare(providerName(b))));
 	let filtered = $derived(accounts.filter(a => (provider === 'all' || !providerIds.includes(provider) || a.provider === provider) && `${a.name} ${a.email ?? ''}`.toLowerCase().includes(search.toLowerCase())).sort((a,b) => sort === 'remaining' ? (remaining(a.id) ?? 101) - (remaining(b.id) ?? 101) : a.name.localeCompare(b.name)));
 	let groups = $derived(providerIds.map(id => ({ id, accounts: filtered.filter(a => a.provider === id) })).filter(group => group.accounts.length));
 	function display(id: string): QuotaDisplay { return settings?.quota_display?.[id] ?? 'accounts'; }
 	async function chooseDisplay(id: string, select: HTMLSelectElement) { await setQuotaDisplay(id, select.value as QuotaDisplay); select.value = display(id); }
+	/** Every window this provider's accounts reported, in first-seen order. */
+	function windowsOf(id: string): QuotaWindow[] {
+		const ids = new Set(accounts.filter(a => a.provider === id).map(a => a.id));
+		const seen = new Map<string, QuotaWindow>();
+		for (const quota of quotas) if (ids.has(quota.account_id)) for (const window of quota.windows) if (!seen.has(window.id)) seen.set(window.id, window);
+		return [...seen.values()];
+	}
+	function choice(id: string) { const saved = settings?.quota_windows?.[id]; const primary = saved?.primary ?? null; return { hidden: (saved?.hidden ?? []).filter(w => w !== primary), primary }; }
+	function toggleShown(id: string, window: string) { const current = choice(id); const hidden = current.hidden.includes(window) ? current.hidden.filter(w => w !== window) : [...current.hidden, window]; return setQuotaWindows(id, { ...current, hidden }); }
+	function choosePrimary(id: string, window: string | null) { const current = choice(id); return setQuotaWindows(id, { hidden: current.hidden.filter(w => w !== window), primary: window }); }
 	function remaining(id: string) { const values = quotas.find(q => q.account_id === id)?.windows.map(w => w.remaining_percent).filter((v): v is number => v != null) ?? []; return values.length ? Math.min(...values) : null; }
 </script>
 
@@ -44,7 +57,22 @@
 	<div class="provider-groups">
 		{#each groups as group (group.id)}
 			<section class="provider-group" aria-label="Quotas {providerName(group.id)}">
-				<header class="provider-heading"><ProviderMark provider={group.id} size={29}/><h2>{providerName(group.id)}</h2><span>{group.accounts.length} {group.accounts.length === 1 ? 'compte' : 'comptes'}</span>{#if settings}<label class="display-choice" title="Affichage des quotas {providerName(group.id)} dans Boite et les clients de /v1/quotas"><span>Dans Boite / les clients</span><select value={display(group.id)} disabled={!!busy} onchange={(event) => chooseDisplay(group.id, event.currentTarget)}><option value="accounts">Détail par compte</option><option value="average">Moyenne des comptes</option></select></label>{/if}</header>
+				<header class="provider-heading"><ProviderMark provider={group.id} size={29}/><h2>{providerName(group.id)}</h2><span>{group.accounts.length} {group.accounts.length === 1 ? 'compte' : 'comptes'}</span>{#if settings}<label class="display-choice" title="Affichage des quotas {providerName(group.id)} dans Boite et les clients de /v1/quotas"><span>Dans Boite / les clients</span><select value={display(group.id)} disabled={!!busy} onchange={(event) => chooseDisplay(group.id, event.currentTarget)}><option value="accounts">Détail par compte</option><option value="average">Moyenne des comptes</option></select></label><button class="button small windows-toggle" aria-expanded={windowsOpen === group.id} aria-controls="windows-{group.id}" title="Fenêtres de quota {providerName(group.id)} montrées dans Boite" onclick={() => windowsOpen = windowsOpen === group.id ? null : group.id}><SlidersHorizontal size={16}/>Fenêtres</button>{/if}</header>
+					{#if settings && windowsOpen === group.id}
+						{@const current = choice(group.id)}
+						<div class="window-choices" id="windows-{group.id}" aria-label="Fenêtres {providerName(group.id)} dans Boite">
+							{#each windowsOf(group.id) as window (window.id)}
+								{@const primary = current.primary === window.id}
+								{@const shown = primary || !current.hidden.includes(window.id)}
+								<div class="window-choice" class:hidden-window={!shown}>
+									<span class="window-name">{usageLabel(window.label)}</span>
+									<button class="primary-choice" class:on={primary} aria-pressed={primary} disabled={!!busy} onclick={() => choosePrimary(group.id, primary ? null : window.id)}><Star size={16}/>{primary ? 'Principale' : 'Rendre principale'}</button>
+									<button class="switch" class:on={shown} role="switch" aria-checked={shown} aria-label="Afficher {usageLabel(window.label)} dans Boite" disabled={!!busy || primary} onclick={() => toggleShown(group.id, window.id)}><span></span></button>
+								</div>
+							{:else}<p class="quota-unavailable">Aucune fenêtre lue pour ce fournisseur.</p>{/each}
+							{#if !current.primary && windowsOf(group.id).length}<p class="window-default">Sans fenêtre principale, Boite met la semaine en avant.</p>{/if}
+						</div>
+					{/if}
 				<div class="ledger">
 					{#each group.accounts as account (account.id)}
 						{@const quota = quotas.find(q => q.account_id === account.id)}
@@ -56,7 +84,7 @@
 								<div class="quota-windows">{#if quota?.windows.length}{#each quota.windows as window (window.id)}<div class="quota-window"><QuotaMeter value={window.remaining_percent} label={usageLabel(window.label)}/><p class="reset-date" title={window.reset_at ? `Réinitialisation : ${formatDate(window.reset_at)}` : undefined}><RefreshCw size={16}/>{resetLabel(window.reset_at)}</p></div>{/each}{:else if !quota?.verification_required}<p class="quota-unavailable">{quota?.error ? privateLabel(quota.error) : 'Quota non communiqué'}</p>{/if}</div>
 								{#if quota?.credits?.length}<div class="credit-windows">{#each quota.credits as credit (credit.id)}<div class="credit-window"><div><span>{usageLabel(credit.label)}</span><strong>{credit.enabled === false ? 'Désactivé' : credit.unlimited ? 'Illimités' : creditValue(credit.remaining, credit.unit)}{#if credit.enabled !== false && credit.remaining != null}<span class="muted">{' restants'}</span>{/if}</strong></div>{#if credit.used != null}<p>{creditValue(credit.used, credit.unit)}{' utilisés'}{#if credit.limit != null}{' sur '}{creditValue(credit.limit, credit.unit)}{/if}</p>{/if}{#if credit.reset_at}<p class="reset-date"><RefreshCw size={16}/>{resetLabel(credit.reset_at)}</p>{/if}</div>{/each}</div>{/if}
 							</div>
-							<div class="account-state"><span class="state-badge" class:warning={!!quota?.error || accountWarning(account) || (account.enabled && !!account.reserve_reached)} class:inactive={!account.enabled}><span class="status-pip"></span>{!account.enabled ? 'Désactivé' : quota?.error ? 'À vérifier' : account.reserve_reached && ['ready', 'error'].includes(account.status) ? 'Réserve atteinte' : accountStatus(account)}</span><button class="icon-button" disabled={!!busy} onclick={() => refresh(account.id)} title="Actualiser ce compte" aria-label="Actualiser {privateLabel(account.name)}"><RefreshCw size={19}/></button></div>
+							<div class="account-state"><span class="state-badge" class:warning={!!quota?.error || accountWarning(account) || (account.enabled && !!account.reserve_reached)} class:inactive={!account.enabled}><span class="status-pip"></span>{!account.enabled ? 'Désactivé' : quota?.error ? 'À vérifier' : account.reserve_reached && ['ready', 'active'].includes(account.status) ? 'Réserve atteinte' : accountStatus(account)}</span><button class="icon-button" disabled={!!busy} onclick={() => refresh(account.id)} title="Actualiser ce compte" aria-label="Actualiser {privateLabel(account.name)}"><RefreshCw size={19}/></button></div>
 						</article>
 					{/each}
 				</div>
@@ -74,6 +102,17 @@
 	.provider-heading>span { margin-left: auto; font-size: 15px; color: var(--muted); }
 	.display-choice { display: flex; align-items: center; gap: 10px; margin-left: 10px; font-size: 15px; color: var(--muted); }
 	.display-choice select { background: var(--surface); font-size: 15px; }
+	.windows-toggle[aria-expanded='true'] { border-color: var(--primary); color: var(--text); }
+	.window-choices { display: grid; gap: 4px; margin: 0 0 14px; padding: 10px 16px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
+	.window-choice { display: flex; align-items: center; gap: 14px; min-height: 48px; }
+	.window-choice+.window-choice { border-top: 1px solid var(--border); }
+	.window-name { flex: 1; min-width: 0; font-size: 16px; }
+	.hidden-window .window-name { color: var(--muted); }
+	.primary-choice { display: inline-flex; align-items: center; gap: 7px; min-height: 36px; padding: 0 11px; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--muted); font-size: 15px; }
+	.primary-choice:hover:not(:disabled) { border-color: var(--border); color: var(--text); }
+	.primary-choice.on { border-color: var(--primary); color: var(--text); }
+	.primary-choice.on :global(svg) { color: var(--primary); fill: var(--primary); }
+	.window-default { margin: 6px 0 4px; font-size: 15px; color: var(--muted); }
 	.quota-row { display: grid; grid-template-columns: minmax(220px,.8fr) minmax(320px,1.8fr) auto; gap: 26px; padding: 25px 24px; border-bottom: 1px solid var(--border); align-items: center; }
 	.quota-row:last-child { border-bottom: 0; }
 	.account-identity { min-width: 0; }
@@ -93,5 +132,5 @@
 	.credit-window strong>span { font-weight: 400; }
 	.credit-window>p { margin: 8px 0 0; color: var(--muted); font-size: 15px; }
 	@media(max-width:1250px) { .quota-row { grid-template-columns: minmax(190px,.7fr) minmax(260px,1.3fr); gap: 22px; }.account-state { grid-column: 1/-1; margin-top: -8px; } }
-	@media(max-width:650px) { .quota-toolbar { flex-wrap: nowrap; margin: 18px 0 25px; gap: 10px; }.quota-toolbar>select { max-width: 140px; padding: 0 8px; }.quota-toolbar>.search-input { min-width: 0; width: auto; }.provider-groups { gap: 28px; }.provider-heading { flex-wrap: wrap; }.provider-heading h2 { font-size: 22px; }.display-choice { flex-basis: 100%; justify-content: space-between; margin-left: 0; }.display-choice select { max-width: 200px; padding: 0 8px; }.quota-row { grid-template-columns: 1fr; gap: 22px; padding: 20px 18px; }.quota-windows { grid-template-columns: 1fr; gap: 23px; }.account-state { grid-column: auto; justify-content: space-between; margin-top: 0; }.credit-window>div { flex-wrap: wrap; } }
+	@media(max-width:650px) { .quota-toolbar { flex-wrap: nowrap; margin: 18px 0 25px; gap: 10px; }.quota-toolbar>select { max-width: 140px; padding: 0 8px; }.quota-toolbar>.search-input { min-width: 0; width: auto; }.provider-groups { gap: 28px; }.provider-heading { flex-wrap: wrap; }.provider-heading h2 { font-size: 22px; }.display-choice { flex-basis: 100%; justify-content: space-between; margin-left: 0; }.display-choice select { max-width: 200px; padding: 0 8px; }.windows-toggle { margin-left: auto; }.window-choices { padding: 6px 14px; }.window-choice { gap: 10px; }.primary-choice { padding: 0 8px; }.quota-row { grid-template-columns: 1fr; gap: 22px; padding: 20px 18px; }.quota-windows { grid-template-columns: 1fr; gap: 23px; }.account-state { grid-column: auto; justify-content: space-between; margin-top: 0; }.credit-window>div { flex-wrap: wrap; } }
 </style>

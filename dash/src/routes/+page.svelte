@@ -17,7 +17,7 @@
 	import SettingsView from '$lib/components/settings-view.svelte';
 	import ConnectDialog from '$lib/components/connect-dialog.svelte';
 	import DouaneMark from '$lib/components/douane-mark.svelte';
-	import { management, importErrors, type Account, type Quota, type Provider, type Model, type Call, type Status, type Settings, type QuotaDisplay } from '$lib/management';
+	import { management, importErrors, type Account, type Quota, type Provider, type Model, type Call, type Status, type Settings, type QuotaDisplay, type QuotaWindowChoice } from '$lib/management';
 	const groups = [
 		{ label:'Abonnements', items:[{ id:'quotas',label:'Quotas',icon:Gauge },{ id:'overview',label:"Vue d'ensemble",icon:LayoutDashboard },{ id:'accounts',label:'Comptes',icon:Users },{ id:'models',label:'Modèles',icon:Boxes }] },
 		{ label:'Service',items:[{ id:'activity',label:'Requêtes',icon:Activity },{ id:'settings',label:'Réglages',icon:Settings2 },{ id:'quickstart',label:'Démarrage rapide',icon:Rocket }] }
@@ -71,6 +71,11 @@
 		if (display === 'average') next[provider] = display; else delete next[provider];
 		await mutate('settings', () => management.settingsSave({ quota_display: next }), 'Affichage dans Boite enregistré.');
 	}
+	async function setQuotaWindows(provider: string, choice: QuotaWindowChoice) {
+		const next = { ...settings?.quota_windows };
+		if (choice.hidden?.length || choice.primary) next[provider] = { hidden: choice.hidden ?? [], primary: choice.primary ?? null }; else delete next[provider];
+		await mutate('settings', () => management.settingsSave({ quota_windows: next }), 'Fenêtres affichées dans Boite enregistrées.');
+	}
 	async function rename(account: Account, name: string) {
 		if (busy) throw new Error('Une action est déjà en cours.');
 		busy = 'rename';
@@ -108,7 +113,7 @@
 			{#if failure}<div class="notice error" role="alert"><span>{failure}</span><button class="button small" onclick={() => load()} disabled={loading}>Réessayer</button></div>{/if}
 			{#if notice}<div class="notice success" role="status">{notice}<button class="icon-button" onclick={() => notice = ''} aria-label="Fermer la notification"><X size={14}/></button></div>{/if}
 			{#if loading && !summary}<div class="loading-state" role="status"><RefreshCw size={18} class="spinning"/><span>Chargement de vos abonnements...</span></div>{/if}
-			{#if screen === 'quotas'}<QuotasView {accounts} {quotas} {busy} {refresh} {rename} {setReserve} {settings} {setQuotaDisplay} resetUpdated={() => load(true)} connect={() => connectOpen = true}/>
+			{#if screen === 'quotas'}<QuotasView {accounts} {quotas} {busy} {refresh} {rename} {setReserve} {settings} {setQuotaDisplay} {setQuotaWindows} resetUpdated={() => load(true)} connect={() => connectOpen = true}/>
 			{:else if screen === 'accounts'}<AccountsView {accounts} {quotas} {busy} {rename} connect={() => connectOpen = true} {importFiles} toggle={(account) => mutate('account',() => management.setAccountEnabled(account.id,!account.enabled),account.enabled ? 'Compte désactivé.' : 'Compte activé.')} remove={(account) => mutate('account',() => management.deleteAccount(account.id),'Compte supprimé.')}/>
 			{:else if screen === 'settings'}{#if settings}{#key JSON.stringify(settings)}<SettingsView {settings} {providers} {busy} save={(next) => mutate('settings',() => management.settingsSave(next),'Réglages enregistrés.')}/>{/key}{:else}<div class="page-heading"><div><h1>Réglages</h1><p class="page-description">Les réglages seront disponibles lorsque le serveur répondra.</p></div></div>{/if}
 			{:else}{#key screen}<DataViews {screen} {summary} {calls} {models} {accounts} {busy} {navigate} toggleModel={(model) => mutate('model',() => management.setModelEnabled(model.id,model.enabled === false),'Modèle mis à jour.')}/>{/key}{/if}

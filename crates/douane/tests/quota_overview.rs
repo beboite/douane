@@ -187,3 +187,46 @@ async fn quota_display_persists_through_the_settings_api() {
     assert_eq!(body["providers"][0]["display"], "accounts");
     assert_eq!(body["providers"][0]["entries"].as_array().unwrap().len(), 2);
 }
+
+#[tokio::test]
+async fn quota_windows_persist_and_reject_bad_ids() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("douane.toml");
+    let app = douane::router(state(directory.path(), Some(path.clone())));
+    let choice = json!({"claude":{"hidden":["seven-day-opus"],"primary":"five-hour"}});
+
+    let (status, settings) = send(&app, patch_settings(json!({ "quota_windows": choice }))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(settings["quota_windows"], choice);
+    let saved = Config::load(&path).unwrap();
+    let windows = saved
+        .settings
+        .quota_windows(SubscriptionProvider::Claude)
+        .unwrap();
+    assert_eq!(windows.primary.as_deref(), Some("five-hour"));
+    assert!(windows.hidden.contains("seven-day-opus"));
+    assert!(
+        saved
+            .settings
+            .quota_windows(SubscriptionProvider::Codex)
+            .is_none()
+    );
+
+    let long = "x".repeat(81);
+    for invalid in [
+        json!({"quota_windows":{"anthropic":{}}}),
+        json!({"quota_windows":{"claude":{"hidden":[""]}}}),
+        json!({"quota_windows":{"claude":{"hidden":[long]}}}),
+        json!({"quota_windows":{"claude":{"primary":"a\nb"}}}),
+        json!({"quota_windows":{"claude":{"shown":["five-hour"]}}}),
+    ] {
+        let (status, _) = send(&app, patch_settings(invalid)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    let (_, settings) = send(&app, get("/admin/api/settings", Some("fixture-management"))).await;
+    assert_eq!(settings["quota_windows"], choice);
+
+    let (status, settings) = send(&app, patch_settings(json!({"quota_windows":{}}))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(settings["quota_windows"], json!({}));
+}

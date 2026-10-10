@@ -37,6 +37,8 @@ pub struct Settings {
     pub default_provider: Option<String>,
     /// How `/v1/quotas` presents each provider's accounts. Absent means per account.
     pub quota_display: BTreeMap<String, QuotaDisplay>,
+    /// Which windows `/v1/quotas` shows for each provider, and the one shown first.
+    pub quota_windows: BTreeMap<String, QuotaWindows>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +47,25 @@ pub enum QuotaDisplay {
     #[default]
     Accounts,
     Average,
+}
+
+/// A provider's window choices for `/v1/quotas`, by window id.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct QuotaWindows {
+    /// Window ids left out of `/v1/quotas`.
+    pub hidden: BTreeSet<String>,
+    /// The window listed first and flagged `primary`, shown even when hidden.
+    pub primary: Option<String>,
+}
+
+const MAX_WINDOW_ID: usize = 80;
+const MAX_HIDDEN_WINDOWS: usize = 64;
+
+fn window_id(id: &str) -> bool {
+    !id.trim().is_empty()
+        && id.len() <= MAX_WINDOW_ID
+        && !id.chars().any(|character| character.is_control())
 }
 
 impl Default for Server {
@@ -67,6 +88,7 @@ impl Default for Settings {
             request_timeout_seconds: 180,
             default_provider: None,
             quota_display: BTreeMap::new(),
+            quota_windows: BTreeMap::new(),
         }
     }
 }
@@ -139,7 +161,28 @@ impl Settings {
         }) {
             bail!("unknown quota display provider");
         }
+        if self.quota_windows.keys().any(|p| {
+            crate::subscriptions::SubscriptionProvider::parse(p).map(|p| p.as_str()) != Some(p)
+        }) {
+            bail!("unknown quota windows provider");
+        }
+        if self.quota_windows.values().any(|choice| {
+            choice.hidden.len() > MAX_HIDDEN_WINDOWS
+                || !choice.hidden.iter().all(|id| window_id(id))
+                || choice.primary.as_deref().is_some_and(|id| !window_id(id))
+        }) {
+            bail!(
+                "quota windows take at most {MAX_HIDDEN_WINDOWS} hidden ids of 1 to {MAX_WINDOW_ID} characters"
+            );
+        }
         Ok(())
+    }
+
+    pub fn quota_windows(
+        &self,
+        provider: crate::subscriptions::SubscriptionProvider,
+    ) -> Option<&QuotaWindows> {
+        self.quota_windows.get(provider.as_str())
     }
 
     pub fn quota_display(

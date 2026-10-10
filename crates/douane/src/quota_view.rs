@@ -5,7 +5,7 @@
 //! error categories already stored in snapshots and account summaries.
 
 use crate::{
-    settings::{QuotaDisplay, Settings},
+    settings::{QuotaDisplay, QuotaWindows, Settings},
     subscriptions::{AccountSummary, QuotaCredits, QuotaSnapshot, QuotaWindow},
     subscriptions::{SubscriptionProvider, parse_timestamp},
 };
@@ -70,13 +70,18 @@ pub fn overview(
                 (label(&account.name).to_lowercase(), account.id.clone())
             });
             let display = settings.quota_display(provider);
-            let entries = match display {
+            let mut entries: Vec<Value> = match display {
                 QuotaDisplay::Accounts => members
                     .iter()
                     .map(|(account, snapshot)| account_entry(account, *snapshot))
                     .collect(),
                 QuotaDisplay::Average => vec![average_entry(provider, &members)],
             };
+            if let Some(choice) = settings.quota_windows(provider) {
+                for entry in &mut entries {
+                    arrange(&mut entry["windows"], choice);
+                }
+            }
             json!({"provider":provider.as_str(),"name":provider_name(provider),"display":display,"entries":entries})
         })
         .collect();
@@ -230,6 +235,27 @@ fn merge_credits(snapshots: &[&QuotaSnapshot]) -> Vec<Value> {
             json!({"id":first.id,"label":first.label,"unit":first.unit,"remaining":remaining,"limit":limit,"used":used})
         })
         .collect()
+}
+
+/// Drops the provider's hidden windows and lists its primary window first,
+/// flagged `primary`. The primary window stays even when it is also hidden.
+fn arrange(windows: &mut Value, choice: &QuotaWindows) {
+    let Some(list) = windows.as_array_mut() else {
+        return;
+    };
+    let primary = choice.primary.as_deref();
+    list.retain(|window| {
+        let id = window["id"].as_str().unwrap_or_default();
+        Some(id) == primary || !choice.hidden.contains(id)
+    });
+    if let Some(index) = list
+        .iter()
+        .position(|window| primary.is_some() && window["id"].as_str() == primary)
+    {
+        let mut first = list.remove(index);
+        first["primary"] = json!(true);
+        list.insert(0, first);
+    }
 }
 
 fn window(window: &QuotaWindow) -> Value {
@@ -394,6 +420,107 @@ mod tests {
             .quota_display
             .insert(provider.as_str().into(), QuotaDisplay::Average);
         settings
+    }
+
+    #[test]
+    fn provider_windows_hide_and_lead_with_the_primary() {
+        let accounts = vec![
+            summary("a", SubscriptionProvider::Claude, "ready"),
+            summary("b", SubscriptionProvider::Claude, "ready"),
+            summary("codex", SubscriptionProvider::Codex, "ready"),
+        ];
+        let windows = || {
+            vec![
+                quota_window("five-hour", Some(60.0), None),
+                quota_window("seven-day", Some(70.0), None),
+                quota_window("seven-day-opus", Some(90.0), None),
+            ]
+        };
+        let snapshots = vec![
+            snapshot("a", windows(), vec![]),
+            snapshot("b", windows(), vec![]),
+            snapshot("codex", windows(), vec![]),
+        ];
+        let ids = |entry: &Value| -> Vec<String> {
+            entry["windows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|w| w["id"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        let mut settings = Settings::default();
+        settings.quota_windows.insert(
+            "claude".into(),
+            QuotaWindows {
+                hidden: ["seven-day-opus".into(), "five-hour".into()].into(),
+                primary: Some("five-hour".into()),
+            },
+        );
+        let value = overview(
+            accounts.clone(),
+            snapshots.clone(),
+            &settings,
+            "2026-10-04T12:00:00Z".into(),
+        );
+        let claude = &value["providers"][0]["entries"][0];
+        // The primary stays although hidden, and leads.
+        assert_eq!(ids(claude), ["five-hour", "seven-day"]);
+        assert_eq!(claude["windows"][0]["primary"], true);
+        assert_eq!(claude["windows"][1].get("primary"), None);
+        // Another provider keeps every window, none flagged.
+        let codex = &value["providers"][1]["entries"][0];
+        assert_eq!(ids(codex), ["five-hour", "seven-day", "seven-day-opus"]);
+        assert!(!value["providers"][1].to_string().contains("primary"));
+
+        // The same choice applies to the averaged entry.
+        settings
+            .quota_display
+            .insert("claude".into(), QuotaDisplay::Average);
+        settings.quota_windows.insert(
+            "claude".into(),
+            QuotaWindows {
+                hidden: ["five-hour".into()].into(),
+                primary: Some("seven-day".into()),
+            },
+        );
+        let value = overview(
+            accounts,
+            snapshots,
+            &settings,
+            "2026-10-04T12:00:00Z".into(),
+        );
+        let average = &value["providers"][0]["entries"][0];
+        assert_eq!(ids(average), ["seven-day", "seven-day-opus"]);
+        assert_eq!(average["windows"][0]["primary"], true);
+    }
+
+    #[test]
+    fn a_primary_the_reading_lacks_flags_nothing() {
+        let mut settings = Settings::default();
+        settings.quota_windows.insert(
+            "claude".into(),
+            QuotaWindows {
+                hidden: Default::default(),
+                primary: Some("monthly".into()),
+            },
+        );
+        let value = overview(
+            vec![summary("a", SubscriptionProvider::Claude, "ready")],
+            vec![snapshot(
+                "a",
+                vec![
+                    quota_window("five-hour", Some(60.0), None),
+                    quota_window("seven-day", Some(70.0), None),
+                ],
+                vec![],
+            )],
+            &settings,
+            "2026-10-04T12:00:00Z".into(),
+        );
+        let entry = &value["providers"][0]["entries"][0];
+        assert_eq!(entry["windows"].as_array().unwrap().len(), 2);
+        assert!(!entry.to_string().contains("primary"));
     }
 
     #[test]
