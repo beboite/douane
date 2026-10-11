@@ -10,10 +10,9 @@
 	import AccountName from './account-name.svelte';
 	import PrivateEmail from './private-email.svelte';
 	import AccountResets from './account-resets.svelte';
-	import AccountReserve from './account-reserve.svelte';
 	import EmptyState from './empty-state.svelte';
 	import { providerName, formatDate, resetLabel, creditValue, usageLabel, privateLabel, accountStatus, accountWarning, type Account, type Quota, type QuotaWindow, type Settings, type QuotaDisplay, type QuotaWindowChoice } from '$lib/management';
-	let { accounts, quotas, busy, refresh, connect, rename, setReserve, resetUpdated, settings, setQuotaDisplay, setQuotaWindows }: { accounts: Account[]; quotas: Quota[]; busy: string; refresh: (id?: string) => void; connect: () => void; rename: (account: Account, name: string) => Promise<void>; setReserve: (account: Account, reserve: number | null) => Promise<boolean>; resetUpdated: () => Promise<void>; settings: Settings | null; setQuotaDisplay: (provider: string, display: QuotaDisplay) => Promise<void>; setQuotaWindows: (provider: string, choice: QuotaWindowChoice) => Promise<void> } = $props();
+	let { accounts, quotas, busy, refresh, connect, rename, resetUpdated, settings, setQuotaDisplay, setQuotaWindows }: { accounts: Account[]; quotas: Quota[]; busy: string; refresh: (id?: string) => void; connect: () => void; rename: (account: Account, name: string) => Promise<void>; resetUpdated: () => Promise<void>; settings: Settings | null; setQuotaDisplay: (provider: string, display: QuotaDisplay) => Promise<void>; setQuotaWindows: (provider: string, choice: QuotaWindowChoice) => Promise<void> } = $props();
 	let provider = $state('all');
 	let search = $state('');
 	let sort = $state('name');
@@ -78,7 +77,7 @@
 						{@const quota = quotas.find(q => q.account_id === account.id)}
 						{@const subscription = quota?.subscription ?? account.subscription}
 						<article class="quota-row" class:disabled-row={!account.enabled}>
-							<div class="account-identity"><AccountName {account} {rename} {busy}/>{#if subscription?.label || account.plan}<p class="account-plan">{subscription?.label ?? account.plan}</p>{/if}{#if account.email}<PrivateEmail email={account.email}/>{/if}<AccountReserve {account} {busy} save={setReserve}/><AccountResets {account} {busy} updated={resetUpdated}/></div>
+							<div class="account-identity"><AccountName {account} {rename} {busy}/>{#if subscription?.label || account.plan}<p class="account-plan">{subscription?.label ?? account.plan}</p>{/if}{#if account.email}<PrivateEmail email={account.email}/>{/if}<AccountResets {account} {busy} updated={resetUpdated}/></div>
 							<div class="quota-details">
 								{#if quota?.verification_required}<div class="verification-needed"><p>Google demande de vérifier ce compte.</p>{#if quota.verification_available}<a class="button" href={`/admin/api/accounts/${encodeURIComponent(account.id)}/verification`} target="_blank" rel="noopener noreferrer" data-sveltekit-reload>Vérifier le compte Google<ExternalLink size={16}/></a>{:else}<p>Ouvrez Antigravity avec ce compte pour terminer la vérification.</p>{/if}</div>{/if}
 								<div class="quota-windows">{#if quota?.windows.length}{#each quota.windows as window (window.id)}<div class="quota-window"><QuotaMeter value={window.remaining_percent} label={usageLabel(window.label)}/><p class="reset-date" title={window.reset_at ? `Réinitialisation : ${formatDate(window.reset_at)}` : undefined}><RefreshCw size={16}/>{resetLabel(window.reset_at)}</p></div>{/each}{:else if !quota?.verification_required}<p class="quota-unavailable">{quota?.error ? privateLabel(quota.error) : 'Quota non communiqué'}</p>{/if}</div>
