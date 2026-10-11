@@ -1,20 +1,14 @@
 /target
+
+# Account credentials and Google OAuth clients.
 /auth/
 oauth-clients.json
 *.auth.json
 
-# The vault, in every shape it might land in. It is encrypted, but an encrypted
-# file in a public history is an offline cracking target with unlimited time.
-vault.json
-*.vault
-*.vault.json
-vault.tmp
-
-# The real configuration. The example is committed, this one names actual
-# hosts and machines.
+# The real configuration; douane.example.toml is the committed one.
 douane.toml
 
-# The request log, and SQLite's companions.
+# The request log and SQLite's companions.
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm

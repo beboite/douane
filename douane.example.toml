@@ -21,3 +21,7 @@ request_timeout_seconds = 180
 [settings.quota_display]
 # antigravity = "average"
 
+# Which windows /v1/quotas sends per provider, and which one leads.
+[settings.quota_windows]
+# claude = { hidden = ["seven-day-opus"], primary = "five-hour" }
+
