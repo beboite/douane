@@ -1,0 +1,37 @@
+# syntax=docker/dockerfile:1
+# cargo-chef builds the dependencies in their own layer, so a source change
+# reuses them from the build cache instead of compiling every crate again.
+FROM lukemathwalker/cargo-chef:0.1.78-rust-1.99.0-slim-trixie@sha256:bcda2cef02bedabfaf433379d82fecd02c0a428fb66fe28ab2d65c25c3db3b5e AS chef
+WORKDIR /src
+
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY crates crates
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS build
+COPY --from=planner /src/recipe.json recipe.json
+RUN cargo chef cook --release --locked --recipe-path recipe.json
+COPY Cargo.toml Cargo.lock ./
+COPY crates crates
+# The dashboard is compiled in the repository and embedded by the build.
+COPY dash/build dash/build
+RUN cargo build --release --locked --bin douane --bin douanectl \
+    && mkdir -p /out/data \
+    && cp target/release/douane target/release/douanectl /out/
+
+# glibc, libgcc and CA certificates, no shell, uid 65532.
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2
+COPY --from=build /out/douane /out/douanectl /usr/local/bin/
+COPY --from=build --chown=65532:65532 /out/data /data
+COPY LICENSE /usr/share/doc/douane/LICENSE
+LABEL org.opencontainers.image.title="douane" \
+      org.opencontainers.image.description="One self-hosted endpoint for every AI subscription you pay for" \
+      org.opencontainers.image.source="https://github.com/beboite/douane" \
+      org.opencontainers.image.licenses="AGPL-3.0-or-later"
+WORKDIR /data
+EXPOSE 8787
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD ["/usr/local/bin/douanectl", "health"]
+ENTRYPOINT ["/usr/local/bin/douane"]
+CMD ["--config", "/data/douane.toml", "--listen", "0.0.0.0:8787"]

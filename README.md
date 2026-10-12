@@ -1,76 +1,79 @@
 # douane
 
-douane routes AI requests through subscription accounts. It manages OAuth connections, imported credentials, model availability, quotas and account selection in a Rust service with an embedded Svelte dashboard.
+[![CI](https://github.com/beboite/douane/actions/workflows/ci.yml/badge.svg)](https://github.com/beboite/douane/actions/workflows/ci.yml)
+[![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)](LICENSE)
+![Rust 1.90+](https://img.shields.io/badge/rust-1.90%2B-orange)
 
-## Build and run
+One self-hosted endpoint for every AI subscription you pay for.
 
-Building the service requires Rust 1.90 or newer and the native linker for your platform. SQLite is bundled. The committed dashboard build is embedded in the executable, so Node.js and pnpm are only needed when changing the frontend.
+douane connects your Claude, ChatGPT (Codex), Antigravity, Grok and OpenCode Go subscriptions, then serves them to any coding tool through OpenAI- and Anthropic-compatible APIs. It watches each account's quota, picks the account that should serve the next conversation, and keeps a conversation on the same account so the provider's prompt cache stays warm. A single Rust binary with an embedded dashboard; no Node.js, Docker or external database at runtime.
+
+![Quotas page: accounts grouped by provider, with five-hour and weekly windows, resets and extra credits](docs/images/quotas.png)
+
+## Features
+
+- One base URL and one placeholder key for Claude Code, the Grok CLI, Boite and any OpenAI-compatible client.
+- Chat Completions, Anthropic Messages and Responses, streaming included, with translation between them; native Codex WebSocket sessions.
+- Live quotas per account: five-hour, daily, weekly and monthly windows, reset times, plan tier, extra credits and banked resets, refreshed in the background.
+- Four routing strategies, per provider if you like, and failover to another account of the same provider when one runs out.
+- Conversation affinity: native session ids and `prompt_cache_key` pin a conversation to its account, so cache reads keep landing.
+- Per-account reserve: stop spending an account at 5 % (or any share) so you keep some for yourself.
+- Request history with latency, token and cache counters; never conversation bodies or credentials.
+- OAuth and device sign-in from the dashboard, JSON import of existing CLI credentials, and `douanectl` for scripting.
+
+## Providers
+
+| Provider | Connect with | Quotas |
+| --- | --- | --- |
+| Claude (Pro, Max) | OAuth in the dashboard, or credential import | Five-hour, weekly and weekly Opus windows, extra usage, banked resets |
+| Codex (ChatGPT plans) | OAuth in the dashboard, or credential import | Five-hour and weekly windows, credits, banked resets |
+| Antigravity | Google OAuth once a client is configured, or import | Per-model quotas |
+| Grok (SuperGrok) | Device code in the dashboard | Weekly or monthly credit windows |
+| OpenCode Go | Subscription key in the manual form | Five-hour, weekly and monthly windows |
+| Gemini CLI, Kimi | Credential import | Read from the provider |
+| Qwen, OpenAI-compatible upstreams | Credential import | Not reported |
+
+What a provider exposes depends on the account and plan. A quota douane cannot read stays unknown; it is never estimated.
+
+## Quick start
+
+### Docker
+
+Images for `linux/amd64` and `linux/arm64` are on GitHub Container Registry: `latest` is the last release, `edge` follows `main`.
+
+```sh
+docker compose up -d   # with compose.yaml from this repository
+```
+
+or without compose:
+
+```sh
+docker run -d --name douane --restart unless-stopped \
+  -p 127.0.0.1:8787:8787 -v douane:/data ghcr.io/beboite/douane:latest
+```
+
+Accounts, the database and `douane.toml` live in the `/data` volume; put a configuration file there to change settings. The container runs as uid 65532, so a bind-mounted folder must be writable by that uid. `docker exec douane douanectl status` runs the CLI inside it. The port is published on loopback only: read [Security and data](#security-and-data) before exposing it.
+
+### From source
+
+Build with Rust 1.90 or newer. SQLite is bundled and the dashboard is already compiled into the repository.
 
 ```sh
 cargo build --workspace --release --locked
 ```
 
-The output contains `douane` and the management CLI `douanectl` under `target/release`, with `.exe` on Windows. You can copy these binaries to another machine with the same operating system and architecture. Runtime data remains in the configured credential directory and SQLite database.
+`target/release` now holds `douane` and the management CLI `douanectl`. Both are self-contained and can be copied to another machine with the same OS and architecture.
 
-Create `douane.toml`:
-
-```toml
-[server]
-listen = "127.0.0.1:8787"
-auth_dir = "auth"
-database = "douane.sqlite"
-# client_api_base_url = "http://127.0.0.1:8787/v1"
-
-[settings]
-strategy = "smart"
-quota_refresh_seconds = 300
-# Longest wait for the upstream to answer, then for each next piece of its stream.
-# A long answer keeps streaming as long as the upstream stays active.
-request_timeout_seconds = 180
-
-[settings.provider_strategies]
-codex = "reset-first"
-
-[settings.quota_display]
-antigravity = "average"
-```
+Start the service. Without a configuration file it listens on `127.0.0.1:8787` and keeps `auth/` and `douane.sqlite` in the working directory. With one, relative paths resolve from the file's folder, and settings changed in the dashboard are saved back to it. [`douane.example.toml`](douane.example.toml) lists every setting.
 
 ```sh
-douane --config douane.toml --check
+douane --config douane.toml --check   # validate, create nothing
 douane --config douane.toml
 ```
 
-Relative data paths resolve from the configuration file's directory. An absent configuration file uses the same loopback address, `auth` directory, database and default settings. `--check` validates configuration without creating runtime files. Run the service as the user that owns its credential directory and writable database. Dashboard changes to settings persist in the configuration file.
+Open `http://127.0.0.1:8787/admin`, choose **Connecter un compte** (connect an account) and sign in to a provider. When douane runs on another machine, paste the callback URL or code shown by the provider back into the dialog: the provider's localhost redirect does not need to reach the server.
 
-Open `http://127.0.0.1:8787/admin`. `/management.html` redirects to the dashboard. The default listener serves the local machine; a remote deployment can place authentication in its reverse proxy. Management endpoints also support an optional token through `server.management_token_env`, which names an environment variable. This token does not act as a client API key.
-
-## Connect accounts
-
-The dashboard starts with live empty states. Add accounts through Connecter un compte:
-
-- Claude and Codex use OAuth. Open the authorization link, then paste the returned callback URL or authorization code into the dialog. This also works when the service runs on another machine and the provider's localhost redirect cannot reach it.
-- Grok uses device authorization. Enter the displayed code on the provider's page; the dashboard polls until the account is connected or the authorization expires.
-- OpenCode Go accepts the subscription bearer credential through the manual form. Its default upstream is `https://opencode.ai/zen/go`.
-- JSON import accepts native provider credential objects and supported CLIProxyAPI auth files. Drop files into the dashboard or select them in the connection dialog. Imports report each rejected file.
-- Antigravity OAuth becomes available when its runtime OAuth client metadata is configured. Existing Gemini credential imports remain supported. Other imported account types include Kimi, Qwen and OpenAI-compatible upstreams.
-
-Google OAuth reads `oauth-clients.json` from the parent of `auth_dir`, outside the account credential directory. The object may contain `gemini` and `antigravity` entries with `client_id`, `client_secret` and optional `project_id`. Alternatively set `DOUANE_GEMINI_CLIENT_ID`, `DOUANE_GEMINI_CLIENT_SECRET`, `DOUANE_GEMINI_PROJECT_ID`, or the corresponding `DOUANE_ANTIGRAVITY_*` variables. Environment values take precedence. Restart after changing this startup configuration. The dashboard obtains OAuth availability from the service.
-
-Provider features depend on the account, plan and upstream. An unavailable quota stays unknown; douane does not fabricate an allowance. Credentials remain in local account files. SQLite stores request metadata, status, latency and token/cache counters, without conversation bodies or credential values. Click an account name to rename it. Emails start blurred and can be revealed individually.
-
-### Google account eligibility and verification
-
-Antigravity requires an eligible Google account. Google currently requires users to be at least 18 and in a supported region; its [FAQ](https://antigravity.google/docs/faq) explains eligibility and age verification. A paid subscription alone does not establish eligibility.
-
-If Google requests account verification, use Vérifier le compte Google in the account's quota card or connection dialog. The action opens Google's supplied verification page. After completing it, refresh the existing account's quotas or start a fresh connection for an account that has not yet been added.
-
-An incomplete activation returns `google_project_unavailable` when Google supplies no usable Cloud project. Check account eligibility before retrying. The connection dialog clears the consumed callback and offers a new authorization attempt; each retry needs its own callback URL. The error alone does not identify the eligibility reason. Provider diagnostics retain only known reason/status categories and structural flags, excluding tokens, account identifiers, challenge URLs and provider message text.
-
-## Use a client
-
-Set the client's base URL to `http://127.0.0.1:8787/v1`. Clients that require an API key can use the placeholder `douane`; upstream authentication uses the connected subscription. Choose a model ID returned by `/v1/models`, including its provider prefix.
-
-If the dashboard and client API use different addresses, set `server.client_api_base_url` to the API's HTTP(S) address. The dashboard uses it in client configuration snippets. An origin or a path ending in `/v1` is accepted; an existing proxy path is retained. Omit the setting to use the dashboard's origin. Credentials, query parameters and fragments are rejected.
+Then point a client at it:
 
 ```sh
 curl http://127.0.0.1:8787/v1/models
@@ -78,77 +81,99 @@ curl http://127.0.0.1:8787/v1/models
 curl http://127.0.0.1:8787/v1/chat/completions \
   -H 'Authorization: Bearer douane' \
   -H 'Content-Type: application/json' \
-  -d '{"model":"<model-id-from-v1-models>","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+  -d '{"model":"<id from /v1/models>","messages":[{"role":"user","content":"Hello"}],"stream":true}'
 ```
 
-Boite and other OpenAI-compatible clients can use the same base URL, placeholder key and provider-prefixed model ID. Boite's optional subscription proxy configuration also accepts the dashboard URL: it discovers proxy models and opens the configured dashboard from Limits. Anthropic-compatible clients can call `/v1/messages`.
+Model ids carry their provider prefix, for example `claude/...` or `codex/...`. The key `douane` is a placeholder: authentication upstream uses the connected subscription.
 
-`GET /v1/quotas` gives Boite the quotas it draws as native bars. It accepts the same client authentication as `/v1/models` and lists each provider that has accounts: Claude, Codex and Antigravity first, then the others. Each provider is shown per account by default. On the Quotas page, Dans Boite / les clients can switch a provider to Moyenne des comptes. That provider then returns one entry: the mean remaining percentage of each window, the earliest reset and summed credits (`null` when an account does not report a value). The choice is stored in `settings.quota_display`. Fenêtres, beside it, picks which windows a provider sends and its primary window: hidden window ids leave the response, and the primary one comes first with `"primary": true`, even if it is hidden. Boite shows that window largest, with its reset; without one it leads with the weekly window. The choice is stored in `settings.quota_windows`, for example `claude = { hidden = ["seven-day-opus"], primary = "five-hour" }`. Account labels mask email domains, and the response contains no credentials or provider bodies. A Douane version without this route answers 404, and Boite then falls back to the dashboard.
+![Accounts page with plan, state and reserve per account](docs/images/accounts.png)
 
-For Claude Code, set `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` and `ANTHROPIC_AUTH_TOKEN=douane`, then select a connected Claude model. Claude Code adds `/v1/messages` to the base URL. The dashboard's Configurer un outil page provides the client settings.
+## Clients
 
-For the Grok CLI, set `XAI_API_KEY=douane`, point `GROK_MODELS_BASE_URL` and `GROK_XAI_API_BASE_URL` at `http://127.0.0.1:8787/v1`, and set `GROK_MODELS_LIST_URL=http://127.0.0.1:8787/v1/models?provider=xai&ids=upstream`. The `provider` parameter keeps one provider's models, or several separated by commas, and `ids=upstream` lists them as xAI does, without the `xai/` prefix and with xAI's default first: the CLI starts on the first model of the list. It also reads each model's context window and effort scale there. A session stored by `grok login` takes precedence over the key and would be sent to Douane in its place: set `GROK_AUTH_PATH` to a file that does not exist to leave it out.
+The dashboard's **Configurer un outil** page writes these settings for you, with your own address.
 
-| Endpoint | Support |
+| Client | Settings |
+| --- | --- |
+| OpenAI-compatible tools | Base URL `http://127.0.0.1:8787/v1`, API key `douane`, a model id from `/v1/models` |
+| Claude Code | `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` (no `/v1`), `ANTHROPIC_AUTH_TOKEN=douane` |
+| Grok CLI | `XAI_API_KEY=douane`, `GROK_MODELS_BASE_URL` and `GROK_XAI_API_BASE_URL` set to `http://127.0.0.1:8787/v1`, `GROK_MODELS_LIST_URL=http://127.0.0.1:8787/v1/models?provider=xai&ids=upstream` |
+| [Boite](https://github.com/beboite/boite) | Subscription proxy set to the dashboard URL: Boite lists the models and draws each account's quota bars from `/v1/quotas` |
+
+For the Grok CLI, a session saved by `grok login` takes precedence over the key; set `GROK_AUTH_PATH` to a missing file to keep it out.
+
+If clients reach the API at a different address than the dashboard (a reverse proxy, a separate host name), set `server.client_api_base_url` so the generated snippets use it.
+
+## API
+
+| Endpoint | Purpose |
 | --- | --- |
 | `GET /health` | Service health |
-| `GET /v1/models` | Available models, optionally of the providers named in `provider` and under their provider's own ids and order with `ids=upstream` |
-| `GET /v1/quotas` | Quotas per provider, per account or averaged, for Boite |
-| `POST /v1/chat/completions` | Chat Completions, including streaming |
-| `POST /v1/messages` | Anthropic Messages, including streaming |
+| `GET /v1/models` | Available models; `?provider=xai,claude` filters, `&ids=upstream` lists provider-native ids in the provider's order |
+| `GET /v1/quotas` | Quotas per provider, per account or averaged, for client status bars |
+| `POST /v1/chat/completions` | Chat Completions, streaming included |
+| `POST /v1/messages` | Anthropic Messages, streaming included |
 | `POST /v1/messages/count_tokens` | Claude token counting, relayed to the provider |
-| `POST /v1/responses` | Responses, including streaming |
-| `POST /v1/responses/compact` | Native compaction on compatible Responses upstreams |
-| `GET /v1/responses` with WebSocket upgrade | Native Codex/Responses sessions and a streaming HTTP bridge for other subscriptions |
+| `POST /v1/responses` | Responses, streaming included |
+| `POST /v1/responses/compact` | Native compaction on compatible upstreams |
+| `GET /v1/responses` (WebSocket) | Native Codex sessions, and a streaming bridge for the other subscriptions |
 | `/admin/api/*` | Accounts, quotas, models, request history, settings and OAuth |
+| `/v0/management`, `/v8/management` | A CLIProxyAPI-compatible subset of its management API |
 
-HTTP requests can translate between Chat Completions, Messages and Responses. Translation covers the implemented text, tool and image forms; provider-specific extensions are not a promise of full protocol equivalence. Native WebSocket sessions keep one eligible upstream account. Quota and authentication failures make that account temporarily unavailable. A full request can retry on another account before any response event reaches the client. Started output and concurrent requests are never replayed automatically. A refused account rests until the provider's own reset: its `retry-after`, Claude's rejected unified window or Codex's exhausted window, else 30 seconds. A same-dialect request returns the provider's rate-limit headers and request ID, and a client error such as an oversized prompt comes back as the provider wrote it without marking the account. A refresh token the provider revoked is not sent again until the account is reconnected. A continuation that cannot use its original account returns `previous_response_not_found`, allowing the client to reconnect and resend the full conversation.
+Translation between the three dialects covers text, tools and images; provider-specific extensions do not all have an equivalent. A failed request moves to another account only before its first byte reaches the client: started output is never replayed. A same-dialect request returns the provider's own rate-limit headers and request id, and client errors such as an oversized prompt come back as the provider wrote them.
 
-The HTTP bridge processes queued responses in order, supports cancellation and retains up to eight responses within 64 MiB for incremental conversations. After reconnecting, an unavailable previous response also returns `previous_response_not_found`. Native sockets send periodic heartbeats in both directions, detect silent peers and bound blocked writes.
+## Routing and quotas
 
-`/v0/management` and `/v8/management` expose a CLIProxyAPI-compatible subset for auth files, status changes, account models, configuration, usage, logs, models and version. douane does not implement every CLIProxyAPI management operation.
+Pick a strategy in **Réglages** (settings), globally or per provider. It applies to new conversations:
 
-## Quotas and routing
-
-Choose a global strategy in Réglages and optionally override it per provider:
-
-| Value | Behavior for new conversations |
+| Strategy | Behaviour |
 | --- | --- |
-| `round-robin` | Rotate through eligible accounts |
-| `fill-first` | Keep selecting the first eligible account until it becomes unavailable |
-| `reset-first` | Use the account with the nearest known weekly reset; other accounts serve only while it is unavailable |
-| `smart` | Give 90% of new assignments to the account whose weekly reset arrives first within 48 hours, until exhausted; otherwise weight by remaining quota/time with 20% equal rotation |
+| `smart` (default) | Sends 90 % of new conversations to the account whose weekly reset comes within 48 hours, until it is exhausted; otherwise weighs remaining quota against time left, with 20 % plain rotation |
+| `reset-first` | Uses the account with the nearest weekly reset, and moves running conversations back to it as soon as it is eligible again |
+| `fill-first` | Uses the first eligible account until it becomes unavailable |
+| `round-robin` | Rotates through eligible accounts |
 
-Conversation identifiers keep an existing conversation on the same eligible account, which helps preserve upstream cache affinity. Changing a strategy affects new conversations; it does not rebalance active ones, except under `reset-first`: a conversation on any other account returns to the nearest reset as soon as that account is eligible, at the cost of one cache rebuild. Accounts with the same reset keep their conversations. A strategy picked in Réglages is saved on click. Disabled, exhausted or temporarily unavailable accounts can cause failover to another eligible account of the same provider. Request history reports cache reads and writes when the provider returns them, without estimating prices or promising a latency improvement.
+A conversation stays on its account while that account is eligible. douane recognises Codex, Claude and OpenCode session ids, `session_id` headers and `prompt_cache_key`, and keeps Claude cache controls untouched. A custom client should send one stable id per conversation. The affinity table holds 10,000 conversations for 24 hours of inactivity, in memory.
 
-Each account can keep a reserve, set from the Accounts page or with `PATCH /admin/api/accounts/{id}` and `{"reserve_percent": 5}` (`null` or `0` removes it). Once any account-wide window (such as five-hour, daily, weekly or monthly) reports that share or less, douane stops sending requests to that account, live conversations included, until that window resets. The reserve is a hard floor: with no other eligible account, requests are refused rather than spending it. It acts only on quotas the provider reports for the whole account, so per-model quotas such as Antigravity's leave it inactive, and the dashboard says so. Quotas are read periodically; close to the reserve, douane rereads them at most once a minute, so a burst of requests can still overshoot it by a little.
+When an account is refused, it rests until the provider's own reset (its `retry-after`, Claude's rejected window, Codex's exhausted window), then returns. Accounts whose subscription quota is gone but which still hold usable credits stay available behind accounts with quota left.
 
-The quota view groups accounts by provider, shows local reset dates, and displays subscription tiers and extra credits reported by the provider. Claude and Codex can expose banked resets. Consuming one requires confirmation in the dashboard. A retry retains the same request and credit, including after a service restart, so a double click cannot consume another reset. Reset availability is read through `GET /admin/api/accounts/{id}/resets`; redemption uses `POST /admin/api/accounts/{id}/resets/redeem` with `confirmation: true` and a UUID `request_id` reused for retries.
+A reserve, set per account on the Accounts page or with `PATCH /admin/api/accounts/{id}` and `{"reserve_percent": 5}`, is a hard floor: once any account-wide window reaches it, douane stops using that account, live conversations included, until the window resets. Close to the floor, quotas are reread at most once a minute, so a burst can overshoot by a little.
 
-For a custom client, send a stable `session_id` header or `prompt_cache_key` for each conversation. Reuse it on every turn and reconnect, and use a different identifier for each independent conversation. Native Codex, Claude and OpenCode session identifiers are recognized; Claude cache controls and native prompt cache keys are preserved. Cache hits still depend on the provider and the reusable prompt prefix.
+Banked resets for Claude and Codex appear on each account card. Using one asks for confirmation, and a retried click reuses the same request id, so a double click cannot spend two.
 
-The affinity table holds up to 10,000 conversations, expires entries after 24 hours without activity, and is kept in memory. A separate bounded table tracks which account produced a native response ID, so response traffic cannot evict conversation bindings. A service restart clears these tables; a WebSocket reconnect to the running service preserves the binding.
+![Overview page: active accounts, requests, tokens, cache reads and recent activity](docs/images/activity.png)
 
-## Command line management
+## Security and data
+
+- Credentials stay in `auth_dir` as local files. They never appear in the dashboard, the management API, logs or errors, and refresh-token rotation is serialised and written to disk.
+- SQLite stores request metadata only: time, model, account, status, latency and token or cache counts.
+- The default listener is loopback. To expose douane, put it behind a reverse proxy that authenticates the dashboard, and set `server.management_token_env` to require a bearer token on `/admin/api`. That token is separate from client access.
+- Google OAuth clients for Gemini and Antigravity are read from `oauth-clients.json` beside `auth_dir`, or from `DOUANE_GEMINI_*` and `DOUANE_ANTIGRAVITY_*` environment variables; douane ships none.
+
+## Command line
 
 ```sh
+douanectl health
 douanectl status
 douanectl accounts
-douanectl models
 douanectl quotas --refresh
-douanectl import account.json --name "Subscription account"
+douanectl models
+douanectl import account.json --name "Work"
+douanectl login codex
+douanectl complete <oauth-session-id> --callback-file callback.txt
 douanectl disable <account-id>
 douanectl enable <account-id>
 douanectl remove <account-id>
-douanectl login codex
-douanectl complete <oauth-session-id> --callback-file callback.txt
 ```
 
-Use `--url <service-origin>` to target another listener. `DOUANE_MANAGEMENT_TOKEN` supplies the optional management bearer token for the CLI. Credential import and OAuth completion read files rather than taking secrets as command-line values.
+`--url` targets another instance and `DOUANE_MANAGEMENT_TOKEN` supplies the management token. Secrets are read from files, never from arguments.
 
 ## Development
 
-Frontend changes require Node.js 24 and pnpm 11:
+```sh
+cargo test --workspace --all-targets --locked
+```
+
+The dashboard is Svelte 5 in [`dash/`](dash). Changing it needs Node.js 24 and pnpm 11:
 
 ```sh
 cd dash
@@ -157,10 +182,16 @@ pnpm check
 pnpm build
 ```
 
-Commit the refreshed `dash/build` alongside frontend source changes. Build Rust afterward to embed those assets. `pnpm dev` runs the dashboard development server; it needs the management API at the same origin or a proxy for `/admin/api`.
+Commit `dash/build` with the source change, then rebuild Rust to embed it. `pnpm dev` runs the dashboard alone and expects the management API at the same origin or behind a proxy for `/admin/api`.
 
-```sh
-cargo test --workspace --all-targets --locked -j 8
-```
+CI tests Rust on the minimum supported version, checks and builds the dashboard, and builds the Docker image on amd64 and arm64, then runs [`docker/smoke.sh`](docker/smoke.sh) against it; a pull request runs only the jobs its files touch. Tests run against local fake upstreams; they do not prove that a real provider accepts a given account or model.
 
-CI checks Rust on the declared minimum version and validates/builds Svelte. These checks use local test upstreams; they do not prove that a real subscription is authorized or that a provider has enabled a particular model for an account.
+A release is a tag `vX.Y.Z` equal to the version in `Cargo.toml`: CI runs again, the tested image is published as `X.Y.Z`, `X.Y` and `latest`, and the GitHub release is created.
+
+## Disclaimer
+
+douane is an independent project, not affiliated with Anthropic, OpenAI, Google, xAI or any other provider. Use it with accounts you own and within each provider's terms.
+
+## License
+
+[AGPL-3.0-or-later](LICENSE). The model catalogue in `crates/douane/data` is derived from CLIProxyAPI under the MIT license; see [NOTICE](crates/douane/data/NOTICE).

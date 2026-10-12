@@ -1,0 +1,19 @@
+version: 2
+# Actions and base images are pinned by digest; one weekly pull request moves
+# them all, so a week of updates costs one CI run.
+multi-ecosystem-groups:
+  pins:
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+      include: scope
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    multi-ecosystem-group: pins
+    patterns: ['*']
+  - package-ecosystem: docker
+    directory: /
+    multi-ecosystem-group: pins
+    patterns: ['*']

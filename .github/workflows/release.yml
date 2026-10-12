@@ -1,0 +1,72 @@
+name: Release
+
+# Push a tag vX.Y.Z matching the workspace version in Cargo.toml. Every check
+# runs, the tested image is published as X.Y.Z, X.Y and latest (a prerelease
+# such as v1.0.0-rc.1 gets its own tag only), then the GitHub release is created.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tags: ${{ steps.version.outputs.tags }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: version
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          cargo_version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          if [[ "$version" != "$cargo_version" ]]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $cargo_version"
+            exit 1
+          fi
+          tags="$version sha-$GITHUB_SHA"
+          if [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+$ ]]; then
+            tags="$tags ${BASH_REMATCH[1]}.${BASH_REMATCH[2]} latest"
+          fi
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+
+  verify:
+    needs: version
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      image-tags: ${{ needs.version.outputs.tags }}
+
+  release:
+    needs: [version, verify]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          flags=()
+          [[ "$version" == *-* ]] && flags+=(--prerelease)
+          fence=$'\x60\x60\x60'
+          printf '%s\n' 'Image for linux/amd64 and linux/arm64:' '' "${fence}sh" \
+            "docker pull ghcr.io/${GITHUB_REPOSITORY,,}:$version" "$fence" > "$RUNNER_TEMP/notes.md"
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "douane $GITHUB_REF_NAME" --generate-notes --notes-file "$RUNNER_TEMP/notes.md" "${flags[@]}"
