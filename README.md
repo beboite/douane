@@ -37,6 +37,25 @@ What a provider exposes depends on the account and plan. A quota douane cannot r
 
 ## Quick start
 
+### Docker
+
+Images for `linux/amd64` and `linux/arm64` are on GitHub Container Registry: `latest` is the last release, `edge` follows `main`.
+
+```sh
+docker compose up -d   # with compose.yaml from this repository
+```
+
+or without compose:
+
+```sh
+docker run -d --name douane --restart unless-stopped \
+  -p 127.0.0.1:8787:8787 -v douane:/data ghcr.io/beboite/douane:latest
+```
+
+Accounts, the database and `douane.toml` live in the `/data` volume; put a configuration file there to change settings. The container runs as uid 65532, so a bind-mounted folder must be writable by that uid. `docker exec douane douanectl status` runs the CLI inside it. The port is published on loopback only: read [Security and data](#security-and-data) before exposing it.
+
+### From source
+
 Build with Rust 1.90 or newer. SQLite is bundled and the dashboard is already compiled into the repository.
 
 ```sh
@@ -133,6 +152,7 @@ Banked resets for Claude and Codex appear on each account card. Using one asks f
 ## Command line
 
 ```sh
+douanectl health
 douanectl status
 douanectl accounts
 douanectl quotas --refresh
@@ -164,7 +184,9 @@ pnpm build
 
 Commit `dash/build` with the source change, then rebuild Rust to embed it. `pnpm dev` runs the dashboard alone and expects the management API at the same origin or behind a proxy for `/admin/api`.
 
-CI tests Rust on the minimum supported version and checks and builds the dashboard. Tests run against local fake upstreams; they do not prove that a real provider accepts a given account or model.
+CI tests Rust on the minimum supported version, checks and builds the dashboard, and builds the Docker image on amd64 and arm64, then runs [`docker/smoke.sh`](docker/smoke.sh) against it; a pull request runs only the jobs its files touch. Tests run against local fake upstreams; they do not prove that a real provider accepts a given account or model.
+
+A release is a tag `vX.Y.Z` equal to the version in `Cargo.toml`: CI runs again, the tested image is published as `X.Y.Z`, `X.Y` and `latest`, and the GitHub release is created.
 
 ## Disclaimer
 

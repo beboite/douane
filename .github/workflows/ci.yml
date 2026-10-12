@@ -2,40 +2,96 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      image-tags:
+        description: Space-separated tags to publish the tested image under; empty publishes nothing.
+        type: string
+        default: ''
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # A pull request runs only the jobs its files can affect; main, a release and
+  # a manual run check everything.
+  changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      dashboard: ${{ steps.filter.outputs.dashboard }}
+      image: ${{ steps.filter.outputs.image }}
+      workflows: ${{ steps.filter.outputs.workflows }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: filter
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" != pull_request ]]; then
+            printf '%s=true\n' rust dashboard image workflows >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          files=$(git diff --name-only "$BASE_SHA...HEAD")
+          printf '%s\n' "$files"
+          match() { grep -qE "$1" <<< "$files" && echo true || echo false; }
+          workflows=$(match '^\.github/')
+          # A workflow change can break any job, so it runs them all.
+          any() { [[ "$workflows" == true ]] && echo true || match "$1"; }
+          {
+            echo "rust=$(any '^(Cargo\.(toml|lock)|crates/|dash/build/)')"
+            echo "dashboard=$(any '^dash/')"
+            echo "image=$(any '^(Cargo\.(toml|lock)|crates/|dash/build/|Dockerfile|\.dockerignore|docker/|LICENSE)')"
+            echo "workflows=$workflows"
+          } >> "$GITHUB_OUTPUT"
+
   rust:
     name: Rust 1.90
-    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
-      CARGO_BUILD_JOBS: 2
       CARGO_TERM_COLOR: always
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install Rust 1.90
-        run: rustup toolchain install 1.90.0 --profile minimal
+        run: rustup toolchain install 1.90.0 --profile minimal && rustup default 1.90.0
+      # Saved from main only: a pull request's cache is visible to that pull
+      # request alone and would evict the one every pull request restores.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Test workspace
-        run: cargo +1.90.0 test --workspace --locked
+        run: cargo test --workspace --all-targets --locked
 
   dashboard:
     name: Svelte dashboard
-    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.dashboard == 'true'
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     defaults:
       run:
         working-directory: dash
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
           package-manager-cache: false
@@ -47,3 +103,54 @@ jobs:
         run: pnpm check
       - name: Build dashboard
         run: pnpm build
+
+  image:
+    name: Docker image
+    needs: changes
+    if: needs.changes.outputs.image == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/image.yml
+    with:
+      # main publishes edge; a release passes its version tags.
+      tags: ${{ inputs.image-tags || (github.event_name == 'push' && format('edge sha-{0}', github.sha) || '') }}
+
+  actionlint:
+    needs: changes
+    if: needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate workflows
+        run: |
+          curl --fail --location --retry 3 https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz -o "$RUNNER_TEMP/actionlint.tar.gz"
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $RUNNER_TEMP/actionlint.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint"
+
+  # The one check to require on main: it passes when every job the change
+  # needed passed and the others were skipped.
+  required:
+    name: CI required
+    if: always()
+    needs: [changes, rust, dashboard, image, actionlint]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          jobs = json.loads(os.environ['RESULTS'])
+          assert jobs['changes']['result'] == 'success', jobs
+          wanted = jobs['changes']['outputs']
+          for name, key in (('rust', 'rust'), ('dashboard', 'dashboard'), ('image', 'image'), ('actionlint', 'workflows')):
+              expected = 'success' if wanted[key] == 'true' else 'skipped'
+              assert jobs[name]['result'] == expected, (name, jobs[name]['result'])
+          print('All applicable checks passed')
+          PY

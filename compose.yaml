@@ -1,0 +1,13 @@
+services:
+  douane:
+    image: ghcr.io/beboite/douane:latest
+    restart: unless-stopped
+    # Loopback only: the dashboard and its management API have no login of
+    # their own. See "Security and data" in the README before exposing it.
+    ports:
+      - 127.0.0.1:8787:8787
+    volumes:
+      - douane:/data
+
+volumes:
+  douane:
