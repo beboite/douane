@@ -66,5 +66,7 @@ jobs:
           version=${GITHUB_REF_NAME#v}
           flags=()
           [[ "$version" == *-* ]] && flags+=(--prerelease)
-          notes=$(printf 'Image for linux/amd64 and linux/arm64:\n\n```sh\ndocker pull ghcr.io/%s:%s\n```\n' "${GITHUB_REPOSITORY,,}" "$version")
-          gh release create "$GITHUB_REF_NAME" --verify-tag --title "douane $GITHUB_REF_NAME" --generate-notes --notes "$notes" "${flags[@]}"
+          fence=$'\x60\x60\x60'
+          printf '%s\n' 'Image for linux/amd64 and linux/arm64:' '' "${fence}sh" \
+            "docker pull ghcr.io/${GITHUB_REPOSITORY,,}:$version" "$fence" > "$RUNNER_TEMP/notes.md"
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "douane $GITHUB_REF_NAME" --generate-notes --notes-file "$RUNNER_TEMP/notes.md" "${flags[@]}"

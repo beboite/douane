@@ -45,10 +45,10 @@ jobs:
           fi
           files=$(git diff --name-only "$BASE_SHA...HEAD")
           printf '%s\n' "$files"
-          match() { grep -qE "$1" <<< "$files" && echo true || echo false; }
+          match() { if grep -qE "$1" <<< "$files"; then echo true; else echo false; fi; }
           workflows=$(match '^\.github/')
           # A workflow change can break any job, so it runs them all.
-          any() { [[ "$workflows" == true ]] && echo true || match "$1"; }
+          any() { if [[ "$workflows" == true ]]; then echo true; else match "$1"; fi; }
           {
             echo "rust=$(any '^(Cargo\.(toml|lock)|crates/|dash/build/)')"
             echo "dashboard=$(any '^dash/')"
