@@ -16,6 +16,8 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Exit with an error unless the service answers its health check.
+    Health,
     Status,
     Accounts,
     Models,
@@ -54,6 +56,7 @@ async fn main() -> Result<()> {
         .build()?;
     let root = cli.url.trim_end_matches('/');
     let mut request = match cli.command {
+        Command::Health => client.get(format!("{root}/health")),
         Command::Status => client.get(format!("{root}/admin/api/summary")),
         Command::Accounts => client.get(format!("{root}/admin/api/accounts")),
         Command::Models => client.get(format!("{root}/admin/api/models")),
