@@ -54,10 +54,11 @@ async fn main() -> Result<()> {
     state.refresh_models().await;
     let poller = state.clone();
     let task = tokio::spawn(async move {
+        // Each account keeps its own schedule: the refresh interval when its
+        // reads succeed, a widening retry delay when they fail.
         loop {
-            poller.refresh_quotas(None).await;
-            let interval = poller.config.read().await.settings.quota_refresh_seconds;
-            tokio::time::sleep(Duration::from_secs(interval)).await;
+            poller.refresh_due_quotas().await;
+            tokio::time::sleep(Duration::from_secs(15)).await;
         }
     });
     let listener = tokio::net::TcpListener::bind(&listen)

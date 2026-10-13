@@ -429,10 +429,12 @@ impl AppState {
         let quotas = self.quotas.clone();
         let id = id.to_owned();
         tokio::spawn(async move {
-            let _ = quotas.refresh(&id).await;
+            let _ = quotas.refresh_background(&id).await;
         });
     }
 
+    /// A read asked by hand, for one account or all of them: a failure shows
+    /// at once.
     pub async fn refresh_quotas(&self, id: Option<&str>) {
         use futures_util::{StreamExt, stream};
         let ids: Vec<String> = self
@@ -446,6 +448,23 @@ impl AppState {
         stream::iter(ids)
             .for_each_concurrent(4, |id| async move {
                 let _ = self.quotas.refresh(&id).await;
+            })
+            .await;
+    }
+
+    /// The poller's pass: reads only the accounts whose snapshot is
+    /// `quota_refresh_seconds` old or whose retry delay has passed.
+    pub async fn refresh_due_quotas(&self) {
+        use futures_util::{StreamExt, stream};
+        let interval = self.config.read().await.settings.quota_refresh_seconds;
+        let interval = time::Duration::seconds(interval as i64);
+        let ids = self
+            .quotas
+            .due(interval, time::OffsetDateTime::now_utc())
+            .await;
+        stream::iter(ids)
+            .for_each_concurrent(4, |id| async move {
+                let _ = self.quotas.refresh_background(&id).await;
             })
             .await;
     }
