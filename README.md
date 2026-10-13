@@ -17,7 +17,7 @@ douane connects your Claude, ChatGPT (Codex), Antigravity, Grok and OpenCode Go 
 - Live quotas per account: five-hour, daily, weekly and monthly windows, reset times, plan tier, extra credits and banked resets, refreshed in the background.
 - Four routing strategies, per provider if you like, and failover to another account of the same provider when one runs out.
 - Conversation affinity: native session ids and `prompt_cache_key` pin a conversation to its account, so cache reads keep landing.
-- Per-account reserve: stop spending an account at 5 % of its weekly quota (or any share) so you keep some for yourself.
+- Per-account reserve: stop spending an account at 5 % of its longest quota window (or any share) so you keep some for yourself.
 - Request history with latency, token and cache counters; never conversation bodies or credentials.
 - OAuth and device sign-in from the dashboard, JSON import of existing CLI credentials, and `douanectl` for scripting.
 
@@ -136,7 +136,7 @@ A conversation stays on its account while that account is eligible. douane recog
 
 When an account is refused, it rests until the provider's own reset (its `retry-after`, Claude's rejected window, Codex's exhausted window), then returns. Accounts whose subscription quota is gone but which still hold usable credits stay available behind accounts with quota left.
 
-A reserve, set per account on the Accounts page or with `PATCH /admin/api/accounts/{id}` and `{"reserve_percent": 5}`, is a hard floor on the weekly window: once it reaches the floor, douane stops using that account, live conversations included, until the weekly reset. Five-hour, daily and monthly windows never trip it. Close to the floor, quotas are reread at most once a minute, so a burst can overshoot by a little.
+A reserve, set per account on the Accounts page or with `PATCH /admin/api/accounts/{id}` and `{"reserve_percent": 5}`, is a hard floor on the account's longest window (monthly over weekly over daily over five-hour): once that window reaches the floor, douane stops using the account, live conversations included, until it resets. Shorter windows never trip it. Close to the floor, quotas are reread at most once a minute, so a burst can overshoot by a little.
 
 Banked resets for Claude and Codex appear on each account card. Using one asks for confirmation, and a retried click reuses the same request id, so a double click cannot spend two.
 

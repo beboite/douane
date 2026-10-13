@@ -139,7 +139,7 @@ async fn account_value(
     let measured = snapshot
         .as_ref()
         .filter(|q| !(q.windows.is_empty() && q.error.is_some()))
-        .map(|q| q.reports_weekly_window());
+        .map(|q| q.reports_account_window());
     let reached = crate::state::reserve_reached_in(summary.reserve_percent, snapshot.as_ref(), now);
     let mut value = json!(summary);
     value["reserve_measured"] = json!(measured);
@@ -766,9 +766,12 @@ mod tests {
                 true,
             ),
             (
-                "five-hour-only",
-                Some((vec![window("five-hour", 0.0, later)], None)),
-                json!(false),
+                "five-hour-low",
+                Some((
+                    vec![window("seven-day", 40.0, later), window("five-hour", 0.0, later)],
+                    None,
+                )),
+                json!(true),
                 false,
             ),
             (
