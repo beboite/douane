@@ -761,9 +761,18 @@ mod tests {
         let cases: Vec<(&str, Option<(Vec<QuotaWindow>, Option<&str>)>, Value, bool)> = vec![
             (
                 "low",
-                Some((vec![window("five-hour", 3.0, later)], None)),
+                Some((vec![window("seven-day", 3.0, later)], None)),
                 json!(true),
                 true,
+            ),
+            (
+                "five-hour-low",
+                Some((
+                    vec![window("seven-day", 40.0, later), window("five-hour", 0.0, later)],
+                    None,
+                )),
+                json!(true),
+                false,
             ),
             (
                 "scoped",
@@ -773,7 +782,7 @@ mod tests {
             ),
             (
                 "reset",
-                Some((vec![window("five-hour", 1.0, past)], None)),
+                Some((vec![window("seven-day", 1.0, past)], None)),
                 json!(true),
                 false,
             ),
