@@ -1,7 +1,7 @@
 //! Translation at protocol boundaries. Native requests and streams bypass this module.
 
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dialect {
@@ -57,6 +57,59 @@ fn text(content: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// Names of the freeform (`custom`) tools a Responses request declares. Other
+/// providers only know JSON functions, so these travel as a function with one
+/// string `input` and come back as `custom_tool_call` items.
+pub fn custom_tools(body: &Value, from: Dialect) -> BTreeSet<String> {
+    if from != Dialect::Responses {
+        return BTreeSet::new();
+    }
+    body["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|tool| tool["type"] == "custom")
+        .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+        .collect()
+}
+
+fn custom_tool_function(tool: &Value) -> Value {
+    let mut description = tool["description"].as_str().unwrap_or("").to_owned();
+    if !description.is_empty() {
+        description.push_str("\n\n");
+    }
+    description.push_str("Put the raw tool input, unchanged, in the `input` string.");
+    if let Some(definition) = tool.pointer("/format/definition").and_then(Value::as_str) {
+        let syntax = tool
+            .pointer("/format/syntax")
+            .and_then(Value::as_str)
+            .unwrap_or("grammar");
+        description.push_str(&format!(
+            " It must match this {syntax} definition:\n{definition}"
+        ));
+    }
+    json!({"type":"function","function":{"name":tool["name"],"description":description,
+        "parameters":{"type":"object","properties":{"input":{"type":"string"}},"required":["input"],"additionalProperties":false}}})
+}
+
+/// The freeform input a model wrote into the `input` argument of a custom tool.
+fn custom_tool_input(arguments: &str) -> String {
+    match serde_json::from_str::<Value>(arguments) {
+        Ok(Value::Object(map)) => match map.get("input") {
+            Some(Value::String(input)) => input.clone(),
+            _ => match map.values().next() {
+                Some(Value::String(input)) if map.len() == 1 => input.clone(),
+                _ => arguments.to_owned(),
+            },
+        },
+        _ => arguments.to_owned(),
+    }
+}
+
+fn custom_tool_item(id: &Value, call_id: &Value, name: &Value, arguments: &str) -> Value {
+    json!({"type":"custom_tool_call","id":id,"call_id":call_id,"name":name,"input":custom_tool_input(arguments),"status":"completed"})
+}
+
 fn responses_to_chat(body: &Value) -> Result<Value, String> {
     let mut messages = vec![];
     if let Some(instructions) = body.get("instructions").filter(|v| !v.is_null()) {
@@ -79,8 +132,9 @@ fn responses_to_chat(body: &Value) -> Result<Value, String> {
                     messages.push(json!({"role":item["role"],"content":content}));
                 },
                 "function_call" => messages.push(json!({"role":"assistant","content":null,"tool_calls":[{"id":item["call_id"],"type":"function","function":{"name":item["name"],"arguments":item["arguments"]}}]})),
-                "function_call_output" => messages.push(json!({"role":"tool","tool_call_id":item["call_id"],"content":item["output"]})),
-                "reasoning" => {},
+                "function_call_output" | "custom_tool_call_output" => messages.push(json!({"role":"tool","tool_call_id":item["call_id"],"content":item["output"]})),
+                "custom_tool_call" => messages.push(json!({"role":"assistant","content":null,"tool_calls":[{"id":item["call_id"],"type":"function","function":{"name":item["name"],"arguments":json!({"input":item["input"]}).to_string()}}]})),
+                "reasoning" | "web_search_call" | "file_search_call" | "image_generation_call" => {},
                 other => return Err(format!("cannot translate Responses item type {other}")),
             }
             }
@@ -113,17 +167,25 @@ fn responses_to_chat(body: &Value) -> Result<Value, String> {
     if let Some(tools) = body["tools"].as_array() {
         let mut mapped = vec![];
         for tool in tools {
-            if tool["type"] != "function" {
-                return Err("this provider cannot translate non-function Responses tools".into());
+            match tool["type"].as_str() {
+                Some("function") => {
+                    let mut f = tool.clone();
+                    f.as_object_mut().unwrap().remove("type");
+                    mapped.push(json!({"type":"function","function":f}));
+                }
+                Some("custom") => mapped.push(custom_tool_function(tool)),
+                // Hosted tools (web_search, file_search, image_generation...)
+                // run inside OpenAI's backend; no other provider can execute
+                // them, so the request goes on without them.
+                _ => {}
             }
-            let mut f = tool.clone();
-            f.as_object_mut().unwrap().remove("type");
-            mapped.push(json!({"type":"function","function":f}));
         }
-        out["tools"] = json!(mapped);
+        if !mapped.is_empty() {
+            out["tools"] = json!(mapped);
+        }
     }
     if let Some(choice) = body.get("tool_choice") {
-        out["tool_choice"] = if choice["type"] == "function" {
+        out["tool_choice"] = if choice["type"] == "function" || choice["type"] == "custom" {
             json!({"type":"function","function":{"name":choice["name"]}})
         } else {
             choice.clone()
@@ -383,7 +445,24 @@ fn chat_to_gemini(body: &Value) -> Result<Value, String> {
     }
     out["generationConfig"] = generation;
     if let Some(tools) = body["tools"].as_array() {
-        out["tools"] = json!([{"functionDeclarations":tools.iter().map(|t|t["function"].clone()).collect::<Vec<_>>()}]);
+        // `parameters` takes Google's OpenAPI subset and refuses the rest of
+        // JSON Schema (`$schema`, `exclusiveMinimum`, `propertyNames`); agents
+        // send full JSON Schema, which `parametersJsonSchema` accepts as is.
+        let declarations: Vec<Value> = tools
+            .iter()
+            .map(|t| {
+                let function = &t["function"];
+                let mut declaration = json!({"name": function["name"]});
+                if let Some(description) = function.get("description").filter(|v| !v.is_null()) {
+                    declaration["description"] = description.clone();
+                }
+                if let Some(schema) = function.get("parameters").filter(|v| !v.is_null()) {
+                    declaration["parametersJsonSchema"] = schema.clone();
+                }
+                declaration
+            })
+            .collect();
+        out["tools"] = json!([{ "functionDeclarations": declarations }]);
     }
     if let Some(choice) = body.get("tool_choice") {
         let config = match choice.as_str() {
@@ -400,7 +479,13 @@ fn chat_to_gemini(body: &Value) -> Result<Value, String> {
     Ok(out)
 }
 
-pub fn response(body: &Value, from: Dialect, to: Dialect, model: &str) -> Result<Value, String> {
+pub fn response(
+    body: &Value,
+    from: Dialect,
+    to: Dialect,
+    model: &str,
+    custom: &BTreeSet<String>,
+) -> Result<Value, String> {
     if from == to {
         return Ok(body.clone());
     }
@@ -412,7 +497,7 @@ pub fn response(body: &Value, from: Dialect, to: Dialect, model: &str) -> Result
                 .ok_or("cannot translate completion")?,
         )
         .map_err(|_| "invalid translated completion".into()),
-        Dialect::Responses => Ok(chat_response_to_responses(&chat, model)),
+        Dialect::Responses => Ok(chat_response_to_responses(&chat, model, custom)),
         Dialect::Gemini => Err("Gemini output requires its native endpoint".into()),
     }
 }
@@ -518,7 +603,7 @@ fn to_chat_response(body: &Value, from: Dialect, model: &str) -> Result<Value, S
     )
 }
 
-fn chat_response_to_responses(body: &Value, model: &str) -> Value {
+fn chat_response_to_responses(body: &Value, model: &str, custom: &BTreeSet<String>) -> Value {
     let message = &body["choices"][0]["message"];
     let mut output = vec![];
     if let Some(t) = message["content"].as_str().filter(|s| !s.is_empty()) {
@@ -526,7 +611,13 @@ fn chat_response_to_responses(body: &Value, model: &str) -> Value {
     }
     if let Some(calls) = message["tool_calls"].as_array() {
         for call in calls {
-            output.push(json!({"type":"function_call","id":call["id"],"call_id":call["id"],"name":call["function"]["name"],"arguments":call["function"]["arguments"],"status":"completed"}));
+            let name = &call["function"]["name"];
+            if name.as_str().is_some_and(|name| custom.contains(name)) {
+                let arguments = call["function"]["arguments"].as_str().unwrap_or("");
+                output.push(custom_tool_item(&call["id"], &call["id"], name, arguments));
+                continue;
+            }
+            output.push(json!({"type":"function_call","id":call["id"],"call_id":call["id"],"name":name,"arguments":call["function"]["arguments"],"status":"completed"}));
         }
     }
     let input = body["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
@@ -600,6 +691,20 @@ mod tests {
         );
         let invalid = json!({"model":"fixture","messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"AA=="}}]}]});
         assert!(request(&invalid, Dialect::Chat, Dialect::Gemini).is_err());
+    }
+
+    #[test]
+    fn gemini_tools_carry_full_json_schema_in_parameters_json_schema() {
+        let schema = json!({"$schema":"http://json-schema.org/draft-07/schema#","type":"object",
+            "properties":{"limit":{"type":"integer","exclusiveMinimum":0}},"required":["limit"]});
+        let messages = json!({"model":"fixture","messages":[{"role":"user","content":"hi"}],
+            "tools":[{"name":"read","description":"Read a file","input_schema":schema}]});
+        let gemini = request(&messages, Dialect::Messages, Dialect::Gemini).unwrap();
+        let declaration = &gemini["tools"][0]["functionDeclarations"][0];
+        assert_eq!(declaration["name"], "read");
+        assert_eq!(declaration["description"], "Read a file");
+        assert_eq!(declaration["parametersJsonSchema"], schema);
+        assert!(declaration.get("parameters").is_none());
     }
 
     #[test]
@@ -717,6 +822,84 @@ mod tests {
                 .contains("upstream reported")
         );
     }
+
+    fn codex_request() -> Value {
+        json!({"model":"fixture","instructions":"be brief","tools":[
+            {"type":"function","name":"shell","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}},
+            {"type":"custom","name":"apply_patch","description":"Edit files.","format":{"type":"grammar","syntax":"lark","definition":"start: patch"}},
+            {"type":"web_search"}],
+            "input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"fix it"}]},
+                {"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search","query":"x"}},
+                {"type":"custom_tool_call","call_id":"call_1","name":"apply_patch","input":"*** Begin Patch"},
+                {"type":"custom_tool_call_output","call_id":"call_1","output":"Done"}]})
+    }
+
+    #[test]
+    fn codex_custom_tools_travel_as_functions_and_hosted_tools_are_dropped() {
+        let body = codex_request();
+        assert_eq!(
+            custom_tools(&body, Dialect::Responses),
+            BTreeSet::from(["apply_patch".to_owned()])
+        );
+        let gemini = request(&body, Dialect::Responses, Dialect::Gemini).unwrap();
+        let declarations = gemini["tools"][0]["functionDeclarations"]
+            .as_array()
+            .unwrap();
+        assert_eq!(declarations.len(), 2);
+        assert_eq!(declarations[1]["name"], "apply_patch");
+        assert_eq!(
+            declarations[1]["parametersJsonSchema"]["required"],
+            json!(["input"])
+        );
+        let description = declarations[1]["description"].as_str().unwrap();
+        assert!(description.starts_with("Edit files.") && description.contains("start: patch"));
+        let chat = request(&body, Dialect::Responses, Dialect::Chat).unwrap();
+        let messages = chat["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 4);
+        assert_eq!(
+            messages[2]["tool_calls"][0]["function"]["arguments"],
+            json!({"input":"*** Begin Patch"}).to_string()
+        );
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[3]["content"], "Done");
+    }
+
+    #[test]
+    fn custom_tool_calls_come_back_as_custom_items() {
+        let custom = BTreeSet::from(["apply_patch".to_owned()]);
+        let gemini = json!({"response":{"candidates":[{"content":{"parts":[
+            {"functionCall":{"name":"apply_patch","args":{"input":"*** Begin Patch"}}},
+            {"functionCall":{"name":"shell","args":{"cmd":"ls"}}}]},"finishReason":"STOP"}]}});
+        let responses = response(
+            &gemini,
+            Dialect::Gemini,
+            Dialect::Responses,
+            "fixture",
+            &custom,
+        )
+        .unwrap();
+        assert_eq!(responses["output"][0]["type"], "custom_tool_call");
+        assert_eq!(responses["output"][0]["input"], "*** Begin Patch");
+        assert_eq!(responses["output"][1]["type"], "function_call");
+
+        let mut bridge =
+            Bridge::new(Dialect::Gemini, Dialect::Responses, "fixture").with_custom_tools(custom);
+        let mut out = bridge.feed(gemini).unwrap();
+        out.push_str(&bridge.finish().unwrap());
+        let events = values(&out);
+        let done: Vec<&Value> = events
+            .iter()
+            .filter(|e| e["type"] == "response.output_item.done")
+            .collect();
+        assert_eq!(done[0]["item"]["type"], "custom_tool_call");
+        assert_eq!(done[0]["item"]["input"], "*** Begin Patch");
+        assert_eq!(done[1]["item"]["type"], "function_call");
+        assert!(
+            events
+                .iter()
+                .any(|e| e["type"] == "response.custom_tool_call_input.done")
+        );
+    }
 }
 
 /// Decodes SSE records without assuming transport chunks end on UTF-8 or frame boundaries.
@@ -791,6 +974,7 @@ pub struct Bridge {
     cache_write: u64,
     text: String,
     tools: BTreeMap<usize, Value>,
+    custom: BTreeSet<String>,
     input: u64,
     output: u64,
     anthropic: crate::wire::StreamTranslator,
@@ -811,10 +995,16 @@ impl Bridge {
             cache_write: 0,
             text: String::new(),
             tools: BTreeMap::new(),
+            custom: BTreeSet::new(),
             input: 0,
             output: 0,
             anthropic: crate::wire::StreamTranslator::new(model),
         }
+    }
+    /// Tool names to hand back as `custom_tool_call` items; see [`custom_tools`].
+    pub fn with_custom_tools(mut self, custom: BTreeSet<String>) -> Self {
+        self.custom = custom;
+        self
     }
     pub fn finished(&self) -> bool {
         self.finished
@@ -1026,8 +1216,36 @@ impl Bridge {
                 if item["name"].as_str().is_none_or(|name| name.is_empty()) {
                     return Err("upstream tool call has no function name".into());
                 }
-                let arguments = item["arguments"].as_str().unwrap_or("");
-                if !arguments.is_empty() && serde_json::from_str::<Value>(arguments).is_err() {
+                let arguments = item["arguments"].as_str().unwrap_or("").to_owned();
+                if item["name"]
+                    .as_str()
+                    .is_some_and(|name| self.custom.contains(name))
+                {
+                    let done =
+                        custom_tool_item(&item["id"], &item["call_id"], &item["name"], &arguments);
+                    let mut start = done.clone();
+                    start["input"] = json!("");
+                    start["status"] = json!("in_progress");
+                    out.push_str(&self.event(
+                        "response.output_item.added",
+                        json!({"output_index":index,"item":start}),
+                    ));
+                    out.push_str(&self.event(
+                        "response.custom_tool_call_input.delta",
+                        json!({"item_id":done["id"],"output_index":index,"delta":done["input"]}),
+                    ));
+                    out.push_str(&self.event(
+                        "response.custom_tool_call_input.done",
+                        json!({"item_id":done["id"],"output_index":index,"input":done["input"]}),
+                    ));
+                    out.push_str(&self.event(
+                        "response.output_item.done",
+                        json!({"output_index":index,"item":done}),
+                    ));
+                    items.push(done);
+                    continue;
+                }
+                if !arguments.is_empty() && serde_json::from_str::<Value>(&arguments).is_err() {
                     return Err("upstream tool call arguments are not JSON".into());
                 }
                 let mut start = item.clone();
