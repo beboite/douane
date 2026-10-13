@@ -83,7 +83,9 @@ impl Wire {
         endpoints.iter().any(|e| match self {
             Self::Anthropic => e.eq_ignore_ascii_case("anthropic"),
             Self::Openai => e.eq_ignore_ascii_case("openai"),
-            Self::Responses => e.eq_ignore_ascii_case("openai-response") || e.eq_ignore_ascii_case("responses"),
+            Self::Responses => {
+                e.eq_ignore_ascii_case("openai-response") || e.eq_ignore_ascii_case("responses")
+            }
         })
     }
 }
@@ -199,12 +201,24 @@ fn translate_turn(turn: &Value, out: &mut Vec<Value>) -> Result<(), Untranslatab
                 }
             }
             Some("image") => {
-                let source = b.get("source").ok_or_else(|| Untranslatable("image source is missing".into()))?;
+                let source = b
+                    .get("source")
+                    .ok_or_else(|| Untranslatable("image source is missing".into()))?;
                 let url = match source.get("type").and_then(Value::as_str) {
-                    Some("url") => source.get("url").and_then(Value::as_str).ok_or_else(|| Untranslatable("image URL is missing".into()))?.to_owned(),
+                    Some("url") => source
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| Untranslatable("image URL is missing".into()))?
+                        .to_owned(),
                     Some("base64") => {
-                        let media = source.get("media_type").and_then(Value::as_str).ok_or_else(|| Untranslatable("image media type is missing".into()))?;
-                        let data = source.get("data").and_then(Value::as_str).ok_or_else(|| Untranslatable("image data is missing".into()))?;
+                        let media = source
+                            .get("media_type")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| Untranslatable("image media type is missing".into()))?;
+                        let data = source
+                            .get("data")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| Untranslatable("image data is missing".into()))?;
                         format!("data:{media};base64,{data}")
                     }
                     _ => return Err(Untranslatable("unsupported image source".into())),
@@ -228,8 +242,13 @@ fn translate_turn(turn: &Value, out: &mut Vec<Value>) -> Result<(), Untranslatab
                 }
             })),
             Some("tool_result") => {
-                if b.get("content").and_then(Value::as_array).is_some_and(|parts| parts.iter().any(|part| part["type"] != "text")) {
-                    return Err(Untranslatable("tool results containing non-text blocks cannot use this dialect".into()));
+                if b.get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|parts| parts.iter().any(|part| part["type"] != "text"))
+                {
+                    return Err(Untranslatable(
+                        "tool results containing non-text blocks cannot use this dialect".into(),
+                    ));
                 }
                 results.push(json!({
                 "role": "tool",
@@ -258,7 +277,14 @@ fn translate_turn(turn: &Value, out: &mut Vec<Value>) -> Result<(), Untranslatab
     if !(empty && !results.is_empty()) {
         let mut m = Map::new();
         m.insert("role".to_owned(), Value::String(role.to_owned()));
-        m.insert("content".to_owned(), if has_image { Value::Array(multimodal) } else { Value::String(text) });
+        m.insert(
+            "content".to_owned(),
+            if has_image {
+                Value::Array(multimodal)
+            } else {
+                Value::String(text)
+            },
+        );
         if !tool_calls.is_empty() {
             m.insert("tool_calls".to_owned(), Value::Array(tool_calls));
         }
@@ -308,7 +334,10 @@ fn usage_to_anthropic(u: &Value) -> Value {
         .and_then(|d| d.get("cached_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let cache_write = u.pointer("/prompt_tokens_details/cache_write_tokens").and_then(Value::as_u64).unwrap_or(0);
+    let cache_write = u
+        .pointer("/prompt_tokens_details/cache_write_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     json!({
         "input_tokens": n("prompt_tokens").saturating_sub(cached).saturating_sub(cache_write),
         "output_tokens": n("completion_tokens"),
@@ -464,7 +493,9 @@ impl StreamTranslator {
 
     /// Feed one upstream chunk, get back the Anthropic frames it produced.
     pub fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
-        if self.done { return Vec::new(); }
+        if self.done {
+            return Vec::new();
+        }
         self.partial.extend_from_slice(chunk);
         let Some(cut) = self.partial.iter().rposition(|byte| *byte == b'\n') else {
             // A frame longer than any real one is not one. Cap rather than let a
@@ -502,7 +533,11 @@ impl StreamTranslator {
     /// Called when the upstream stream ends, whether or not `[DONE]` arrived.
     /// A truncated stream still has to be closed or the client waits forever.
     pub fn finish(&mut self) -> Vec<u8> {
-        let mut tail = if self.partial.is_empty() { Vec::new() } else { self.push(b"\n") };
+        let mut tail = if self.partial.is_empty() {
+            Vec::new()
+        } else {
+            self.push(b"\n")
+        };
         let mut out = String::new();
         self.close(&mut out);
         tail.extend(out.into_bytes());
@@ -562,8 +597,11 @@ impl StreamTranslator {
         {
             // Text can arrive between two fragments of the same tool. Hold it
             // behind the call until the terminal frame proves the call whole.
-            if self.tools.is_empty() { self.emit_text(t, out); }
-            else { self.pending_text.push_str(t); }
+            if self.tools.is_empty() {
+                self.emit_text(t, out);
+            } else {
+                self.pending_text.push_str(t);
+            }
         }
 
         // Nothing is emitted from a tool fragment: it is filed under its index
@@ -622,7 +660,11 @@ impl StreamTranslator {
             self.close_block(out);
             self.open_block(out, BlockKind::Text, &json!({"type":"text","text":""}));
         }
-        emit(out, "content_block_delta", &json!({"type":"content_block_delta","index":self.open.map_or(0, |(i, _)| i),"delta":{"type":"text_delta","text":text}}));
+        emit(
+            out,
+            "content_block_delta",
+            &json!({"type":"content_block_delta","index":self.open.map_or(0, |(i, _)| i),"delta":{"type":"text_delta","text":text}}),
+        );
     }
 
     /// Send every tool call assembled so far and forget them.
@@ -741,7 +783,9 @@ impl StreamTranslator {
         // the close is where it goes.
         self.flush_tools(out);
         let pending_text = std::mem::take(&mut self.pending_text);
-        if !pending_text.is_empty() { self.emit_text(&pending_text, out); }
+        if !pending_text.is_empty() {
+            self.emit_text(&pending_text, out);
+        }
         self.close_block(out);
         // `usage` is not optional on this event: the Anthropic schema requires it,
         // and a client that validates the stream rejects the whole response when it
@@ -1087,7 +1131,10 @@ mod tests {
 
         let f = frames(&all);
         assert_eq!(f[0]["type"], "error");
-        assert_eq!(f[0]["error"]["message"], "upstream reported an error in its stream");
+        assert_eq!(
+            f[0]["error"]["message"],
+            "upstream reported an error in its stream"
+        );
         let emitted = String::from_utf8(all).unwrap();
         assert!(!emitted.contains("rate limited"));
         assert!(!emitted.contains("fixture-provider-token"));
@@ -1174,7 +1221,9 @@ mod tests {
     fn text_after_a_tool_call_starts_its_own_block() {
         let mut t = StreamTranslator::new("m");
         let mut all = Vec::new();
-        all.extend(t.push(b"data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"before\"}}]}\n"));
+        all.extend(
+            t.push(b"data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"before\"}}]}\n"),
+        );
         all.extend(t.push(
             b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"t1\",\"function\":{\"name\":\"ls\",\"arguments\":\"{}\"}}]}}]}\n",
         ));
@@ -1219,7 +1268,9 @@ mod tests {
     fn tool_arguments_that_never_get_a_name_are_dropped_not_misfiled() {
         let mut t = StreamTranslator::new("m");
         let mut all = Vec::new();
-        all.extend(t.push(b"data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n"));
+        all.extend(
+            t.push(b"data: {\"id\":\"c1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n"),
+        );
         all.extend(t.push(
             b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"p\\\":1}\"}}]}}]}\n",
         ));
@@ -1227,8 +1278,7 @@ mod tests {
 
         let f = frames(&all);
         assert!(
-            !f.iter()
-                .any(|x| x["delta"]["type"] == "input_json_delta"),
+            !f.iter().any(|x| x["delta"]["type"] == "input_json_delta"),
             "arguments on a text block corrupt the message: {f:?}"
         );
     }

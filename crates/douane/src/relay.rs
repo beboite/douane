@@ -1,4 +1,5 @@
 use crate::{
+    antigravity_replay::{Recorder, Scope},
     ledger::{Call, Ledger},
     state::AppState,
     subscriptions::{AccountCredential, SubscriptionProvider},
@@ -13,6 +14,7 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
@@ -330,6 +332,68 @@ pub async fn forward(
             Ok(v) => v,
             Err(e) => return error(StatusCode::BAD_REQUEST, &e),
         };
+        let mut replay = if account.provider == SubscriptionProvider::Antigravity {
+            crate::antigravity_system::normalize_system(&mut translated);
+            let (capabilities, output_limit) = state
+                .models
+                .read()
+                .await
+                .iter()
+                .find(|m| m.provider == account.provider && m.upstream_id == model)
+                .map(|m| (m.thinking.clone(), m.max_output_tokens))
+                .unwrap_or_default();
+            if translated
+                .pointer("/generationConfig/maxOutputTokens")
+                .is_none()
+            {
+                if let Some(limit) = output_limit.filter(|limit| *limit > 0) {
+                    translated["generationConfig"]["maxOutputTokens"] = json!(limit);
+                }
+            }
+            if let Err(e) = crate::antigravity_thinking::configure(
+                &mut translated,
+                &value,
+                from,
+                &model,
+                capabilities.as_ref(),
+            ) {
+                return error(StatusCode::BAD_REQUEST, &e);
+            }
+            let scope = Scope {
+                account: account.id.clone(),
+                model: model.clone(),
+                // Billing metadata has already been removed. A different system
+                // prompt must not inherit hidden parts from an earlier prompt.
+                session: session
+                    .as_ref()
+                    .map(|session| {
+                        let system = serde_json::to_vec(&translated["systemInstruction"])
+                            .unwrap_or_default();
+                        format!("{session}:{}", hex::encode(Sha256::digest(system)))
+                    })
+                    .unwrap_or_default(),
+            };
+            if let Err(e) = state
+                .antigravity_replay
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .restore(&scope, &mut translated)
+            {
+                return error(StatusCode::BAD_REQUEST, &e);
+            }
+            Some(NativeReplay {
+                state: state.clone(),
+                recorder: Some(Recorder::new(
+                    scope,
+                    translated["contents"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default(),
+                )),
+            })
+        } else {
+            None
+        };
         let codex_sse =
             account.provider == SubscriptionProvider::Codex && !uri.path().ends_with("/compact");
         // Same dialect: the agent talks to its own provider and reads its
@@ -495,12 +559,13 @@ pub async fn forward(
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|v| v.contains("text/event-stream"));
         if stream && is_sse {
-            let mut streamed = stream_response(response, from, to, model, call, idle, custom);
+            let mut streamed =
+                stream_response(response, from, to, model, call, idle, custom, replay);
             streamed.headers_mut().extend(passed);
             return streamed;
         }
         let result = if is_sse {
-            collect_response(response, to, &mut call, idle).await
+            collect_response(response, to, &mut call, idle, &mut replay).await
         } else {
             match read_bounded(response, 32 * 1024 * 1024, idle).await {
                 Ok(b) => serde_json::from_slice::<Value>(&b)
@@ -508,14 +573,32 @@ pub async fn forward(
                 Err(e) => Err(e),
             }
         };
-        let result = match result {
+        let mut result = match result {
             Ok(v) => v,
             Err(e) => {
                 call.fail(&e);
                 return error(StatusCode::BAD_GATEWAY, &e);
             }
         };
+        if !is_sse {
+            if let Some(replay) = &mut replay {
+                replay.observe(&mut result);
+            }
+        }
+        if to == Dialect::Gemini && !gemini_finished(&result) {
+            call.fail("upstream response did not contain a Gemini completion");
+            return error(
+                StatusCode::BAD_GATEWAY,
+                "upstream response did not contain a Gemini completion",
+            );
+        }
         call.observe(&result);
+        if call.call.error.is_some() {
+            return error(
+                StatusCode::BAD_GATEWAY,
+                "upstream reported an error in its response",
+            );
+        }
         let result = match translate::response(&result, to, from, &model, &custom) {
             Ok(v) => v,
             Err(e) => {
@@ -524,6 +607,9 @@ pub async fn forward(
             }
         };
         call.complete = true;
+        if let Some(replay) = &mut replay {
+            replay.commit();
+        }
         let mut answer = Json(result).into_response();
         answer.headers_mut().extend(passed);
         return answer;
@@ -543,6 +629,35 @@ pub async fn forward(
             "all accounts for this provider are unavailable; check their quotas and connection status",
         ),
     }
+}
+
+/// Keep opaque native parts in bounded memory only after a clean completion.
+struct NativeReplay {
+    state: Arc<AppState>,
+    recorder: Option<Recorder>,
+}
+impl NativeReplay {
+    fn observe(&mut self, event: &mut Value) {
+        if let Some(recorder) = &mut self.recorder {
+            recorder.observe(event);
+        }
+    }
+    fn commit(&mut self) {
+        if let Some(turn) = self.recorder.take().and_then(Recorder::finish) {
+            self.state
+                .antigravity_replay
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record(turn);
+        }
+    }
+}
+
+fn gemini_finished(event: &Value) -> bool {
+    let body = event.get("response").unwrap_or(event);
+    body.pointer("/candidates/0/finishReason")
+        .and_then(Value::as_str)
+        .is_some_and(|reason| !reason.is_empty() && reason != "FINISH_REASON_UNSPECIFIED")
 }
 
 /// A Google (Gemini, Antigravity) refusal reduced to its enum fields. The
@@ -741,16 +856,23 @@ async fn collect_response(
     to: Dialect,
     call: &mut CallGuard,
     idle: Duration,
+    replay: &mut Option<NativeReplay>,
 ) -> Result<Value, String> {
     let mut decoder = Frames::default();
     let mut upstream = response.bytes_stream();
     let mut collected = Collected::default();
     while let Some(chunk) = next_chunk(&mut upstream, idle, "upstream stream interrupted").await {
-        for frame in decoder.feed(&chunk?)? {
+        for mut frame in decoder.feed(&chunk?)? {
+            if let Some(replay) = replay {
+                replay.observe(&mut frame);
+            }
             collected.frame(&frame, to, call)?;
         }
     }
-    for frame in decoder.finish()? {
+    for mut frame in decoder.finish()? {
+        if let Some(replay) = replay {
+            replay.observe(&mut frame);
+        }
         collected.frame(&frame, to, call)?;
     }
     let mut result = collected
@@ -771,6 +893,8 @@ async fn collect_response(
 struct Collected {
     result: Option<Value>,
     items: Vec<(u64, Value)>,
+    gemini: Option<Value>,
+    gemini_bytes: usize,
 }
 
 impl Collected {
@@ -778,6 +902,41 @@ impl Collected {
         call.observe(frame);
         if frame["type"] == "response.failed" || frame["type"] == "error" {
             return Err("upstream reported a stream error".into());
+        }
+        if to == Dialect::Gemini {
+            let body = frame.get("response").unwrap_or(frame);
+            if body.get("error").is_some() {
+                return Err("upstream reported a stream error".into());
+            }
+            let result = self.gemini.get_or_insert_with(
+                || json!({"candidates":[{"content":{"role":"model","parts":[]}}]}),
+            );
+            if let Some(parts) = body
+                .pointer("/candidates/0/content/parts")
+                .and_then(Value::as_array)
+            {
+                self.gemini_bytes += serde_json::to_vec(parts)
+                    .map_err(|_| "invalid native Gemini parts")?
+                    .len();
+                if self.gemini_bytes > 32 * 1024 * 1024 {
+                    return Err("upstream response exceeds size limit".into());
+                }
+                result["candidates"][0]["content"]["parts"]
+                    .as_array_mut()
+                    .unwrap()
+                    .extend(parts.iter().cloned());
+            }
+            if let Some(usage) = body.get("usageMetadata") {
+                result["usageMetadata"] = usage.clone();
+            }
+            if gemini_finished(frame) {
+                result["candidates"][0]["finishReason"] =
+                    body["candidates"][0]["finishReason"].clone();
+            }
+            if gemini_finished(result) {
+                self.result = Some(result.clone());
+            }
+            return Ok(());
         }
         if to != Dialect::Responses {
             return Ok(());
@@ -806,6 +965,7 @@ fn stream_response(
     call: CallGuard,
     idle: Duration,
     custom: std::collections::BTreeSet<String>,
+    replay: Option<NativeReplay>,
 ) -> Response {
     let bridge = if from == to {
         None
@@ -818,10 +978,11 @@ fn stream_response(
         bridge,
         call,
         false,
+        replay,
     );
     let stream = futures_util::stream::unfold(
         state,
-        move |(mut upstream, mut frames, mut bridge, mut call, mut done)| async move {
+        move |(mut upstream, mut frames, mut bridge, mut call, mut done, mut replay)| async move {
             if done {
                 return None;
             }
@@ -832,7 +993,10 @@ fn stream_response(
                         Ok(events) => {
                             let mut translated = String::new();
                             let mut failure = None;
-                            for event in events {
+                            for mut event in events {
+                                if let Some(replay) = &mut replay {
+                                    replay.observe(&mut event);
+                                }
                                 call.observe(&event);
                                 if let Some(b) = bridge.as_mut() {
                                     match b.feed(event) {
@@ -860,7 +1024,10 @@ fn stream_response(
                         if let Some(b) = bridge.as_mut() {
                             let tail = (|| -> Result<String, String> {
                                 let mut output = String::new();
-                                for event in frames.finish()? {
+                                for mut event in frames.finish()? {
+                                    if let Some(replay) = &mut replay {
+                                        replay.observe(&mut event);
+                                    }
                                     call.observe(&event);
                                     output.push_str(&b.feed(event)?);
                                 }
@@ -870,6 +1037,11 @@ fn stream_response(
                             match tail {
                                 Ok(t) => {
                                     call.complete = true;
+                                    if call.call.error.is_none() {
+                                        if let Some(replay) = &mut replay {
+                                            replay.commit();
+                                        }
+                                    }
                                     Ok((!t.is_empty()).then(|| Bytes::from(t)))
                                 }
                                 Err(e) => Err(e),
@@ -895,7 +1067,7 @@ fn stream_response(
                     Ok(Some(bytes)) => {
                         return Some((
                             Ok::<Bytes, std::io::Error>(bytes),
-                            (upstream, frames, bridge, call, done),
+                            (upstream, frames, bridge, call, done, replay),
                         ));
                     }
                     Ok(None) if done => return None,
@@ -907,7 +1079,7 @@ fn stream_response(
                             json!({"type":"error","error":{"type":"upstream_error","message":e}});
                         return Some((
                             Ok(Bytes::from(format!("event: error\ndata: {body}\n\n"))),
-                            (upstream, frames, bridge, call, done),
+                            (upstream, frames, bridge, call, done, replay),
                         ));
                     }
                 }

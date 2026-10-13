@@ -67,6 +67,7 @@ pub struct AppState {
     pub models: RwLock<Vec<Model>>,
     pub scheduler: Mutex<Scheduler>,
     pub affinity: Mutex<crate::affinity::Affinity>,
+    pub(crate) antigravity_replay: Mutex<crate::antigravity_replay::ReplayCache>,
     pub management_token: Option<String>,
     pub config_write: tokio::sync::Mutex<()>,
     /// Last background quota refresh started for an account near its reserve.
@@ -111,6 +112,7 @@ impl AppState {
             models: RwLock::new(vec![]),
             scheduler: Mutex::new(Scheduler::default()),
             affinity: Mutex::new(crate::affinity::Affinity::default()),
+            antigravity_replay: Mutex::new(crate::antigravity_replay::ReplayCache::default()),
             management_token,
             config_write: tokio::sync::Mutex::new(()),
             reserve_refresh: Mutex::new(BTreeMap::new()),
