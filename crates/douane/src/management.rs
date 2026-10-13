@@ -500,7 +500,27 @@ fn reasoning_efforts(thinking: Option<&Value>) -> Option<Value> {
             .collect(),
     )
 }
-pub async fn public_quotas(State(state): State<Arc<AppState>>) -> Json<Value> {
+#[derive(Deserialize, Default)]
+pub struct QuotaRead {
+    /// `1` or `true`: the client's user asked for fresh numbers.
+    refresh: Option<String>,
+}
+
+/// Longest a client waits for a refresh it asked for; slower reads land in
+/// the next answer.
+const CLIENT_REFRESH_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+pub async fn public_quotas(
+    State(state): State<Arc<AppState>>,
+    Query(read): Query<QuotaRead>,
+) -> Json<Value> {
+    if matches!(read.refresh.as_deref(), Some("1" | "true")) {
+        // A read asked by hand: failures show at once, and a success clears
+        // any shown error. The task outlives a timeout so no write is cut.
+        let worker = state.clone();
+        let task = tokio::spawn(async move { worker.refresh_quotas(None).await });
+        let _ = tokio::time::timeout(CLIENT_REFRESH_WAIT, task).await;
+    }
     let settings = state.config.read().await.settings.clone();
     Json(crate::quota_view::overview(
         state.accounts.list().await,

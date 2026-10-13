@@ -79,6 +79,15 @@ impl SubscriptionError {
         matches!(self, Self::VerificationRequired(_))
     }
 
+    /// A failure that can pass on its own: rate limiting, a provider outage,
+    /// a lost connection or a garbled answer. Auth and setup failures are not.
+    pub(crate) fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            Self::Transport | Self::InvalidResponse | Self::Upstream(408 | 425 | 429 | 500..=599)
+        )
+    }
+
     pub(crate) fn verification_url(&self) -> Option<&str> {
         match self {
             Self::VerificationRequired(verification) => verification.url.as_deref(),

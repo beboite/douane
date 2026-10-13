@@ -150,12 +150,40 @@ impl QuotaSnapshot {
     }
 }
 
+/// Who asked for a quota read. A read asked by hand reports its failure at
+/// once; the background poller stays quiet about transient failures until
+/// [`FAILURES_SHOWN`] of them in a row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Trigger {
+    Manual,
+    Background,
+}
+
+/// Consecutive failed reads before a transient error reaches the snapshot.
+pub const FAILURES_SHOWN: u32 = 5;
+const RETRY_FIRST_SECONDS: i64 = 30;
+const RETRY_MAX_SECONDS: i64 = 30 * 60;
+
+/// Wait after the `count`-th consecutive failure: 30 s, doubling, capped at
+/// 30 minutes. The fifth failure lands about 7.5 minutes after the first.
+pub fn retry_delay(count: u32) -> time::Duration {
+    let doublings = count.saturating_sub(1).min(16);
+    time::Duration::seconds((RETRY_FIRST_SECONDS << doublings).min(RETRY_MAX_SECONDS))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Failures {
+    count: u32,
+    retry_at: time::OffsetDateTime,
+}
+
 pub struct QuotaService {
     client: reqwest::Client,
     store: Arc<AccountStore>,
     oauth: Arc<OAuthManager>,
     cache: RwLock<BTreeMap<String, QuotaSnapshot>>,
     verification_urls: RwLock<BTreeMap<String, String>>,
+    failures: RwLock<BTreeMap<String, Failures>>,
 }
 
 impl QuotaService {
@@ -175,6 +203,7 @@ impl QuotaService {
             oauth,
             cache: RwLock::new(BTreeMap::new()),
             verification_urls: RwLock::new(BTreeMap::new()),
+            failures: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -215,7 +244,61 @@ impl QuotaService {
         self.verification_urls.read().await.get(id).cloned()
     }
 
+    /// A read asked by hand: it always reaches the provider and a failure
+    /// shows at once.
     pub async fn refresh(&self, id: &str) -> Result<QuotaSnapshot, SubscriptionError> {
+        self.refresh_with(id, Trigger::Manual).await
+    }
+
+    /// A read nobody asked for: skipped while the account waits for its next
+    /// retry, `None` then.
+    pub async fn refresh_background(
+        &self,
+        id: &str,
+    ) -> Option<Result<QuotaSnapshot, SubscriptionError>> {
+        let now = time::OffsetDateTime::now_utc();
+        if self
+            .failures
+            .read()
+            .await
+            .get(id)
+            .is_some_and(|failures| failures.retry_at > now)
+        {
+            return None;
+        }
+        Some(self.refresh_with(id, Trigger::Background).await)
+    }
+
+    /// Accounts the poller should read now: a failing one once its retry
+    /// delay has passed, a healthy one once its snapshot is `interval` old.
+    /// Retry state of deleted accounts goes.
+    pub async fn due(&self, interval: time::Duration, now: time::OffsetDateTime) -> Vec<String> {
+        let ids: Vec<String> = self
+            .store
+            .list()
+            .await
+            .into_iter()
+            .map(|account| account.id)
+            .collect();
+        let mut failures = self.failures.write().await;
+        failures.retain(|id, _| ids.contains(id));
+        let cache = self.cache.read().await;
+        ids.into_iter()
+            .filter(|id| match failures.get(id) {
+                Some(failures) => failures.retry_at <= now,
+                None => cache
+                    .get(id)
+                    .and_then(|snapshot| parse_timestamp(&snapshot.updated_at))
+                    .is_none_or(|at| now - at >= interval),
+            })
+            .collect()
+    }
+
+    async fn refresh_with(
+        &self,
+        id: &str,
+        trigger: Trigger,
+    ) -> Result<QuotaSnapshot, SubscriptionError> {
         let account = self
             .store
             .get(id)
@@ -225,7 +308,7 @@ impl QuotaService {
             Ok(credential) => self.fetch(&credential).await,
             Err(error) => Err(error),
         };
-        self.complete_refresh(id, &account, result).await
+        self.complete_refresh(id, &account, result, trigger).await
     }
 
     async fn complete_refresh(
@@ -233,6 +316,7 @@ impl QuotaService {
         id: &str,
         account: &AccountCredential,
         result: Result<Observation, SubscriptionError>,
+        trigger: Trigger,
     ) -> Result<QuotaSnapshot, SubscriptionError> {
         let verification_url = result
             .as_ref()
@@ -268,12 +352,33 @@ impl QuotaService {
                         })
                         .await?;
                 }
+                // One good read ends the streak and its retry schedule.
+                self.failures.write().await.remove(id);
                 snapshot
             }
             Err(error) => {
                 // Keep the last real observation on a transient error. Its
                 // timestamp still states when those numbers were observed.
                 let previous = self.cache.read().await.get(id).cloned();
+                let observed = time::OffsetDateTime::now_utc();
+                let count = {
+                    let mut failures = self.failures.write().await;
+                    let entry = failures.entry(id.into()).or_insert(Failures {
+                        count: 0,
+                        retry_at: observed,
+                    });
+                    entry.count = entry.count.saturating_add(1);
+                    entry.retry_at = observed + retry_delay(entry.count);
+                    entry.count
+                };
+                // A shown error stays until a read succeeds.
+                let shown = trigger == Trigger::Manual
+                    || !error.is_transient()
+                    || count >= FAILURES_SHOWN
+                    || previous.as_ref().is_some_and(|v| v.error.is_some());
+                if !shown {
+                    tracing::debug!(account = id, count, "quota read failed, retrying quietly");
+                }
                 QuotaSnapshot {
                     account_id: id.into(),
                     provider: account.provider,
@@ -285,7 +390,7 @@ impl QuotaService {
                         .as_ref()
                         .map(|v| v.updated_at.clone())
                         .unwrap_or_else(now),
-                    error: Some(error.to_string()),
+                    error: shown.then(|| error.to_string()),
                     subscription: previous
                         .as_ref()
                         .and_then(|v| v.subscription.clone())
@@ -1198,7 +1303,7 @@ mod tests {
             organization_id: None,
         };
         let first = service
-            .complete_refresh(&summary.id, &account, Ok(observation()))
+            .complete_refresh(&summary.id, &account, Ok(observation()), Trigger::Manual)
             .await
             .unwrap();
         assert!(!first.verification_required);
@@ -1211,6 +1316,7 @@ mod tests {
                 &summary.id,
                 &account,
                 Err(SubscriptionError::verification_required(Some(challenge))),
+                Trigger::Manual,
             )
             .await
             .unwrap();
@@ -1234,6 +1340,7 @@ mod tests {
                 Err(SubscriptionError::verification_required(Some(
                     "https://evil.test/challenge",
                 ))),
+                Trigger::Manual,
             )
             .await
             .unwrap();
@@ -1246,11 +1353,12 @@ mod tests {
                 &summary.id,
                 &account,
                 Err(SubscriptionError::verification_required(Some(challenge))),
+                Trigger::Manual,
             )
             .await
             .unwrap();
         let recovered = service
-            .complete_refresh(&summary.id, &account, Ok(observation()))
+            .complete_refresh(&summary.id, &account, Ok(observation()), Trigger::Manual)
             .await
             .unwrap();
         assert!(!recovered.verification_required);
@@ -1263,6 +1371,7 @@ mod tests {
                 &summary.id,
                 &account,
                 Err(SubscriptionError::verification_required(Some(challenge))),
+                Trigger::Manual,
             )
             .await
             .unwrap();
@@ -1270,6 +1379,113 @@ mod tests {
         assert!(service.verification_url(&summary.id).await.is_none());
         assert!(service.list().await.is_empty());
         assert!(service.verification_urls.read().await.is_empty());
+    }
+
+    #[test]
+    fn retry_delay_widens_up_to_its_cap() {
+        let seconds: Vec<_> = (1..=8).map(|n| retry_delay(n).whole_seconds()).collect();
+        assert_eq!(seconds, [30, 60, 120, 240, 480, 960, 1800, 1800]);
+        assert_eq!(retry_delay(u32::MAX).whole_seconds(), 1800);
+    }
+
+    #[tokio::test]
+    async fn background_failures_stay_quiet_back_off_and_clear_on_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(AccountStore::open(directory.path()).unwrap());
+        let summary = store.import(json!({"type":"antigravity","access_token":"fixture","project_id":"fixture-project"}), None).await.unwrap();
+        let account = store.get(&summary.id).await.unwrap();
+        let service = QuotaService::new(reqwest::Client::new(), store.clone());
+        let id = summary.id.as_str();
+        let observation = || Observation {
+            windows: parse_antigravity(
+                &json!({"groups":[{"displayName":"Models","buckets":[{"remainingFraction":0.3,"resetTime":"2030-10-04T12:00:00Z"}]}]}),
+                observed(),
+            ),
+            plan: None,
+            subscription: None,
+            credits: Vec::new(),
+            organization_id: None,
+        };
+        let limited = || Err(SubscriptionError::Upstream(429));
+        let message = "upstream authentication or quota request failed (HTTP 429)";
+        let interval = time::Duration::minutes(5);
+        let second = time::Duration::seconds(1);
+
+        service
+            .complete_refresh(id, &account, Ok(observation()), Trigger::Background)
+            .await
+            .unwrap();
+        let start = time::OffsetDateTime::now_utc();
+        assert!(service.due(interval, start).await.is_empty());
+        assert_eq!(service.due(interval, start + interval).await, [id]);
+
+        for count in 1..FAILURES_SHOWN {
+            let quiet = service
+                .complete_refresh(id, &account, limited(), Trigger::Background)
+                .await
+                .unwrap();
+            assert!(quiet.error.is_none(), "failure {count}");
+            assert_eq!(quiet.windows[0].remaining_percent, Some(30.0));
+            // The next read waits for a delay that widens with each failure.
+            let now = time::OffsetDateTime::now_utc();
+            let delay = retry_delay(count);
+            assert!(
+                service
+                    .due(interval, now + delay - 2 * second)
+                    .await
+                    .is_empty()
+            );
+            assert_eq!(service.due(interval, now + delay + second).await, [id]);
+            assert!(service.refresh_background(id).await.is_none());
+        }
+        let shown = service
+            .complete_refresh(id, &account, limited(), Trigger::Background)
+            .await
+            .unwrap();
+        assert_eq!(shown.error.as_deref(), Some(message));
+        let sticky = service
+            .complete_refresh(id, &account, limited(), Trigger::Background)
+            .await
+            .unwrap();
+        assert_eq!(sticky.error.as_deref(), Some(message));
+
+        // One good read removes the error and the retry schedule at once.
+        let recovered = service
+            .complete_refresh(id, &account, Ok(observation()), Trigger::Background)
+            .await
+            .unwrap();
+        assert!(recovered.error.is_none());
+        assert!(service.get(id).await.unwrap().error.is_none());
+        let now = time::OffsetDateTime::now_utc();
+        assert!(service.due(interval, now).await.is_empty());
+
+        // A read asked by hand reports its first failure.
+        let manual = service
+            .complete_refresh(id, &account, limited(), Trigger::Manual)
+            .await
+            .unwrap();
+        assert_eq!(manual.error.as_deref(), Some(message));
+        service
+            .complete_refresh(id, &account, Ok(observation()), Trigger::Background)
+            .await
+            .unwrap();
+
+        // A failure that cannot pass on its own shows at once.
+        let revoked = service
+            .complete_refresh(
+                id,
+                &account,
+                Err(SubscriptionError::SessionRevoked),
+                Trigger::Background,
+            )
+            .await
+            .unwrap();
+        assert!(revoked.error.is_some());
+
+        // A deleted account leaves no retry state behind.
+        store.delete(id).await.unwrap();
+        assert!(service.due(interval, now + interval).await.is_empty());
+        assert!(service.failures.read().await.is_empty());
     }
 
     #[test]

@@ -84,6 +84,30 @@ async fn quotas_use_the_same_client_authentication_as_models() {
 }
 
 #[tokio::test]
+async fn a_client_refresh_reads_every_account_and_reports_failures_at_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = state(directory.path(), None);
+    // Qwen has no quota reader: its read fails without leaving the process.
+    state
+        .accounts
+        .import(
+            json!({"type":"qwen","access_token":"fixture-access","name":"Qwen"}),
+            None,
+        )
+        .await
+        .unwrap();
+    let app = douane::router(state);
+    let (_, body) = send(&app, get("/v1/quotas", None)).await;
+    assert_eq!(body["providers"][0]["entries"][0]["error"], Value::Null);
+    let (status, body) = send(&app, get("/v1/quotas?refresh=1", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["providers"][0]["entries"][0]["error"],
+        "provider does not support this operation"
+    );
+}
+
+#[tokio::test]
 async fn quota_display_defaults_to_accounts_for_every_provider() {
     let directory = tempfile::tempdir().unwrap();
     let state = state(directory.path(), None);
