@@ -18,8 +18,11 @@ pub fn request(body: &Value, from: Dialect, to: Dialect) -> Result<Value, String
     let chat = match from {
         Dialect::Chat => body.clone(),
         Dialect::Messages => serde_json::from_slice(
-            &crate::wire::request_to_openai(&serde_json::to_vec(body).map_err(|_| "invalid JSON")?)
-                .map_err(|e| e.to_string())?,
+            &crate::wire::request_to_openai(
+                &serde_json::to_vec(&without_anthropic_billing(body))
+                    .map_err(|_| "invalid JSON")?,
+            )
+            .map_err(|e| e.to_string())?,
         )
         .map_err(|_| "invalid translated request")?,
         Dialect::Responses => responses_to_chat(body)?,
@@ -33,6 +36,45 @@ pub fn request(body: &Value, from: Dialect, to: Dialect) -> Result<Value, String
         Dialect::Responses => chat_to_responses(&chat),
         Dialect::Gemini => chat_to_gemini(&chat),
     }
+}
+
+/// Claude Code opens its system prompt with an `x-anthropic-billing-header:`
+/// line meant for Anthropic's billing alone. Other providers have no use for
+/// it, and Google refuses any request carrying it with a bare 429
+/// RESOURCE_EXHAUSTED, which looks like an exhausted quota.
+fn without_anthropic_billing(body: &Value) -> Value {
+    const BILLING: &str = "x-anthropic-billing-header:";
+    let strip = |text: &str| -> Option<String> {
+        if !text.trim_start().starts_with(BILLING) {
+            return None;
+        }
+        Some(
+            text.trim_start()
+                .split_once('\n')
+                .map(|(_, rest)| rest.trim_start_matches('\n').to_owned())
+                .unwrap_or_default(),
+        )
+    };
+    let mut body = body.clone();
+    match body.get_mut("system") {
+        Some(Value::String(text)) => {
+            if let Some(rest) = strip(text) {
+                *text = rest;
+            }
+        }
+        Some(Value::Array(blocks)) => {
+            blocks.retain_mut(|block| match block["text"].as_str().and_then(strip) {
+                Some(rest) if rest.trim().is_empty() => false,
+                Some(rest) => {
+                    block["text"] = json!(rest);
+                    true
+                }
+                None => true,
+            });
+        }
+        _ => {}
+    }
+    body
 }
 
 fn copy_fields(from: &Value, to: &mut Value, keys: &[&str]) {
@@ -691,6 +733,27 @@ mod tests {
         );
         let invalid = json!({"model":"fixture","messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"AA=="}}]}]});
         assert!(request(&invalid, Dialect::Chat, Dialect::Gemini).is_err());
+    }
+
+    #[test]
+    fn anthropic_billing_header_never_leaves_for_other_providers() {
+        let billing = "x-anthropic-billing-header: cc_version=2.1.0; cc_entrypoint=sdk-ts;";
+        let blocks = json!({"model":"fixture","messages":[{"role":"user","content":"hi"}],"system":[
+            {"type":"text","text":billing},
+            {"type":"text","text":"You are Claude Code."},
+            {"type":"text","text":format!("{billing}\nKeep this line.")}]});
+        let string = json!({"model":"fixture","messages":[{"role":"user","content":"hi"}],
+            "system":format!("{billing}\nKeep this line.")});
+        for body in [blocks, string] {
+            for to in [Dialect::Gemini, Dialect::Chat, Dialect::Responses] {
+                let out = request(&body, Dialect::Messages, to).unwrap().to_string();
+                assert!(!out.contains("x-anthropic-billing-header"), "{to:?}: {out}");
+                assert!(out.contains("Keep this line."));
+            }
+            // Anthropic itself still receives the header untouched.
+            let native = request(&body, Dialect::Messages, Dialect::Messages).unwrap();
+            assert!(native.to_string().contains("x-anthropic-billing-header"));
+        }
     }
 
     #[test]

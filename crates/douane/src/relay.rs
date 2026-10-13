@@ -293,6 +293,8 @@ pub async fn forward(
     let mut last_status = StatusCode::BAD_GATEWAY;
     // The last native refusal, returned as is when every account refused.
     let mut last_native: Option<Response> = None;
+    // Google's reason for the last refusal, so a client sees more than a status.
+    let mut last_reason: Option<String> = None;
     for candidate in candidates {
         let mut account = match state.oauth.credential(&candidate.id).await {
             Ok(a) => a,
@@ -411,20 +413,38 @@ pub async fn forward(
             HeaderMap::new()
         };
         if !last_status.is_success() {
-            call.fail(match last_status {
+            let advised = cooldown_seconds(response.headers(), unix_now());
+            let (response, refusal) = if to == Dialect::Gemini && !native {
+                let body = read_bounded(response, 64 * 1024, idle)
+                    .await
+                    .unwrap_or_default();
+                (None, google_refusal(&body))
+            } else {
+                (Some(response), None)
+            };
+            let summary = match last_status {
                 StatusCode::TOO_MANY_REQUESTS => "upstream quota or rate limit reached",
                 StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
                     "upstream authentication refused"
                 }
                 _ => "upstream request refused",
-            });
+            };
+            match &refusal {
+                Some(refusal) => {
+                    call.fail(&format!("{summary} ({})", refusal.reason));
+                    last_reason = Some(refusal.reason.clone());
+                }
+                None => call.fail(summary),
+            }
             if last_status == StatusCode::TOO_MANY_REQUESTS || last_status.is_server_error() {
-                let wait = cooldown_seconds(response.headers(), unix_now()).unwrap_or(30);
+                let wait = advised
+                    .or_else(|| refusal.as_ref().and_then(|r| r.retry_seconds))
+                    .unwrap_or(30);
                 let _ = state
                     .accounts
                     .cooldown(&account.id, wait, "upstream temporarily unavailable")
                     .await;
-                if native {
+                if let (true, Some(response)) = (native, response) {
                     last_native = native_refusal(last_status, passed, response, idle).await;
                 }
                 continue;
@@ -441,7 +461,7 @@ pub async fn forward(
             }
             // A native refusal of the request itself (too long, invalid) is the
             // agent's to read and act on, compaction included; the account is fine.
-            if native {
+            if let (true, Some(response)) = (native, response) {
                 if let Some(refusal) = native_refusal(last_status, passed, response, idle).await {
                     return refusal;
                 }
@@ -511,10 +531,95 @@ pub async fn forward(
     if let Some(refusal) = last_native {
         return refusal;
     }
-    error(
-        last_status,
-        "all accounts for this provider are unavailable; check their quotas and connection status",
-    )
+    match last_reason {
+        Some(reason) => error(
+            last_status,
+            &format!(
+                "all accounts for this provider are unavailable; last upstream refusal: {reason}"
+            ),
+        ),
+        None => error(
+            last_status,
+            "all accounts for this provider are unavailable; check their quotas and connection status",
+        ),
+    }
+}
+
+/// A Google (Gemini, Antigravity) refusal reduced to its enum fields. The
+/// free-text message is dropped: it can name the project or the account.
+#[derive(Debug, PartialEq)]
+struct GoogleRefusal {
+    /// `error.status`, then the first `details[].reason`, such as
+    /// `RESOURCE_EXHAUSTED/MODEL_CAPACITY_EXHAUSTED`.
+    reason: String,
+    /// The delay Google advises (`RetryInfo.retryDelay` or `quotaResetDelay`).
+    retry_seconds: Option<u64>,
+}
+
+fn google_refusal(body: &[u8]) -> Option<GoogleRefusal> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let error = value.get("error")?;
+    let token = |v: &Value| {
+        v.as_str()
+            .filter(|s| {
+                !s.is_empty()
+                    && s.len() <= 64
+                    && s.chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+            })
+            .map(str::to_owned)
+    };
+    let details = error["details"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let mut parts: Vec<String> = token(&error["status"]).into_iter().collect();
+    parts.extend(details.iter().find_map(|d| token(&d["reason"])));
+    if parts.is_empty() {
+        return None;
+    }
+    let retry_seconds = details.iter().find_map(|d| {
+        d["retryDelay"]
+            .as_str()
+            .or_else(|| {
+                d.pointer("/metadata/quotaResetDelay")
+                    .and_then(Value::as_str)
+            })
+            .and_then(google_duration)
+    });
+    Some(GoogleRefusal {
+        reason: parts.join("/"),
+        retry_seconds,
+    })
+}
+
+/// Seconds in a Google duration: `2.5s`, `1h2m3.4s`, `750ms`; rounded up.
+fn google_duration(text: &str) -> Option<u64> {
+    let mut total = 0.0;
+    let mut number = String::new();
+    let mut chars = text.trim().chars().peekable();
+    let mut seen = false;
+    while let Some(c) = chars.next() {
+        if c.is_ascii_digit() || c == '.' {
+            number.push(c);
+            continue;
+        }
+        let value: f64 = number.parse().ok()?;
+        number.clear();
+        let unit = match (c, chars.peek()) {
+            ('m', Some('s')) => {
+                chars.next();
+                0.001
+            }
+            ('h', _) => 3600.0,
+            ('m', _) => 60.0,
+            ('s', _) => 1.0,
+            _ => return None,
+        };
+        total += value * unit;
+        seen = true;
+    }
+    (seen && number.is_empty() && total.is_finite()).then(|| total.ceil() as u64)
 }
 
 pub(crate) fn unix_now() -> u64 {
@@ -1026,6 +1131,29 @@ mod tests {
             ),
             (7250, 7231, 0)
         );
+    }
+
+    #[test]
+    fn google_refusal_keeps_enum_fields_and_retry_delay_only() {
+        let body = br#"{"error":{"code":429,"message":"No capacity on project secret-project-42 for you@example.com","status":"RESOURCE_EXHAUSTED",
+            "details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"MODEL_CAPACITY_EXHAUSTED","domain":"cloudcode-pa.googleapis.com","metadata":{"model":"gemini-3.8-flash-high"}},
+            {"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"2.5s"}]}}"#;
+        let refusal = super::google_refusal(body).unwrap();
+        assert_eq!(
+            refusal.reason,
+            "RESOURCE_EXHAUSTED/MODEL_CAPACITY_EXHAUSTED"
+        );
+        assert_eq!(refusal.retry_seconds, Some(3));
+        let quota = br#"{"error":{"status":"RESOURCE_EXHAUSTED","details":[{"reason":"QUOTA_EXHAUSTED","metadata":{"quotaResetDelay":"1h2m3.4s"}}]}}"#;
+        assert_eq!(
+            super::google_refusal(quota).unwrap().retry_seconds,
+            Some(3724)
+        );
+        assert_eq!(super::google_duration("750ms"), Some(1));
+        assert_eq!(super::google_duration("soon"), None);
+        let free_text = br#"{"error":{"status":"Project secret-project-42 is blocked"}}"#;
+        assert_eq!(super::google_refusal(free_text), None);
+        assert_eq!(super::google_refusal(b"not json"), None);
     }
 
     #[tokio::test]
