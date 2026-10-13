@@ -115,18 +115,19 @@ impl QuotaSnapshot {
         self.window_exhausted(now) && self.usable_credits()
     }
 
-    /// An account-wide window that has not reset yet is at or below the
-    /// account's reserve. Model-scoped windows and unknown values never count.
+    /// The account's weekly window, not yet reset, is at or below the
+    /// account's reserve. Short windows (five-hour, daily), monthly,
+    /// model-scoped windows and unknown values never count.
     pub fn reserve_reached(&self, reserve: f64, now: time::OffsetDateTime) -> bool {
-        self.lowest_account_window(now)
+        self.lowest_weekly_window(now)
             .is_some_and(|remaining| remaining <= reserve)
     }
 
-    /// Lowest known remaining share among account-wide windows not yet reset.
-    pub fn lowest_account_window(&self, now: time::OffsetDateTime) -> Option<f64> {
+    /// Lowest known remaining share among weekly windows not yet reset.
+    pub fn lowest_weekly_window(&self, now: time::OffsetDateTime) -> Option<f64> {
         self.windows
             .iter()
-            .filter(|window| is_global(&window.id))
+            .filter(|window| is_weekly(&window.id))
             .filter(|window| {
                 window
                     .reset_at
@@ -138,11 +139,11 @@ impl QuotaSnapshot {
             .reduce(f64::min)
     }
 
-    /// The provider reports a known share for at least one account-wide
-    /// window, whether or not that window has reset since the last read.
-    pub fn reports_account_window(&self) -> bool {
+    /// The provider reports a known share for a weekly window, whether or
+    /// not it has reset since the last read: the reserve can be measured.
+    pub fn reports_weekly_window(&self) -> bool {
         self.windows.iter().any(|window| {
-            is_global(&window.id)
+            is_weekly(&window.id)
                 && window
                     .remaining_percent
                     .is_some_and(|value| value.is_finite())
@@ -1226,41 +1227,48 @@ mod tests {
         };
         let later = "2026-10-05T12:00:00Z";
         let earlier = "2026-10-03T11:00:00Z";
-        // The lowest account-wide window decides, the five-hour one included.
+        // Only the weekly window decides: a nearly empty five-hour window
+        // never trips the reserve.
         let both = snapshot(vec![
             window("seven-day", Some(40.0), later),
-            window("five-hour", Some(4.0), later),
+            window("five-hour", Some(2.0), later),
         ]);
-        assert_eq!(both.lowest_account_window(observed()), Some(4.0));
-        assert!(both.reserve_reached(5.0, observed()));
-        assert!(both.reserve_reached(4.0, observed()));
-        assert!(!both.reserve_reached(3.0, observed()));
-        // A window past its reset no longer holds the account back.
+        assert_eq!(both.lowest_weekly_window(observed()), Some(40.0));
+        assert!(!both.reserve_reached(5.0, observed()));
+        assert!(both.reserve_reached(40.0, observed()));
+        assert!(!both.reserve_reached(39.0, observed()));
+        // A weekly window past its reset no longer holds the account back.
         let reset = snapshot(vec![
-            window("seven-day", Some(40.0), later),
-            window("five-hour", Some(1.0), earlier),
+            window("seven-day", Some(1.0), earlier),
+            window("five-hour", Some(90.0), later),
         ]);
         assert!(!reset.reserve_reached(5.0, observed()));
-        // A reset window still shows the provider reports account quota.
-        assert!(reset.reports_account_window());
-        // Every account-wide alias counts, not only five-hour and weekly.
-        for id in ["monthly", "daily", "seven_day", "weekly", "window-1"] {
+        // A reset window still shows the provider reports weekly quota.
+        assert!(reset.reports_weekly_window());
+        // Every weekly alias counts; shorter and monthly windows do not.
+        for id in ["seven-day", "seven_day", "weekly"] {
             let single = snapshot(vec![window(id, Some(3.0), later)]);
-            assert_eq!(single.lowest_account_window(observed()), Some(3.0), "{id}");
+            assert_eq!(single.lowest_weekly_window(observed()), Some(3.0), "{id}");
             assert!(single.reserve_reached(5.0, observed()), "{id}");
+        }
+        for id in ["five-hour", "daily", "monthly", "window-1"] {
+            let single = snapshot(vec![window(id, Some(0.0), later)]);
+            assert_eq!(single.lowest_weekly_window(observed()), None, "{id}");
+            assert!(!single.reserve_reached(5.0, observed()), "{id}");
+            assert!(!single.reports_weekly_window(), "{id}");
         }
         // Model-scoped and unknown windows never invent a limit.
         let scoped = snapshot(vec![
             window("seven-day-opus", Some(0.0), later),
             window("seven-day", None, later),
         ]);
-        assert_eq!(scoped.lowest_account_window(observed()), None);
+        assert_eq!(scoped.lowest_weekly_window(observed()), None);
         assert!(!scoped.reserve_reached(5.0, observed()));
-        assert!(!scoped.reports_account_window());
+        assert!(!scoped.reports_weekly_window());
         // A non-finite share is unknown, not a measurement.
-        let broken = snapshot(vec![window("five-hour", Some(f64::NAN), later)]);
-        assert_eq!(broken.lowest_account_window(observed()), None);
-        assert!(!broken.reports_account_window());
+        let broken = snapshot(vec![window("seven-day", Some(f64::NAN), later)]);
+        assert_eq!(broken.lowest_weekly_window(observed()), None);
+        assert!(!broken.reports_weekly_window());
     }
 
     #[test]

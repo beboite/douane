@@ -40,9 +40,9 @@
 		{#if failure}<p class="reserve-error" role="alert">{failure}</p>{/if}
 	</form>
 {:else}
-	<button class="reserve" class:set={reserve != null} disabled={!!busy} onclick={edit} title="Douane cesse d'utiliser ce compte quand un quota du compte atteint ce seuil"><ShieldCheck size={16}/>{reserve == null ? 'Ajouter une réserve' : `Réserve ${percent(reserve)} %`}</button>
+	<button class="reserve" class:set={reserve != null} disabled={!!busy} onclick={edit} title="Douane cesse d'utiliser ce compte quand son quota hebdomadaire atteint ce seuil"><ShieldCheck size={16}/>{reserve == null ? 'Ajouter une réserve' : `Réserve ${percent(reserve)} %`}</button>
 	{#if reserve != null && account.enabled && account.reserve_reached}<p class="reserve-note reached">Réserve atteinte : douane n'utilise plus ce compte jusqu'à la réinitialisation.</p>
-	{:else if reserve != null && account.reserve_measured === false}<p class="reserve-note">Inactive : ce fournisseur ne communique pas de quota pour l'ensemble du compte.</p>{/if}
+	{:else if reserve != null && account.reserve_measured === false}<p class="reserve-note">Inactive : ce fournisseur ne communique pas de quota hebdomadaire pour ce compte.</p>{/if}
 {/if}
 
 <style>

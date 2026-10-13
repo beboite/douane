@@ -401,7 +401,7 @@ impl AppState {
             return false;
         };
         let near = snapshot
-            .lowest_account_window(now)
+            .lowest_weekly_window(now)
             .is_some_and(|lowest| lowest <= reserve + 10.0);
         let stale = crate::subscriptions::parse_timestamp(&snapshot.updated_at)
             .is_none_or(|at| now - at > time::Duration::minutes(1));

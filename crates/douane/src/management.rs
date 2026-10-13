@@ -139,7 +139,7 @@ async fn account_value(
     let measured = snapshot
         .as_ref()
         .filter(|q| !(q.windows.is_empty() && q.error.is_some()))
-        .map(|q| q.reports_account_window());
+        .map(|q| q.reports_weekly_window());
     let reached = crate::state::reserve_reached_in(summary.reserve_percent, snapshot.as_ref(), now);
     let mut value = json!(summary);
     value["reserve_measured"] = json!(measured);
@@ -761,9 +761,15 @@ mod tests {
         let cases: Vec<(&str, Option<(Vec<QuotaWindow>, Option<&str>)>, Value, bool)> = vec![
             (
                 "low",
-                Some((vec![window("five-hour", 3.0, later)], None)),
+                Some((vec![window("seven-day", 3.0, later)], None)),
                 json!(true),
                 true,
+            ),
+            (
+                "five-hour-only",
+                Some((vec![window("five-hour", 0.0, later)], None)),
+                json!(false),
+                false,
             ),
             (
                 "scoped",
@@ -773,7 +779,7 @@ mod tests {
             ),
             (
                 "reset",
-                Some((vec![window("five-hour", 1.0, past)], None)),
+                Some((vec![window("seven-day", 1.0, past)], None)),
                 json!(true),
                 false,
             ),
