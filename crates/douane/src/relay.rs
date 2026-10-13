@@ -323,6 +323,7 @@ pub async fn forward(
             }
             url.push_str("/count_tokens");
         }
+        let custom = translate::custom_tools(&value, from);
         let mut translated = match translate::request(&value, from, to) {
             Ok(v) => v,
             Err(e) => return error(StatusCode::BAD_REQUEST, &e),
@@ -474,7 +475,7 @@ pub async fn forward(
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|v| v.contains("text/event-stream"));
         if stream && is_sse {
-            let mut streamed = stream_response(response, from, to, model, call, idle);
+            let mut streamed = stream_response(response, from, to, model, call, idle, custom);
             streamed.headers_mut().extend(passed);
             return streamed;
         }
@@ -495,7 +496,7 @@ pub async fn forward(
             }
         };
         call.observe(&result);
-        let result = match translate::response(&result, to, from, &model) {
+        let result = match translate::response(&result, to, from, &model, &custom) {
             Ok(v) => v,
             Err(e) => {
                 call.fail(&e);
@@ -699,11 +700,12 @@ fn stream_response(
     model: String,
     call: CallGuard,
     idle: Duration,
+    custom: std::collections::BTreeSet<String>,
 ) -> Response {
     let bridge = if from == to {
         None
     } else {
-        Some(Bridge::new(to, from, &model))
+        Some(Bridge::new(to, from, &model).with_custom_tools(custom))
     };
     let state = (
         Box::pin(response.bytes_stream()),

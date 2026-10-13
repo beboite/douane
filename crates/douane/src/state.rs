@@ -9,9 +9,9 @@ use crate::{
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -209,6 +209,11 @@ impl AppState {
                     }
                 }
             }
+            if account.provider == SubscriptionProvider::Antigravity && account.models.is_empty() {
+                if let Some(live) = self.antigravity_models(&summary.id).await {
+                    available = live;
+                }
+            }
             for mut model in available {
                 model.upstream_id = model.id.clone();
                 model.id = format!("{}/{}", model.provider.as_str(), model.upstream_id);
@@ -218,6 +223,29 @@ impl AppState {
             }
         }
         *self.models.write().await = models.into_values().collect();
+    }
+
+    /// Google renames Antigravity models without notice, so the bundled ids
+    /// go stale; the account's own `fetchAvailableModels` list is the truth.
+    async fn antigravity_models(&self, id: &str) -> Option<Vec<Model>> {
+        let account = self.oauth.credential(id).await.ok()?;
+        let project = account.project_id.as_deref()?;
+        let response = self
+            .client
+            .post("https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels")
+            .bearer_auth(&account.access_token)
+            .header("User-Agent", "antigravity/hub/2.9.1")
+            .json(&json!({ "project": project }))
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let value = response.json::<Value>().await.ok()?;
+        let models = antigravity_catalog(&value);
+        (!models.is_empty()).then_some(models)
     }
 
     pub async fn candidates(
@@ -483,12 +511,131 @@ pub fn reserve_reached_in(
         .is_some_and(|(reserve, snapshot)| snapshot.reserve_reached(reserve, now))
 }
 
+/// Agent models from a `fetchAvailableModels` answer, in Antigravity's own
+/// order. Tab-completion and internal models are skipped, and an alias that
+/// repeats a display name already listed is dropped.
+fn antigravity_catalog(value: &Value) -> Vec<Model> {
+    let Some(available) = value["models"].as_object() else {
+        return vec![];
+    };
+    let hidden: BTreeSet<&str> = value["tabModelIds"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    let mut order: Vec<&str> = value["agentModelSorts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|sort| sort["groups"].as_array())
+        .flatten()
+        .filter_map(|group| group["modelIds"].as_array())
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    let mut rest: Vec<&str> = available.keys().map(String::as_str).collect();
+    rest.sort_by_key(|id| (catalog_rank(SubscriptionProvider::Antigravity, id), *id));
+    order.extend(rest);
+    let mut seen_ids = BTreeSet::new();
+    let mut seen_names = BTreeSet::new();
+    let mut models = vec![];
+    for id in order {
+        let Some(entry) = available.get(id) else {
+            continue;
+        };
+        let Some(name) = entry["displayName"].as_str() else {
+            continue;
+        };
+        if hidden.contains(id)
+            || entry["isInternal"].as_bool() == Some(true)
+            || !seen_ids.insert(id)
+            || !seen_names.insert(name)
+        {
+            continue;
+        }
+        let bundled = catalog()
+            .iter()
+            .find(|m| m.provider == SubscriptionProvider::Antigravity && m.id == id);
+        let thinking = bundled.and_then(|m| m.thinking.clone()).or_else(|| {
+            (entry["supportsThinking"].as_bool() == Some(true)).then(|| {
+                json!({
+                    "min": entry["minThinkingBudget"].as_u64().unwrap_or(1),
+                    "dynamic_allowed": entry["thinkingBudget"].as_i64() == Some(-1),
+                })
+            })
+        });
+        models.push(Model {
+            id: id.into(),
+            provider: SubscriptionProvider::Antigravity,
+            name: name.into(),
+            context_length: entry["maxTokens"]
+                .as_u64()
+                .or_else(|| bundled.and_then(|m| m.context_length)),
+            max_output_tokens: entry["maxOutputTokens"]
+                .as_u64()
+                .or_else(|| bundled.and_then(|m| m.max_output_tokens)),
+            enabled: true,
+            upstream_id: String::new(),
+            thinking,
+        });
+    }
+    models
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::scheduler::Strategy;
     use crate::subscriptions::{QuotaCredits, QuotaSnapshot, QuotaWindow};
     use serde_json::json;
+
+    #[test]
+    fn antigravity_catalog_keeps_agent_models_in_upstream_order() {
+        let value = serde_json::json!({
+            "models": {
+                "chat_20706": {"isInternal": true, "maxTokens": 16384},
+                "tab_flash_lite_preview": {"maxTokens": 16384},
+                "gemini-3.8-flash-tiered": {"maxTokens": 1048576},
+                "gemini-2.5-flash": {"displayName": "Gemini 3.5 Flash Lite", "maxTokens": 1048576},
+                "gemini-3.5-flash-lite": {"displayName": "Gemini 3.5 Flash Lite", "maxTokens": 1048576},
+                "claude-opus-4-6-thinking": {"displayName": "Claude Opus 4.6 (Thinking)", "maxTokens": 250000, "maxOutputTokens": 64000},
+                "gemini-3.8-flash-high": {"displayName": "Gemini 3.8 Flash (High)", "maxTokens": 1048576, "maxOutputTokens": 65536},
+                "gemini-new": {"displayName": "Gemini New", "supportsThinking": true, "minThinkingBudget": 32, "thinkingBudget": -1}
+            },
+            "agentModelSorts": [{"groups": [{"modelIds": ["gemini-3.8-flash-high", "claude-opus-4-6-thinking"]}]}],
+            "tabModelIds": ["chat_20706", "tab_flash_lite_preview"]
+        });
+        let models = super::antigravity_catalog(&value);
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "gemini-3.8-flash-high",
+                "claude-opus-4-6-thinking",
+                "gemini-3.5-flash-lite",
+                "gemini-new"
+            ]
+        );
+        assert_eq!(models[1].context_length, Some(250000));
+        assert_eq!(models[1].max_output_tokens, Some(64000));
+        assert_eq!(
+            models[3].thinking,
+            Some(serde_json::json!({"min": 32, "dynamic_allowed": true}))
+        );
+    }
+
+    #[test]
+    fn bundled_antigravity_ids_are_the_live_agent_models() {
+        let ids: Vec<&str> = super::catalog()
+            .iter()
+            .filter(|m| m.provider == SubscriptionProvider::Antigravity)
+            .map(|m| m.id.as_str())
+            .collect();
+        assert_eq!(ids[0], "gemini-3.8-flash-high");
+        assert!(ids.contains(&"claude-opus-4-6-thinking"));
+        assert!(!ids.contains(&"gemini-pro-agent"));
+    }
 
     fn credits_only(id: &str) -> QuotaSnapshot {
         QuotaSnapshot {
