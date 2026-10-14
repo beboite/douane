@@ -14,6 +14,8 @@ pub fn session_key(headers: &HeaderMap, body: &Value) -> Option<String> {
         "session_id",
         "session-id",
         "x-opencode-session",
+        "x-opencode-session-id",
+        "x-session-id",
         "thread-id",
         "x-codex-thread-id",
         "x-claude-code-session-id",
@@ -140,6 +142,14 @@ mod tests {
         let mut grok = HeaderMap::new();
         grok.insert("x-grok-session-id", "same".parse().unwrap());
         assert_eq!(session_key(&grok, &json!({})), session_key(&h, &json!({})));
+        for name in ["x-opencode-session-id", "x-session-id"] {
+            let mut opencode = HeaderMap::new();
+            opencode.insert(name, "same".parse().unwrap());
+            assert_eq!(
+                session_key(&opencode, &json!({})),
+                session_key(&h, &json!({}))
+            );
+        }
     }
     #[test]
     fn response_flood_does_not_evict_conversation_pins() {

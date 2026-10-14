@@ -121,6 +121,35 @@ If clients reach the API at a different address than the dashboard (a reverse pr
 
 Translation between the three dialects covers text, tools and images; provider-specific extensions do not all have an equivalent. A failed request moves to another account only before its first byte reaches the client: started output is never replayed. A same-dialect request returns the provider's own rate-limit headers and request id, and client errors such as an oversized prompt come back as the provider wrote them.
 
+### Antigravity clients
+
+Use an advertised `antigravity/<model>` ID through Chat Completions, Messages or
+Responses. Send a stable conversation ID, such as `x-opencode-session-id`,
+`X-Session-Id`, `session_id` or `prompt_cache_key`. OpenCode's custom provider
+sends its own session ID. `/v1/models` includes thinking capabilities and
+context/output limits; explicit thinking controls follow those capabilities.
+
+Only outgoing Antigravity system text is normalized: Anthropic billing lines
+are removed, and the exact Claude Agent SDK and Codex self-identification
+phrases receive one zero-width space. Other instructions, user messages, tools
+and other providers are preserved. This follows the compatibility approach in
+[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI/tree/bf9341629ef2300ac9d846a2e80fe2756f63a671/internal/translator/antigravity).
+Google can still refuse a request; its sanitized reason and retry delay remain
+visible.
+
+Native signed model parts are kept in memory and restored after tool results.
+Replay is scoped to the account, model, session, normalized system instructions
+and preceding visible history. Hidden reasoning and opaque signatures never
+enter the ledger or disk. Chat Completions exposes returned thought text as
+`reasoning_content`; other dialects do not fabricate signed thinking blocks.
+
+The replay cache holds at most 128 turns and 8 MiB for one hour, with a 256 KiB
+native-turn limit. Interrupted, invalid or oversized turns are not recorded.
+Unsigned tool history without a matching entry is refused locally, including
+after restart, expiry, account/model changes or compaction that alters the
+recorded context. Start a new conversation in that case. Acceptance by a live
+Google account remains separate from the local compatibility tests.
+
 ## Routing and quotas
 
 Pick a strategy in **Réglages** (settings), globally or per provider. It applies to new conversations:

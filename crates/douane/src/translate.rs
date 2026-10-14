@@ -18,8 +18,11 @@ pub fn request(body: &Value, from: Dialect, to: Dialect) -> Result<Value, String
     let chat = match from {
         Dialect::Chat => body.clone(),
         Dialect::Messages => serde_json::from_slice(
-            &crate::wire::request_to_openai(&serde_json::to_vec(body).map_err(|_| "invalid JSON")?)
-                .map_err(|e| e.to_string())?,
+            &crate::wire::request_to_openai(
+                &serde_json::to_vec(&without_anthropic_billing(body))
+                    .map_err(|_| "invalid JSON")?,
+            )
+            .map_err(|e| e.to_string())?,
         )
         .map_err(|_| "invalid translated request")?,
         Dialect::Responses => responses_to_chat(body)?,
@@ -33,6 +36,45 @@ pub fn request(body: &Value, from: Dialect, to: Dialect) -> Result<Value, String
         Dialect::Responses => chat_to_responses(&chat),
         Dialect::Gemini => chat_to_gemini(&chat),
     }
+}
+
+/// Claude Code opens its system prompt with an `x-anthropic-billing-header:`
+/// line meant for Anthropic's billing alone. Other providers have no use for
+/// it, and Google refuses any request carrying it with a bare 429
+/// RESOURCE_EXHAUSTED, which looks like an exhausted quota.
+fn without_anthropic_billing(body: &Value) -> Value {
+    const BILLING: &str = "x-anthropic-billing-header:";
+    let strip = |text: &str| -> Option<String> {
+        if !text.trim_start().starts_with(BILLING) {
+            return None;
+        }
+        Some(
+            text.trim_start()
+                .split_once('\n')
+                .map(|(_, rest)| rest.trim_start_matches('\n').to_owned())
+                .unwrap_or_default(),
+        )
+    };
+    let mut body = body.clone();
+    match body.get_mut("system") {
+        Some(Value::String(text)) => {
+            if let Some(rest) = strip(text) {
+                *text = rest;
+            }
+        }
+        Some(Value::Array(blocks)) => {
+            blocks.retain_mut(|block| match block["text"].as_str().and_then(strip) {
+                Some(rest) if rest.trim().is_empty() => false,
+                Some(rest) => {
+                    block["text"] = json!(rest);
+                    true
+                }
+                None => true,
+            });
+        }
+        _ => {}
+    }
+    body
 }
 
 fn copy_fields(from: &Value, to: &mut Value, keys: &[&str]) {
@@ -360,7 +402,7 @@ fn chat_to_messages(body: &Value) -> Result<Value, String> {
 }
 
 fn chat_to_gemini(body: &Value) -> Result<Value, String> {
-    let mut contents = vec![];
+    let mut contents: Vec<Value> = vec![];
     let mut system = vec![];
     let mut call_names = BTreeMap::new();
     for m in body["messages"]
@@ -380,7 +422,7 @@ fn chat_to_gemini(body: &Value) -> Result<Value, String> {
                 .cloned()
                 .ok_or("tool result refers to an unknown function call")?;
             parts
-                .push(json!({"functionResponse":{"name":name,"response":{"result":m["content"]}}}));
+                .push(json!({"functionResponse":{"id":id,"name":name,"response":{"result":m["content"]}}}));
         } else {
             if let Some(t) = m["content"].as_str() {
                 if !t.is_empty() {
@@ -420,12 +462,22 @@ fn chat_to_gemini(body: &Value) -> Result<Value, String> {
                         call["id"].as_str().unwrap_or("").to_owned(),
                         name.to_owned(),
                     );
-                    parts.push(json!({"functionCall":{"name":name,"args":serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap_or("{}")).map_err(|_|"invalid tool arguments")?}}));
+                    parts.push(json!({"functionCall":{"id":call["id"],"name":name,"args":serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap_or("{}")).map_err(|_|"invalid tool arguments")?}}));
                 }
             }
         }
         if !parts.is_empty() {
-            contents.push(json!({"role":if role=="assistant"{"model"}else{"user"},"parts":parts}));
+            // Responses represents one model turn with a message and separate
+            // function-call items. Gemini needs the original logical turn.
+            if role == "assistant" && contents.last().is_some_and(|c| c["role"] == "model") {
+                contents.last_mut().unwrap()["parts"]
+                    .as_array_mut()
+                    .unwrap()
+                    .extend(parts);
+            } else {
+                contents
+                    .push(json!({"role":if role=="assistant"{"model"}else{"user"},"parts":parts}));
+            }
         }
     }
     let mut out = json!({"contents":contents});
@@ -507,6 +559,7 @@ fn to_chat_response(body: &Value, from: Dialect, model: &str) -> Result<Value, S
         return Ok(body.clone());
     }
     let mut content = String::new();
+    let mut reasoning = String::new();
     let mut calls = vec![];
     let mut input = 0;
     let mut output = 0;
@@ -572,9 +625,13 @@ fn to_chat_response(body: &Value, from: Dialect, model: &str) -> Result<Value, S
                 .and_then(Value::as_array)
             {
                 for p in parts {
-                    content.push_str(p["text"].as_str().unwrap_or(""));
+                    if p["thought"] == true {
+                        reasoning.push_str(p["text"].as_str().unwrap_or(""));
+                    } else {
+                        content.push_str(p["text"].as_str().unwrap_or(""));
+                    }
                     if let Some(f) = p.get("functionCall") {
-                        calls.push(json!({"id":format!("call_{}",calls.len()),"type":"function","function":{"name":f["name"],"arguments":f["args"].to_string()}}));
+                        calls.push(json!({"id":f.get("id").cloned().unwrap_or_else(||json!(format!("call_{}",calls.len()))),"type":"function","function":{"name":f["name"],"arguments":f["args"].to_string()}}));
                     }
                 }
             }
@@ -595,6 +652,9 @@ fn to_chat_response(body: &Value, from: Dialect, model: &str) -> Result<Value, S
         finish = "tool_calls";
     }
     let mut message = json!({"role":"assistant","content":content});
+    if !reasoning.is_empty() {
+        message["reasoning_content"] = json!(reasoning);
+    }
     if !calls.is_empty() {
         message["tool_calls"] = json!(calls);
     }
@@ -691,6 +751,27 @@ mod tests {
         );
         let invalid = json!({"model":"fixture","messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{"data":"AA=="}}]}]});
         assert!(request(&invalid, Dialect::Chat, Dialect::Gemini).is_err());
+    }
+
+    #[test]
+    fn anthropic_billing_header_never_leaves_for_other_providers() {
+        let billing = "x-anthropic-billing-header: cc_version=2.1.0; cc_entrypoint=sdk-ts;";
+        let blocks = json!({"model":"fixture","messages":[{"role":"user","content":"hi"}],"system":[
+            {"type":"text","text":billing},
+            {"type":"text","text":"You are Claude Code."},
+            {"type":"text","text":format!("{billing}\nKeep this line.")}]});
+        let string = json!({"model":"fixture","messages":[{"role":"user","content":"hi"}],
+            "system":format!("{billing}\nKeep this line.")});
+        for body in [blocks, string] {
+            for to in [Dialect::Gemini, Dialect::Chat, Dialect::Responses] {
+                let out = request(&body, Dialect::Messages, to).unwrap().to_string();
+                assert!(!out.contains("x-anthropic-billing-header"), "{to:?}: {out}");
+                assert!(out.contains("Keep this line."));
+            }
+            // Anthropic itself still receives the header untouched.
+            let native = request(&body, Dialect::Messages, Dialect::Messages).unwrap();
+            assert!(native.to_string().contains("x-anthropic-billing-header"));
+        }
     }
 
     #[test]
@@ -1019,6 +1100,10 @@ impl Bridge {
         if value["type"] == "error"
             || value["type"] == "response.failed"
             || value.get("error").is_some_and(|v| !v.is_null())
+            || (self.from == Dialect::Gemini
+                && value
+                    .pointer("/response/error")
+                    .is_some_and(|v| !v.is_null()))
         {
             return Err("upstream reported an error in its stream".into());
         }
@@ -1126,11 +1211,11 @@ impl Bridge {
                 self.input=b["usageMetadata"]["promptTokenCount"].as_u64().unwrap_or(self.input);self.output=b["usageMetadata"]["candidatesTokenCount"].as_u64().unwrap_or(self.output);
                 self.cached=b["usageMetadata"]["cachedContentTokenCount"].as_u64().unwrap_or(self.cached);
                 if let Some(parts)=b.pointer("/candidates/0/content/parts").and_then(Value::as_array){for part in parts{
-                    if let Some(t)=part["text"].as_str().filter(|_|part["thought"]!=true){chunks.push(self.chunk(json!({"content":t}),None));}
+                    if let Some(t)=part["text"].as_str(){chunks.push(self.chunk(if part["thought"]==true { json!({"reasoning_content":t}) } else { json!({"content":t}) },None));}
                     if let Some(f)=part.get("functionCall"){let index=self.source_tools;self.source_tools+=1;chunks.push(self.chunk(json!({"tool_calls":[{"index":index,"id":f.get("id").cloned().unwrap_or_else(||json!(format!("call_{:x}",rand::random::<u64>()))),"type":"function","function":{"name":f["name"],"arguments":f["args"].to_string()}}]}),None));}
                     if part.get("inlineData").is_some()||part.get("fileData").is_some(){return Err("translated Gemini output contains unsupported media".into());}
                 }}
-                if b["candidates"][0]["finishReason"].as_str().is_some(){chunks.push(self.chunk(json!({}),Some(if b["candidates"][0]["finishReason"]=="MAX_TOKENS"{"length"}else if self.source_tools>0{"tool_calls"}else{"stop"})));}
+                if b["candidates"][0]["finishReason"].as_str().is_some_and(|reason| !reason.is_empty() && reason != "FINISH_REASON_UNSPECIFIED"){chunks.push(self.chunk(json!({}),Some(if b["candidates"][0]["finishReason"]=="MAX_TOKENS"{"length"}else if self.source_tools>0{"tool_calls"}else{"stop"})));}
             }
         }
         Ok(chunks)

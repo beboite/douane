@@ -1,4 +1,5 @@
 use crate::{
+    antigravity_replay::{Recorder, Scope},
     ledger::{Call, Ledger},
     state::AppState,
     subscriptions::{AccountCredential, SubscriptionProvider},
@@ -13,6 +14,7 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
@@ -293,6 +295,8 @@ pub async fn forward(
     let mut last_status = StatusCode::BAD_GATEWAY;
     // The last native refusal, returned as is when every account refused.
     let mut last_native: Option<Response> = None;
+    // Google's reason for the last refusal, so a client sees more than a status.
+    let mut last_reason: Option<String> = None;
     for candidate in candidates {
         let mut account = match state.oauth.credential(&candidate.id).await {
             Ok(a) => a,
@@ -327,6 +331,68 @@ pub async fn forward(
         let mut translated = match translate::request(&value, from, to) {
             Ok(v) => v,
             Err(e) => return error(StatusCode::BAD_REQUEST, &e),
+        };
+        let mut replay = if account.provider == SubscriptionProvider::Antigravity {
+            crate::antigravity_system::normalize_system(&mut translated);
+            let (capabilities, output_limit) = state
+                .models
+                .read()
+                .await
+                .iter()
+                .find(|m| m.provider == account.provider && m.upstream_id == model)
+                .map(|m| (m.thinking.clone(), m.max_output_tokens))
+                .unwrap_or_default();
+            if translated
+                .pointer("/generationConfig/maxOutputTokens")
+                .is_none()
+            {
+                if let Some(limit) = output_limit.filter(|limit| *limit > 0) {
+                    translated["generationConfig"]["maxOutputTokens"] = json!(limit);
+                }
+            }
+            if let Err(e) = crate::antigravity_thinking::configure(
+                &mut translated,
+                &value,
+                from,
+                &model,
+                capabilities.as_ref(),
+            ) {
+                return error(StatusCode::BAD_REQUEST, &e);
+            }
+            let scope = Scope {
+                account: account.id.clone(),
+                model: model.clone(),
+                // Billing metadata has already been removed. A different system
+                // prompt must not inherit hidden parts from an earlier prompt.
+                session: session
+                    .as_ref()
+                    .map(|session| {
+                        let system = serde_json::to_vec(&translated["systemInstruction"])
+                            .unwrap_or_default();
+                        format!("{session}:{}", hex::encode(Sha256::digest(system)))
+                    })
+                    .unwrap_or_default(),
+            };
+            if let Err(e) = state
+                .antigravity_replay
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .restore(&scope, &mut translated)
+            {
+                return error(StatusCode::BAD_REQUEST, &e);
+            }
+            Some(NativeReplay {
+                state: state.clone(),
+                recorder: Some(Recorder::new(
+                    scope,
+                    translated["contents"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default(),
+                )),
+            })
+        } else {
+            None
         };
         let codex_sse =
             account.provider == SubscriptionProvider::Codex && !uri.path().ends_with("/compact");
@@ -411,20 +477,38 @@ pub async fn forward(
             HeaderMap::new()
         };
         if !last_status.is_success() {
-            call.fail(match last_status {
+            let advised = cooldown_seconds(response.headers(), unix_now());
+            let (response, refusal) = if to == Dialect::Gemini && !native {
+                let body = read_bounded(response, 64 * 1024, idle)
+                    .await
+                    .unwrap_or_default();
+                (None, google_refusal(&body))
+            } else {
+                (Some(response), None)
+            };
+            let summary = match last_status {
                 StatusCode::TOO_MANY_REQUESTS => "upstream quota or rate limit reached",
                 StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
                     "upstream authentication refused"
                 }
                 _ => "upstream request refused",
-            });
+            };
+            match &refusal {
+                Some(refusal) => {
+                    call.fail(&format!("{summary} ({})", refusal.reason));
+                    last_reason = Some(refusal.reason.clone());
+                }
+                None => call.fail(summary),
+            }
             if last_status == StatusCode::TOO_MANY_REQUESTS || last_status.is_server_error() {
-                let wait = cooldown_seconds(response.headers(), unix_now()).unwrap_or(30);
+                let wait = advised
+                    .or_else(|| refusal.as_ref().and_then(|r| r.retry_seconds))
+                    .unwrap_or(30);
                 let _ = state
                     .accounts
                     .cooldown(&account.id, wait, "upstream temporarily unavailable")
                     .await;
-                if native {
+                if let (true, Some(response)) = (native, response) {
                     last_native = native_refusal(last_status, passed, response, idle).await;
                 }
                 continue;
@@ -441,7 +525,7 @@ pub async fn forward(
             }
             // A native refusal of the request itself (too long, invalid) is the
             // agent's to read and act on, compaction included; the account is fine.
-            if native {
+            if let (true, Some(response)) = (native, response) {
                 if let Some(refusal) = native_refusal(last_status, passed, response, idle).await {
                     return refusal;
                 }
@@ -475,12 +559,13 @@ pub async fn forward(
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|v| v.contains("text/event-stream"));
         if stream && is_sse {
-            let mut streamed = stream_response(response, from, to, model, call, idle, custom);
+            let mut streamed =
+                stream_response(response, from, to, model, call, idle, custom, replay);
             streamed.headers_mut().extend(passed);
             return streamed;
         }
         let result = if is_sse {
-            collect_response(response, to, &mut call, idle).await
+            collect_response(response, to, &mut call, idle, &mut replay).await
         } else {
             match read_bounded(response, 32 * 1024 * 1024, idle).await {
                 Ok(b) => serde_json::from_slice::<Value>(&b)
@@ -488,14 +573,32 @@ pub async fn forward(
                 Err(e) => Err(e),
             }
         };
-        let result = match result {
+        let mut result = match result {
             Ok(v) => v,
             Err(e) => {
                 call.fail(&e);
                 return error(StatusCode::BAD_GATEWAY, &e);
             }
         };
+        if !is_sse {
+            if let Some(replay) = &mut replay {
+                replay.observe(&mut result);
+            }
+        }
+        if to == Dialect::Gemini && !gemini_finished(&result) {
+            call.fail("upstream response did not contain a Gemini completion");
+            return error(
+                StatusCode::BAD_GATEWAY,
+                "upstream response did not contain a Gemini completion",
+            );
+        }
         call.observe(&result);
+        if call.call.error.is_some() {
+            return error(
+                StatusCode::BAD_GATEWAY,
+                "upstream reported an error in its response",
+            );
+        }
         let result = match translate::response(&result, to, from, &model, &custom) {
             Ok(v) => v,
             Err(e) => {
@@ -504,6 +607,9 @@ pub async fn forward(
             }
         };
         call.complete = true;
+        if let Some(replay) = &mut replay {
+            replay.commit();
+        }
         let mut answer = Json(result).into_response();
         answer.headers_mut().extend(passed);
         return answer;
@@ -511,10 +617,124 @@ pub async fn forward(
     if let Some(refusal) = last_native {
         return refusal;
     }
-    error(
-        last_status,
-        "all accounts for this provider are unavailable; check their quotas and connection status",
-    )
+    match last_reason {
+        Some(reason) => error(
+            last_status,
+            &format!(
+                "all accounts for this provider are unavailable; last upstream refusal: {reason}"
+            ),
+        ),
+        None => error(
+            last_status,
+            "all accounts for this provider are unavailable; check their quotas and connection status",
+        ),
+    }
+}
+
+/// Keep opaque native parts in bounded memory only after a clean completion.
+struct NativeReplay {
+    state: Arc<AppState>,
+    recorder: Option<Recorder>,
+}
+impl NativeReplay {
+    fn observe(&mut self, event: &mut Value) {
+        if let Some(recorder) = &mut self.recorder {
+            recorder.observe(event);
+        }
+    }
+    fn commit(&mut self) {
+        if let Some(turn) = self.recorder.take().and_then(Recorder::finish) {
+            self.state
+                .antigravity_replay
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record(turn);
+        }
+    }
+}
+
+fn gemini_finished(event: &Value) -> bool {
+    let body = event.get("response").unwrap_or(event);
+    body.pointer("/candidates/0/finishReason")
+        .and_then(Value::as_str)
+        .is_some_and(|reason| !reason.is_empty() && reason != "FINISH_REASON_UNSPECIFIED")
+}
+
+/// A Google (Gemini, Antigravity) refusal reduced to its enum fields. The
+/// free-text message is dropped: it can name the project or the account.
+#[derive(Debug, PartialEq)]
+struct GoogleRefusal {
+    /// `error.status`, then the first `details[].reason`, such as
+    /// `RESOURCE_EXHAUSTED/MODEL_CAPACITY_EXHAUSTED`.
+    reason: String,
+    /// The delay Google advises (`RetryInfo.retryDelay` or `quotaResetDelay`).
+    retry_seconds: Option<u64>,
+}
+
+fn google_refusal(body: &[u8]) -> Option<GoogleRefusal> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let error = value.get("error")?;
+    let token = |v: &Value| {
+        v.as_str()
+            .filter(|s| {
+                !s.is_empty()
+                    && s.len() <= 64
+                    && s.chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+            })
+            .map(str::to_owned)
+    };
+    let details = error["details"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let mut parts: Vec<String> = token(&error["status"]).into_iter().collect();
+    parts.extend(details.iter().find_map(|d| token(&d["reason"])));
+    if parts.is_empty() {
+        return None;
+    }
+    let retry_seconds = details.iter().find_map(|d| {
+        d["retryDelay"]
+            .as_str()
+            .or_else(|| {
+                d.pointer("/metadata/quotaResetDelay")
+                    .and_then(Value::as_str)
+            })
+            .and_then(google_duration)
+    });
+    Some(GoogleRefusal {
+        reason: parts.join("/"),
+        retry_seconds,
+    })
+}
+
+/// Seconds in a Google duration: `2.5s`, `1h2m3.4s`, `750ms`; rounded up.
+fn google_duration(text: &str) -> Option<u64> {
+    let mut total = 0.0;
+    let mut number = String::new();
+    let mut chars = text.trim().chars().peekable();
+    let mut seen = false;
+    while let Some(c) = chars.next() {
+        if c.is_ascii_digit() || c == '.' {
+            number.push(c);
+            continue;
+        }
+        let value: f64 = number.parse().ok()?;
+        number.clear();
+        let unit = match (c, chars.peek()) {
+            ('m', Some('s')) => {
+                chars.next();
+                0.001
+            }
+            ('h', _) => 3600.0,
+            ('m', _) => 60.0,
+            ('s', _) => 1.0,
+            _ => return None,
+        };
+        total += value * unit;
+        seen = true;
+    }
+    (seen && number.is_empty() && total.is_finite()).then(|| total.ceil() as u64)
 }
 
 pub(crate) fn unix_now() -> u64 {
@@ -636,16 +856,23 @@ async fn collect_response(
     to: Dialect,
     call: &mut CallGuard,
     idle: Duration,
+    replay: &mut Option<NativeReplay>,
 ) -> Result<Value, String> {
     let mut decoder = Frames::default();
     let mut upstream = response.bytes_stream();
     let mut collected = Collected::default();
     while let Some(chunk) = next_chunk(&mut upstream, idle, "upstream stream interrupted").await {
-        for frame in decoder.feed(&chunk?)? {
+        for mut frame in decoder.feed(&chunk?)? {
+            if let Some(replay) = replay {
+                replay.observe(&mut frame);
+            }
             collected.frame(&frame, to, call)?;
         }
     }
-    for frame in decoder.finish()? {
+    for mut frame in decoder.finish()? {
+        if let Some(replay) = replay {
+            replay.observe(&mut frame);
+        }
         collected.frame(&frame, to, call)?;
     }
     let mut result = collected
@@ -666,6 +893,8 @@ async fn collect_response(
 struct Collected {
     result: Option<Value>,
     items: Vec<(u64, Value)>,
+    gemini: Option<Value>,
+    gemini_bytes: usize,
 }
 
 impl Collected {
@@ -673,6 +902,41 @@ impl Collected {
         call.observe(frame);
         if frame["type"] == "response.failed" || frame["type"] == "error" {
             return Err("upstream reported a stream error".into());
+        }
+        if to == Dialect::Gemini {
+            let body = frame.get("response").unwrap_or(frame);
+            if body.get("error").is_some() {
+                return Err("upstream reported a stream error".into());
+            }
+            let result = self.gemini.get_or_insert_with(
+                || json!({"candidates":[{"content":{"role":"model","parts":[]}}]}),
+            );
+            if let Some(parts) = body
+                .pointer("/candidates/0/content/parts")
+                .and_then(Value::as_array)
+            {
+                self.gemini_bytes += serde_json::to_vec(parts)
+                    .map_err(|_| "invalid native Gemini parts")?
+                    .len();
+                if self.gemini_bytes > 32 * 1024 * 1024 {
+                    return Err("upstream response exceeds size limit".into());
+                }
+                result["candidates"][0]["content"]["parts"]
+                    .as_array_mut()
+                    .unwrap()
+                    .extend(parts.iter().cloned());
+            }
+            if let Some(usage) = body.get("usageMetadata") {
+                result["usageMetadata"] = usage.clone();
+            }
+            if gemini_finished(frame) {
+                result["candidates"][0]["finishReason"] =
+                    body["candidates"][0]["finishReason"].clone();
+            }
+            if gemini_finished(result) {
+                self.result = Some(result.clone());
+            }
+            return Ok(());
         }
         if to != Dialect::Responses {
             return Ok(());
@@ -701,6 +965,7 @@ fn stream_response(
     call: CallGuard,
     idle: Duration,
     custom: std::collections::BTreeSet<String>,
+    replay: Option<NativeReplay>,
 ) -> Response {
     let bridge = if from == to {
         None
@@ -713,10 +978,11 @@ fn stream_response(
         bridge,
         call,
         false,
+        replay,
     );
     let stream = futures_util::stream::unfold(
         state,
-        move |(mut upstream, mut frames, mut bridge, mut call, mut done)| async move {
+        move |(mut upstream, mut frames, mut bridge, mut call, mut done, mut replay)| async move {
             if done {
                 return None;
             }
@@ -727,7 +993,10 @@ fn stream_response(
                         Ok(events) => {
                             let mut translated = String::new();
                             let mut failure = None;
-                            for event in events {
+                            for mut event in events {
+                                if let Some(replay) = &mut replay {
+                                    replay.observe(&mut event);
+                                }
                                 call.observe(&event);
                                 if let Some(b) = bridge.as_mut() {
                                     match b.feed(event) {
@@ -755,7 +1024,10 @@ fn stream_response(
                         if let Some(b) = bridge.as_mut() {
                             let tail = (|| -> Result<String, String> {
                                 let mut output = String::new();
-                                for event in frames.finish()? {
+                                for mut event in frames.finish()? {
+                                    if let Some(replay) = &mut replay {
+                                        replay.observe(&mut event);
+                                    }
                                     call.observe(&event);
                                     output.push_str(&b.feed(event)?);
                                 }
@@ -765,6 +1037,11 @@ fn stream_response(
                             match tail {
                                 Ok(t) => {
                                     call.complete = true;
+                                    if call.call.error.is_none() {
+                                        if let Some(replay) = &mut replay {
+                                            replay.commit();
+                                        }
+                                    }
                                     Ok((!t.is_empty()).then(|| Bytes::from(t)))
                                 }
                                 Err(e) => Err(e),
@@ -790,7 +1067,7 @@ fn stream_response(
                     Ok(Some(bytes)) => {
                         return Some((
                             Ok::<Bytes, std::io::Error>(bytes),
-                            (upstream, frames, bridge, call, done),
+                            (upstream, frames, bridge, call, done, replay),
                         ));
                     }
                     Ok(None) if done => return None,
@@ -802,7 +1079,7 @@ fn stream_response(
                             json!({"type":"error","error":{"type":"upstream_error","message":e}});
                         return Some((
                             Ok(Bytes::from(format!("event: error\ndata: {body}\n\n"))),
-                            (upstream, frames, bridge, call, done),
+                            (upstream, frames, bridge, call, done, replay),
                         ));
                     }
                 }
@@ -1026,6 +1303,29 @@ mod tests {
             ),
             (7250, 7231, 0)
         );
+    }
+
+    #[test]
+    fn google_refusal_keeps_enum_fields_and_retry_delay_only() {
+        let body = br#"{"error":{"code":429,"message":"No capacity on project secret-project-42 for you@example.com","status":"RESOURCE_EXHAUSTED",
+            "details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"MODEL_CAPACITY_EXHAUSTED","domain":"cloudcode-pa.googleapis.com","metadata":{"model":"gemini-3.8-flash-high"}},
+            {"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"2.5s"}]}}"#;
+        let refusal = super::google_refusal(body).unwrap();
+        assert_eq!(
+            refusal.reason,
+            "RESOURCE_EXHAUSTED/MODEL_CAPACITY_EXHAUSTED"
+        );
+        assert_eq!(refusal.retry_seconds, Some(3));
+        let quota = br#"{"error":{"status":"RESOURCE_EXHAUSTED","details":[{"reason":"QUOTA_EXHAUSTED","metadata":{"quotaResetDelay":"1h2m3.4s"}}]}}"#;
+        assert_eq!(
+            super::google_refusal(quota).unwrap().retry_seconds,
+            Some(3724)
+        );
+        assert_eq!(super::google_duration("750ms"), Some(1));
+        assert_eq!(super::google_duration("soon"), None);
+        let free_text = br#"{"error":{"status":"Project secret-project-42 is blocked"}}"#;
+        assert_eq!(super::google_refusal(free_text), None);
+        assert_eq!(super::google_refusal(b"not json"), None);
     }
 
     #[tokio::test]

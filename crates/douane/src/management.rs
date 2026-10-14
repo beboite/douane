@@ -433,7 +433,17 @@ pub async fn public_models(
         .collect();
     let upstream = query.ids.as_deref() == Some("upstream");
     let models = state.models.read().await;
-    let mut listed:Vec<_>=models.iter().filter(|m|m.enabled&&ready.contains(&m.provider)&&query.provider.as_ref().is_none_or(|p|p.split(',').any(|p|p==m.provider.as_str()))).collect();
+    let mut listed: Vec<_> = models
+        .iter()
+        .filter(|m| {
+            m.enabled
+                && ready.contains(&m.provider)
+                && query
+                    .provider
+                    .as_ref()
+                    .is_none_or(|p| p.split(',').any(|p| p == m.provider.as_str()))
+        })
+        .collect();
     if upstream {
         // The provider's own view: its ids, and its order. A client that
         // starts on the first model of a list, as the Grok CLI does, then
@@ -462,7 +472,7 @@ fn public_model(model: &crate::state::Model, upstream: bool) -> Value {
     } else {
         &model.id
     };
-    json!({"id":id,"object":"model","created":0,"owned_by":model.provider.as_str(),"name":model.name,"label":model.name,"context_length":model.context_length,"context_window":model.context_length,"thinking":model.thinking,"reasoning_efforts":reasoning_efforts(model.thinking.as_ref()),"supported_endpoint_types":["anthropic","openai","openai-response"],"supports_websockets":true})
+    json!({"id":id,"object":"model","created":0,"owned_by":model.provider.as_str(),"name":model.name,"label":model.name,"context_length":model.context_length,"context_window":model.context_length,"max_output_tokens":model.max_output_tokens,"thinking":model.thinking,"reasoning_efforts":reasoning_efforts(model.thinking.as_ref()),"supported_endpoint_types":["anthropic","openai","openai-response"],"supports_websockets":true})
 }
 /// A model's effort levels as the Grok CLI lists them: highest first, `high`
 /// flagged as the default when the model offers it. Null without levels.
@@ -768,7 +778,10 @@ mod tests {
             (
                 "five-hour-low",
                 Some((
-                    vec![window("seven-day", 40.0, later), window("five-hour", 0.0, later)],
+                    vec![
+                        window("seven-day", 40.0, later),
+                        window("five-hour", 0.0, later),
+                    ],
                     None,
                 )),
                 json!(true),
