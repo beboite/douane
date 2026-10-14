@@ -4,7 +4,8 @@ use serde_json::Value;
 
 const BILLING_PREFIX: &str = "x-anthropic-billing-header:";
 const SDK_IDENTITY: &str = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
-const CODEX_IDENTITY_PREFIX: &str = "You are Codex, an agent based on ";
+// Codex ships "a coding agent based on GPT-5." (the line Google refuses) and "an agent based on".
+const CODEX_IDENTITY_PREFIX: &str = "You are Codex, a";
 
 /// Normalize native Gemini system parts before wrapping the Antigravity envelope.
 /// Identity matches are exact; user contents and tool declarations stay untouched.
@@ -48,10 +49,7 @@ fn normalize_text(text: &str) -> String {
             SDK_IDENTITY,
             "You are a Claude agent, built on Anthropic's C\u{200b}laude Agent SDK.",
         )
-        .replace(
-            CODEX_IDENTITY_PREFIX,
-            "You are C\u{200b}odex, an agent based on ",
-        )
+        .replace(CODEX_IDENTITY_PREFIX, "You are C\u{200b}odex, a")
 }
 
 #[cfg(test)]
@@ -92,6 +90,18 @@ mod tests {
         assert_eq!(
             request["systemInstruction"]["parts"][0]["text"],
             "You are C\u{200b}odex, an agent based on GPT-6.\nKeep Codex documentation accurate."
+        );
+    }
+
+    #[test]
+    fn normalizes_the_codex_coding_agent_identity_google_refuses() {
+        let mut request = json!({"systemInstruction":{"parts":[{"text":
+            "You are Codex, a coding agent based on GPT-5. You and the user share the same workspace."
+        }]}});
+        normalize_system(&mut request);
+        assert_eq!(
+            request["systemInstruction"]["parts"][0]["text"],
+            "You are C\u{200b}odex, a coding agent based on GPT-5. You and the user share the same workspace."
         );
     }
 
