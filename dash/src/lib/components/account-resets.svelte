@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { untrack } from 'svelte';
 	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
 	import X from '@lucide/svelte/icons/x';
 	import { management, privateLabel, formatDate, newResetRequestId, type Account, type ResetAvailability } from '$lib/management';
@@ -12,7 +12,7 @@
 	let pending = $state(false);
 	let requestId = '';
 	let dialog = $state<HTMLDialogElement>();
-	let supported = $derived(['claude', 'codex'].includes(account.provider));
+	let supported = $derived(account.enabled && ['claude', 'codex'].includes(account.provider));
 	let storageKey = $derived(`douane-reset-${account.id}`);
 	let canReset = $derived(availability?.status === 'ready' && (availability.available_count ?? 0) > 0);
 	async function check() {
@@ -22,7 +22,7 @@
 		catch (error) { failure = privateLabel((error as Error).message); }
 		finally { checking = false; }
 	}
-	onMount(() => { if (supported) { pending = !!sessionStorage.getItem(storageKey); void check(); } });
+	$effect(() => { if (supported) untrack(() => { pending = !!sessionStorage.getItem(storageKey); void check(); }); else availability = null; });
 	function open() {
 		requestId = availability?.pending_request_id ?? sessionStorage.getItem(storageKey) ?? newResetRequestId();
 		failure = ''; result = ''; dialog?.showModal();

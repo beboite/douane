@@ -144,8 +144,7 @@ impl ResetManager {
             .map(|attempt| attempt.request_id.clone());
         drop(attempts);
         if !account.enabled {
-            status.status = "unavailable".into();
-            status.error = Some("enable this account before using resets".into());
+            status.status = "disabled".into();
             return Ok(status);
         }
         let result = match self.oauth.credential(id).await {
@@ -899,6 +898,22 @@ mod tests {
         assert_eq!(posts.len(), 2);
         assert_eq!(posts[0], posts[1]);
         assert_eq!(backend.reads.load(Ordering::SeqCst), 2);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn disabled_account_reports_disabled_without_error_or_probe() {
+        let backend = Arc::new(Backend::default());
+        let (_directory, accounts, _oauth, manager, id, task) =
+            fixture(backend.clone(), SubscriptionProvider::Codex).await;
+        accounts
+            .modify(&id, |account| account.enabled = false)
+            .await
+            .unwrap();
+        let status = manager.status(&id).await.unwrap();
+        assert_eq!(status.status, "disabled");
+        assert_eq!(status.error, None);
+        assert_eq!(backend.reads.load(Ordering::SeqCst), 0);
         task.abort();
     }
 
