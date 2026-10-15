@@ -370,6 +370,7 @@ mod tests {
             status: status.into(),
             last_error: (status == "error").then(|| "provider request failed".into()),
             reserve_percent: None,
+            reserve_windows: vec![],
             created_at: "2026-10-01T00:00:00Z".into(),
             updated_at: "2026-10-01T00:00:00Z".into(),
         }

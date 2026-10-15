@@ -115,26 +115,45 @@ impl QuotaSnapshot {
         self.window_exhausted(now) && self.usable_credits()
     }
 
-    /// The account's longest window (monthly over weekly over daily over
-    /// five-hour), not yet reset, is at or below the account's reserve.
-    /// Shorter windows, model-scoped windows and unknown values never count.
-    pub fn reserve_reached(&self, reserve: f64, now: time::OffsetDateTime) -> bool {
-        self.reserve_window_remaining(now)
+    /// A watched window, not yet reset, is at or below the account's reserve.
+    /// With no `windows` chosen, only the longest window (monthly over weekly
+    /// over daily over five-hour) is watched; otherwise each chosen kind is.
+    /// Model-scoped windows and unknown values never count.
+    pub fn reserve_reached(
+        &self,
+        reserve: f64,
+        windows: &[String],
+        now: time::OffsetDateTime,
+    ) -> bool {
+        self.reserve_window_remaining(windows, now)
             .is_some_and(|remaining| remaining <= reserve)
     }
 
-    /// Remaining share of the longest account-wide window the provider
-    /// reports, or `None` when it is unknown or has reset since the read.
-    pub fn reserve_window_remaining(&self, now: time::OffsetDateTime) -> Option<f64> {
+    /// Lowest remaining share among the watched windows, or `None` when they
+    /// are unknown or have reset since the read.
+    pub fn reserve_window_remaining(
+        &self,
+        windows: &[String],
+        now: time::OffsetDateTime,
+    ) -> Option<f64> {
         let known = || {
             self.windows
                 .iter()
                 .filter(|window| window.remaining_percent.is_some_and(f64::is_finite))
                 .filter_map(|window| Some((window, window_seconds(&window.id)?)))
         };
-        let longest = known().map(|(_, seconds)| seconds).reduce(f64::max)?;
+        let longest = if windows.is_empty() {
+            Some(known().map(|(_, seconds)| seconds).reduce(f64::max)?)
+        } else {
+            None
+        };
         known()
-            .filter(|(_, seconds)| *seconds == longest)
+            .filter(|(window, seconds)| match longest {
+                Some(longest) => *seconds == longest,
+                None => {
+                    reserve_kind(&window.id).is_some_and(|kind| windows.iter().any(|w| w == kind))
+                }
+            })
             .filter(|(window, _)| {
                 window
                     .reset_at
@@ -144,6 +163,18 @@ impl QuotaSnapshot {
             })
             .filter_map(|(window, _)| window.remaining_percent)
             .reduce(f64::min)
+    }
+
+    /// The provider reports a known share for a window the reserve watches:
+    /// any account-wide window by default, or one of the chosen kinds.
+    pub fn reports_reserve_window(&self, windows: &[String]) -> bool {
+        if windows.is_empty() {
+            return self.reports_account_window();
+        }
+        self.windows.iter().any(|window| {
+            window.remaining_percent.is_some_and(f64::is_finite)
+                && reserve_kind(&window.id).is_some_and(|kind| windows.iter().any(|w| w == kind))
+        })
     }
 
     /// The provider reports a known share for at least one account-wide
@@ -670,6 +701,21 @@ impl QuotaService {
             })
             .await?;
         Ok(())
+    }
+}
+
+/// Window kinds a reserve can watch, shortest first.
+pub const RESERVE_WINDOWS: [&str; 4] = ["five-hour", "daily", "weekly", "monthly"];
+
+/// The reserve kind of an account-wide window id; `None` for model-scoped
+/// windows and for lengths no provider names.
+pub fn reserve_kind(id: &str) -> Option<&'static str> {
+    match id {
+        "five-hour" => Some("five-hour"),
+        "daily" => Some("daily"),
+        "weekly" | "seven-day" | "seven_day" => Some("weekly"),
+        "monthly" => Some("monthly"),
+        _ => None,
     }
 }
 
@@ -1256,31 +1302,31 @@ mod tests {
             window("seven-day", Some(40.0), later),
             window("five-hour", Some(2.0), later),
         ]);
-        assert_eq!(both.reserve_window_remaining(observed()), Some(40.0));
-        assert!(!both.reserve_reached(5.0, observed()));
-        assert!(both.reserve_reached(40.0, observed()));
-        assert!(!both.reserve_reached(39.0, observed()));
+        assert_eq!(both.reserve_window_remaining(&[], observed()), Some(40.0));
+        assert!(!both.reserve_reached(5.0, &[], observed()));
+        assert!(both.reserve_reached(40.0, &[], observed()));
+        assert!(!both.reserve_reached(39.0, &[], observed()));
         // OpenCode Go shape: monthly outranks weekly and five-hour.
         let go = snapshot(vec![
             window("five-hour", Some(100.0), later),
             window("weekly", Some(88.0), later),
             window("monthly", Some(3.0), later),
         ]);
-        assert_eq!(go.reserve_window_remaining(observed()), Some(3.0));
-        assert!(go.reserve_reached(5.0, observed()));
+        assert_eq!(go.reserve_window_remaining(&[], observed()), Some(3.0));
+        assert!(go.reserve_reached(5.0, &[], observed()));
         let go_weekly_low = snapshot(vec![
             window("weekly", Some(1.0), later),
             window("monthly", Some(60.0), later),
         ]);
-        assert!(!go_weekly_low.reserve_reached(5.0, observed()));
+        assert!(!go_weekly_low.reserve_reached(5.0, &[], observed()));
         // The longest window past its reset no longer holds the account
         // back, and a shorter one does not take over.
         let reset = snapshot(vec![
             window("seven-day", Some(1.0), earlier),
             window("five-hour", Some(1.0), later),
         ]);
-        assert_eq!(reset.reserve_window_remaining(observed()), None);
-        assert!(!reset.reserve_reached(5.0, observed()));
+        assert_eq!(reset.reserve_window_remaining(&[], observed()), None);
+        assert!(!reset.reserve_reached(5.0, &[], observed()));
         assert!(reset.reports_account_window());
         // Each alias counts when it is the only account-wide window.
         for id in [
@@ -1294,11 +1340,11 @@ mod tests {
         ] {
             let single = snapshot(vec![window(id, Some(3.0), later)]);
             assert_eq!(
-                single.reserve_window_remaining(observed()),
+                single.reserve_window_remaining(&[], observed()),
                 Some(3.0),
                 "{id}"
             );
-            assert!(single.reserve_reached(5.0, observed()), "{id}");
+            assert!(single.reserve_reached(5.0, &[], observed()), "{id}");
         }
         // A parsed window length ranks by its seconds; an unparsed one last.
         let parsed = snapshot(vec![
@@ -1306,19 +1352,43 @@ mod tests {
             window("weekly", Some(2.0), later),
             window("window-period", Some(0.0), later),
         ]);
-        assert_eq!(parsed.reserve_window_remaining(observed()), Some(50.0));
+        assert_eq!(parsed.reserve_window_remaining(&[], observed()), Some(50.0));
         // Model-scoped and unknown windows never invent a limit.
         let scoped = snapshot(vec![
             window("seven-day-opus", Some(0.0), later),
             window("seven-day", None, later),
         ]);
-        assert_eq!(scoped.reserve_window_remaining(observed()), None);
-        assert!(!scoped.reserve_reached(5.0, observed()));
+        assert_eq!(scoped.reserve_window_remaining(&[], observed()), None);
+        assert!(!scoped.reserve_reached(5.0, &[], observed()));
         assert!(!scoped.reports_account_window());
         // A non-finite share is unknown, not a measurement.
         let broken = snapshot(vec![window("seven-day", Some(f64::NAN), later)]);
-        assert_eq!(broken.reserve_window_remaining(observed()), None);
+        assert_eq!(broken.reserve_window_remaining(&[], observed()), None);
         assert!(!broken.reports_account_window());
+        // Chosen kinds replace the longest-window default: five-hour alone,
+        // both, or a kind the account does not report.
+        let pick = |kinds: &[&str]| kinds.iter().map(|k| k.to_string()).collect::<Vec<_>>();
+        let five = pick(&["five-hour"]);
+        assert_eq!(both.reserve_window_remaining(&five, observed()), Some(2.0));
+        assert!(both.reserve_reached(5.0, &five, observed()));
+        let pair = pick(&["five-hour", "weekly"]);
+        let weekly_low = snapshot(vec![
+            window("seven-day", Some(3.0), later),
+            window("five-hour", Some(90.0), later),
+        ]);
+        assert!(weekly_low.reserve_reached(5.0, &pair, observed()));
+        assert!(both.reserve_reached(5.0, &pair, observed()));
+        assert!(!weekly_low.reserve_reached(5.0, &five, observed()));
+        let monthly = pick(&["monthly"]);
+        assert_eq!(both.reserve_window_remaining(&monthly, observed()), None);
+        assert!(!both.reports_reserve_window(&monthly));
+        assert!(both.reports_reserve_window(&five));
+        // A chosen window past its reset stops counting until the next read.
+        assert_eq!(reset.reserve_window_remaining(&five, observed()), Some(1.0));
+        assert_eq!(
+            reset.reserve_window_remaining(&pick(&["weekly"]), observed()),
+            None
+        );
     }
 
     #[test]

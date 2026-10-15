@@ -10,11 +10,13 @@ mod reset;
 mod store;
 
 pub use oauth::{OAuthAttempt, OAuthManager};
-pub use quota::{QuotaCredits, QuotaService, QuotaSnapshot, QuotaWindow};
+pub use quota::{
+    QuotaCredits, QuotaService, QuotaSnapshot, QuotaWindow, RESERVE_WINDOWS, reserve_kind,
+};
 pub use reset::{ResetError, ResetManager, ResetOutcome, ResetRedemption, ResetStatus};
 pub use store::{
     AccountCredential, AccountStore, AccountSummary, SubscriptionProvider, SubscriptionTier,
-    valid_reserve,
+    reserve_windows, valid_reserve,
 };
 
 pub struct GoogleVerification {
@@ -66,6 +68,10 @@ pub enum SubscriptionError {
     OAuthNotConfigured,
     #[error("reserve_percent must be greater than 0 and less than 100, or null/0 to clear")]
     InvalidReserve,
+    #[error(
+        "reserve_windows accepts five-hour, daily, weekly and monthly; empty watches the longest window"
+    )]
+    InvalidReserveWindows,
 }
 
 impl SubscriptionError {

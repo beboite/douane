@@ -408,6 +408,7 @@ impl AppState {
         let snapshot = self.quotas.get(&account.id).await;
         reserve_reached_in(
             account.reserve(),
+            &account.reserve_windows(),
             snapshot.as_ref(),
             time::OffsetDateTime::now_utc(),
         )
@@ -430,15 +431,16 @@ impl AppState {
         let (Some(reserve), Some(snapshot)) = (account.reserve(), snapshot) else {
             return false;
         };
+        let windows = account.reserve_windows();
         let near = snapshot
-            .reserve_window_remaining(now)
+            .reserve_window_remaining(&windows, now)
             .is_some_and(|lowest| lowest <= reserve + 10.0);
         let stale = crate::subscriptions::parse_timestamp(&snapshot.updated_at)
             .is_none_or(|at| now - at > time::Duration::minutes(1));
         if near && stale {
             self.refresh_soon(&account.id);
         }
-        reserve_reached_in(Some(reserve), Some(snapshot), now)
+        reserve_reached_in(Some(reserve), &windows, Some(snapshot), now)
     }
 
     fn refresh_soon(&self, id: &str) {
@@ -504,13 +506,14 @@ impl AppState {
 /// it. Shared by routing and the management listing.
 pub fn reserve_reached_in(
     reserve: Option<f64>,
+    windows: &[String],
     snapshot: Option<&crate::subscriptions::QuotaSnapshot>,
     now: time::OffsetDateTime,
 ) -> bool {
     reserve
         .filter(|percent| crate::subscriptions::valid_reserve(*percent))
         .zip(snapshot)
-        .is_some_and(|(reserve, snapshot)| snapshot.reserve_reached(reserve, now))
+        .is_some_and(|(reserve, snapshot)| snapshot.reserve_reached(reserve, windows, now))
 }
 
 /// Agent models from a `fetchAvailableModels` answer, in Antigravity's own
@@ -843,7 +846,7 @@ mod tests {
 
         state
             .accounts
-            .update(&kept, None, None, Some(Some(5.0)))
+            .update(&kept, None, None, Some(Some(5.0)), None)
             .await
             .unwrap();
         assert_eq!(order(&state).await.unwrap(), vec![spare.clone()]);
@@ -857,7 +860,7 @@ mod tests {
         // Above the reserve, the account serves again.
         state
             .accounts
-            .update(&kept, None, None, Some(Some(4.0)))
+            .update(&kept, None, None, Some(Some(4.0)), None)
             .await
             .unwrap();
         assert_eq!(order(&state).await.unwrap(), vec![kept]);
@@ -880,7 +883,7 @@ mod tests {
             .unwrap();
         state
             .accounts
-            .update(&account.id, None, None, Some(Some(5.0)))
+            .update(&account.id, None, None, Some(Some(5.0)), None)
             .await
             .unwrap();
         let mut low = weekly(&account.id, "2099-01-01T00:00:00Z");
