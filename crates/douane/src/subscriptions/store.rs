@@ -137,6 +137,7 @@ pub struct AccountSummary {
     pub status: String,
     pub last_error: Option<String>,
     pub reserve_percent: Option<f64>,
+    pub reserve_windows: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -185,11 +186,32 @@ pub struct AccountCredential {
     /// Share of every account-wide quota window that douane leaves unused.
     #[serde(default)]
     pub(crate) reserve_percent: Option<f64>,
+    /// Window kinds the reserve watches; empty watches the longest window.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) reserve_windows: Vec<String>,
 }
 
 /// A reserve is a share strictly between 0 and 100.
 pub fn valid_reserve(percent: f64) -> bool {
     percent.is_finite() && percent > 0.0 && percent < 100.0
+}
+
+/// Known reserve window kinds, deduplicated in shortest-first order, or
+/// `None` when one is unknown.
+pub fn reserve_windows(kinds: &[String]) -> Option<Vec<String>> {
+    if kinds
+        .iter()
+        .any(|kind| !super::RESERVE_WINDOWS.contains(&kind.as_str()))
+    {
+        return None;
+    }
+    Some(
+        super::RESERVE_WINDOWS
+            .iter()
+            .filter(|known| kinds.iter().any(|kind| kind == *known))
+            .map(|known| known.to_string())
+            .collect(),
+    )
 }
 
 impl AccountCredential {
@@ -198,6 +220,12 @@ impl AccountCredential {
     pub(crate) fn reserve(&self) -> Option<f64> {
         self.reserve_percent
             .filter(|percent| valid_reserve(*percent))
+    }
+
+    /// The watched window kinds; a hand-edited unknown kind falls back to
+    /// the longest window rather than silently watching nothing.
+    pub(crate) fn reserve_windows(&self) -> Vec<String> {
+        reserve_windows(&self.reserve_windows).unwrap_or_default()
     }
 
     pub(crate) fn summary(&self) -> AccountSummary {
@@ -240,6 +268,7 @@ impl AccountCredential {
             status: status.into(),
             last_error: self.last_error.clone(),
             reserve_percent: self.reserve(),
+            reserve_windows: self.reserve_windows(),
             created_at: self.created_at.clone(),
             updated_at: self.updated_at.clone(),
         }
@@ -339,6 +368,7 @@ impl AccountStore {
             account.created_at = previous.created_at.clone();
             account.enabled = previous.enabled;
             account.reserve_percent = previous.reserve_percent;
+            account.reserve_windows = previous.reserve_windows.clone();
             if !explicit_name {
                 account.name = previous.name.clone();
             }
@@ -364,13 +394,15 @@ impl AccountStore {
         self.modify(id, |account| account.enabled = enabled).await
     }
 
-    /// `reserve` is `Some(None)` to remove the reserve, `None` to keep it.
+    /// `reserve` is `Some(None)` to remove the reserve, `None` to keep it;
+    /// `windows` is `None` to keep the watched kinds.
     pub async fn update(
         &self,
         id: &str,
         name: Option<String>,
         enabled: Option<bool>,
         reserve: Option<Option<f64>>,
+        windows: Option<Vec<String>>,
     ) -> Result<AccountSummary, SubscriptionError> {
         if reserve
             .flatten()
@@ -378,6 +410,12 @@ impl AccountStore {
         {
             return Err(SubscriptionError::InvalidReserve);
         }
+        let windows = match windows {
+            Some(kinds) => {
+                Some(reserve_windows(&kinds).ok_or(SubscriptionError::InvalidReserveWindows)?)
+            }
+            None => None,
+        };
         self.modify(id, |account| {
             if let Some(name) = name {
                 account.name = name;
@@ -387,6 +425,9 @@ impl AccountStore {
             }
             if let Some(reserve) = reserve {
                 account.reserve_percent = reserve;
+            }
+            if let Some(windows) = windows {
+                account.reserve_windows = windows;
             }
         })
         .await
@@ -441,6 +482,7 @@ impl AccountStore {
         account.enabled = previous.enabled;
         account.name = previous.name.clone();
         account.reserve_percent = previous.reserve_percent;
+        account.reserve_windows = previous.reserve_windows.clone();
         account.plan = previous.plan.clone().or(account.plan);
         account.subscription = previous.subscription.clone().or(account.subscription);
         account.organization_id = previous.organization_id.clone().or(account.organization_id);
@@ -786,6 +828,7 @@ fn parse_import(
         token_endpoint: text(&value, &["token_endpoint"]),
         model_exhaustion: BTreeMap::new(),
         reserve_percent: None,
+        reserve_windows: vec![],
     };
     apply_identity(&mut account);
     account.name = name
@@ -929,10 +972,13 @@ mod tests {
                 Some("New label".into()),
                 Some(false),
                 Some(Some(5.0)),
+                Some(vec!["weekly".into(), "five-hour".into(), "weekly".into()]),
             )
             .await
             .unwrap();
         assert_eq!(updated.name, "New label");
+        // Watched kinds are stored once each, shortest first.
+        assert_eq!(updated.reserve_windows, ["five-hour", "weekly"]);
         assert!(!updated.enabled);
         assert_eq!(updated.reserve_percent, Some(5.0));
         store.update_credential(stale).await.unwrap();
@@ -940,11 +986,30 @@ mod tests {
         assert_eq!(reopened.list().await[0].name, "New label");
         assert!(!reopened.list().await[0].enabled);
         assert_eq!(reopened.list().await[0].reserve_percent, Some(5.0));
+        assert_eq!(
+            reopened.list().await[0].reserve_windows,
+            ["five-hour", "weekly"]
+        );
         // A reimport keeps the reserve; an explicit removal clears it.
         reopened.import(json!({"type":"claude","access_token":"rotated-fixture","account_id":"fixture-account"}), None).await.unwrap();
         assert_eq!(reopened.list().await[0].reserve_percent, Some(5.0));
+        assert_eq!(
+            reopened.list().await[0].reserve_windows,
+            ["five-hour", "weekly"]
+        );
+        assert!(matches!(
+            reopened
+                .update(&imported.id, None, None, None, Some(vec!["hourly".into()]))
+                .await,
+            Err(SubscriptionError::InvalidReserveWindows)
+        ));
+        let longest = reopened
+            .update(&imported.id, None, None, None, Some(vec![]))
+            .await
+            .unwrap();
+        assert!(longest.reserve_windows.is_empty());
         let cleared = reopened
-            .update(&imported.id, None, None, Some(None))
+            .update(&imported.id, None, None, Some(None), None)
             .await
             .unwrap();
         assert_eq!(cleared.reserve_percent, None);
@@ -952,7 +1017,7 @@ mod tests {
         for invalid in [-1.0, 0.0, 100.0, f64::NAN, f64::INFINITY] {
             assert!(matches!(
                 reopened
-                    .update(&imported.id, None, None, Some(Some(invalid)))
+                    .update(&imported.id, None, None, Some(Some(invalid)), None)
                     .await,
                 Err(SubscriptionError::InvalidReserve)
             ));

@@ -147,6 +147,28 @@ async fn reserve_patch_sets_validates_and_clears_the_floor() {
         assert_eq!(state.accounts.list().await[0].name, original);
     }
 
+    // The watched windows come back sorted; an unknown kind changes nothing.
+    let response = app
+        .clone()
+        .oneshot(patch(json!({"reserve_windows":["weekly","five-hour"]})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["account"]["reserve_windows"], json!(["five-hour", "weekly"]));
+    let response = app
+        .clone()
+        .oneshot(patch(json!({"reserve_windows":["hourly"],"reserve_percent":7})))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(reserve().await, Some(5.0));
+    assert_eq!(
+        state.accounts.list().await[0].reserve_windows,
+        ["five-hour", "weekly"]
+    );
+
     // Renaming keeps the reserve; null and zero remove it.
     let response = app
         .clone()

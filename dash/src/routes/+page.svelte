@@ -17,7 +17,7 @@
 	import SettingsView from '$lib/components/settings-view.svelte';
 	import ConnectDialog from '$lib/components/connect-dialog.svelte';
 	import DouaneMark from '$lib/components/douane-mark.svelte';
-	import { management, importErrors, type Account, type Quota, type Provider, type Model, type Call, type Status, type Settings, type QuotaDisplay, type QuotaWindowChoice } from '$lib/management';
+	import { management, importErrors, type Account, type Quota, type Provider, type Model, type Call, type Status, type Settings, type QuotaDisplay, type QuotaWindowChoice, type ReserveWindow } from '$lib/management';
 	const groups = [
 		{ label:'Abonnements', items:[{ id:'quotas',label:'Quotas',icon:Gauge },{ id:'overview',label:"Vue d'ensemble",icon:LayoutDashboard },{ id:'accounts',label:'Comptes',icon:Users },{ id:'models',label:'Modèles',icon:Boxes }] },
 		{ label:'Service',items:[{ id:'activity',label:'Requêtes',icon:Activity },{ id:'settings',label:'Réglages',icon:Settings2 },{ id:'quickstart',label:'Démarrage rapide',icon:Rocket }] }
@@ -82,8 +82,8 @@
 		try { const result = await management.renameAccount(account.id, name); accounts = accounts.map(item => item.id === account.id ? result.account : item); }
 		finally { busy = ''; }
 	}
-	function setReserve(account: Account, reserve: number | null) {
-		return mutate('reserve', () => management.setAccountReserve(account.id, reserve), reserve == null ? 'Réserve retirée.' : 'Réserve enregistrée.');
+	function setReserve(account: Account, reserve: number | null, windows: ReserveWindow[]) {
+		return mutate('reserve', () => management.setAccountReserve(account.id, reserve, windows), reserve == null ? 'Réserve retirée.' : 'Réserve enregistrée.');
 	}
 	async function importFiles(files: FileList) {
 		const selected = Array.from(files);

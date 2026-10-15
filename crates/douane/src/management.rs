@@ -139,8 +139,13 @@ async fn account_value(
     let measured = snapshot
         .as_ref()
         .filter(|q| !(q.windows.is_empty() && q.error.is_some()))
-        .map(|q| q.reports_account_window());
-    let reached = crate::state::reserve_reached_in(summary.reserve_percent, snapshot.as_ref(), now);
+        .map(|q| q.reports_reserve_window(&summary.reserve_windows));
+    let reached = crate::state::reserve_reached_in(
+        summary.reserve_percent,
+        &summary.reserve_windows,
+        snapshot.as_ref(),
+        now,
+    );
     let mut value = json!(summary);
     value["reserve_measured"] = json!(measured);
     value["reserve_reached"] = json!(reached);
@@ -239,6 +244,8 @@ pub struct AccountPatch {
     /// Absent keeps the reserve; `null` or `0` removes it.
     #[serde(default, deserialize_with = "present")]
     reserve_percent: Option<Option<f64>>,
+    /// Absent keeps the watched windows; `[]` watches the longest window.
+    reserve_windows: Option<Vec<String>>,
 }
 
 fn present<'de, D: serde::Deserializer<'de>>(value: D) -> Result<Option<Option<f64>>, D::Error> {
@@ -271,7 +278,21 @@ pub async fn update_account(
             &crate::subscriptions::SubscriptionError::InvalidReserve.to_string(),
         );
     }
-    if name.is_none() && body.enabled.is_none() && reserve.is_none() {
+    if body
+        .reserve_windows
+        .as_deref()
+        .is_some_and(|kinds| crate::subscriptions::reserve_windows(kinds).is_none())
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            &crate::subscriptions::SubscriptionError::InvalidReserveWindows.to_string(),
+        );
+    }
+    if name.is_none()
+        && body.enabled.is_none()
+        && reserve.is_none()
+        && body.reserve_windows.is_none()
+    {
         return error(
             StatusCode::BAD_REQUEST,
             "provide a name, enabled state or reserve",
@@ -279,7 +300,7 @@ pub async fn update_account(
     }
     match state
         .accounts
-        .update(&id, name, body.enabled, reserve)
+        .update(&id, name, body.enabled, reserve, body.reserve_windows)
         .await
     {
         Ok(a) => {
@@ -289,7 +310,10 @@ pub async fn update_account(
         Err(e) => error(
             match e {
                 crate::subscriptions::SubscriptionError::NotFound => StatusCode::NOT_FOUND,
-                crate::subscriptions::SubscriptionError::InvalidReserve => StatusCode::BAD_REQUEST,
+                crate::subscriptions::SubscriptionError::InvalidReserve
+                | crate::subscriptions::SubscriptionError::InvalidReserveWindows => {
+                    StatusCode::BAD_REQUEST
+                }
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             },
             &e.to_string(),
@@ -703,6 +727,7 @@ pub async fn patch_auth_file(
             name: None,
             enabled: Some(!body["disabled"].as_bool().unwrap_or(false)),
             reserve_percent: None,
+            reserve_windows: None,
         }),
     )
     .await
@@ -819,7 +844,7 @@ mod tests {
                 .unwrap();
             state
                 .accounts
-                .update(&account.id, None, None, Some(Some(5.0)))
+                .update(&account.id, None, None, Some(Some(5.0)), None)
                 .await
                 .unwrap();
             if let Some((windows, error)) = quota {
@@ -849,6 +874,7 @@ mod tests {
                 name: Some("Renamed".into()),
                 enabled: None,
                 reserve_percent: None,
+                reserve_windows: None,
             }),
         )
         .await;
