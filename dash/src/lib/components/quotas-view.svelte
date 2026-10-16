@@ -11,14 +11,17 @@
 	import PrivateEmail from './private-email.svelte';
 	import AccountResets from './account-resets.svelte';
 	import EmptyState from './empty-state.svelte';
-	import { providerName, formatDate, resetLabel, creditValue, usageLabel, privateLabel, accountStatus, accountWarning, type Account, type Quota, type QuotaWindow, type Settings, type QuotaDisplay, type QuotaWindowChoice } from '$lib/management';
-	let { accounts, quotas, busy, refresh, connect, rename, resetUpdated, settings, setQuotaDisplay, setQuotaWindows }: { accounts: Account[]; quotas: Quota[]; busy: string; refresh: (id?: string) => void; connect: () => void; rename: (account: Account, name: string) => Promise<void>; resetUpdated: () => Promise<void>; settings: Settings | null; setQuotaDisplay: (provider: string, display: QuotaDisplay) => Promise<void>; setQuotaWindows: (provider: string, choice: QuotaWindowChoice) => Promise<void> } = $props();
+	import { providerName, formatDate, resetLabel, creditValue, usageLabel, privateLabel, accountStatus, accountWarning, type Account, type Quota, type QuotaWindow, type Settings, type QuotaDisplay, type QuotaWindowChoice, type Provider } from '$lib/management';
+	import { t } from '$lib/i18n.svelte';
+	let { accounts, quotas, providers = [], busy, refresh, connect, rename, resetUpdated, settings, setQuotaDisplay, setQuotaWindows }: { accounts: Account[]; quotas: Quota[]; providers?: Provider[]; busy: string; refresh: (id?: string) => void; connect: () => void; rename: (account: Account, name: string) => Promise<void>; resetUpdated: () => Promise<void>; settings: Settings | null; setQuotaDisplay: (provider: string, display: QuotaDisplay) => Promise<void>; setQuotaWindows: (provider: string, choice: QuotaWindowChoice) => Promise<void> } = $props();
 	let provider = $state('all');
 	let search = $state('');
 	let sort = $state('name');
 	let windowsOpen = $state<string | null>(null);
 	const order = ['claude', 'codex', 'opencode_go', 'xai'];
-	let providerIds = $derived([...new Set(accounts.map(a => a.provider))].sort((a, b) => (order.indexOf(a) < 0 ? 99 : order.indexOf(a)) - (order.indexOf(b) < 0 ? 99 : order.indexOf(b)) || providerName(a).localeCompare(providerName(b))));
+	// Providers that report no quota (custom endpoints, Qwen) have nothing to show here.
+	let unreported = $derived(new Set(providers.filter(p => !p.quota).map(p => p.id)));
+	let providerIds = $derived([...new Set(accounts.map(a => a.provider).filter(id => !unreported.has(id)))].sort((a, b) => (order.indexOf(a) < 0 ? 99 : order.indexOf(a)) - (order.indexOf(b) < 0 ? 99 : order.indexOf(b)) || providerName(a).localeCompare(providerName(b))));
 	let filtered = $derived(accounts.filter(a => (provider === 'all' || !providerIds.includes(provider) || a.provider === provider) && `${a.name} ${a.email ?? ''}`.toLowerCase().includes(search.toLowerCase())).sort((a,b) => sort === 'remaining' ? (remaining(a.id) ?? 101) - (remaining(b.id) ?? 101) : a.name.localeCompare(b.name)));
 	let groups = $derived(providerIds.map(id => ({ id, accounts: filtered.filter(a => a.provider === id) })).filter(group => group.accounts.length));
 	function display(id: string): QuotaDisplay { return settings?.quota_display?.[id] ?? 'accounts'; }
@@ -37,39 +40,39 @@
 </script>
 
 <div class="page-heading">
-	<h1>Quotas</h1>
-	<div class="heading-actions"><button class="button" disabled={!!busy || !accounts.length} onclick={() => refresh()}><RefreshCw size={18} class={busy === 'quotas' ? 'spinning' : ''}/>Actualiser les quotas</button><button class="button primary" onclick={connect}><Plus size={20}/>Connecter un compte</button></div>
+	<h1>{t('nav.quotas')}</h1>
+	<div class="heading-actions"><button class="button" disabled={!!busy || !accounts.length} onclick={() => refresh()}><RefreshCw size={18} class={busy === 'quotas' ? 'spinning' : ''}/>{t('quotas.refresh')}</button><button class="button primary" onclick={connect}><Plus size={20}/>{t('common.connectAccount')}</button></div>
 </div>
 
 {#if providerIds.length > 1}
-	<div class="provider-tabs" aria-label="Filtrer par fournisseur">
-		<button class:active={provider === 'all'} onclick={() => provider = 'all'} aria-pressed={provider === 'all'}>Tous <span class="count-badge">{accounts.length}</span></button>
+	<div class="provider-tabs" aria-label={t('quotas.filter')}>
+		<button class:active={provider === 'all'} onclick={() => provider = 'all'} aria-pressed={provider === 'all'}>{t('quotas.all')} <span class="count-badge">{accounts.filter(a => providerIds.includes(a.provider)).length}</span></button>
 		{#each providerIds as id (id)}<button class:active={provider === id} onclick={() => provider = id} aria-pressed={provider === id}><ProviderMark provider={id} size={22}/>{providerName(id)}<span class="count-badge">{accounts.filter(a => a.provider === id).length}</span></button>{/each}
 	</div>
 {/if}
 
-<div class="section-toolbar quota-toolbar"><label class="search-input"><Search size={18}/><input type="search" placeholder="Rechercher" aria-label="Rechercher un compte" bind:value={search}/></label><select aria-label="Trier les comptes" bind:value={sort}><option value="name">Par nom</option><option value="remaining">Quota restant</option></select></div>
+<div class="section-toolbar quota-toolbar"><label class="search-input"><Search size={18}/><input type="search" placeholder={t('quotas.search')} aria-label={t('common.searchAccount')} bind:value={search}/></label><select aria-label={t('quotas.sort')} bind:value={sort}><option value="name">{t('quotas.byName')}</option><option value="remaining">{t('quotas.byRemaining')}</option></select></div>
 
-{#if !accounts.length}<section class="ledger"><EmptyState title="Aucun compte connecté" description="Connectez un abonnement pour afficher ses quotas." action="Connecter un compte" onclick={connect}/></section>
-{:else if !filtered.length}<section class="ledger"><EmptyState title="Aucun compte correspondant" description="Essayez un autre nom ou fournisseur."/></section>
+{#if !accounts.length}<section class="ledger"><EmptyState title={t('common.noAccountConnected')} description={t('quotas.emptyDescription')} action={t('common.connectAccount')} onclick={connect}/></section>
+{:else if !filtered.length}<section class="ledger"><EmptyState title={t('common.noMatchingAccount')} description={t('common.tryOtherName')}/></section>
 {:else}
 	<div class="provider-groups">
 		{#each groups as group (group.id)}
-			<section class="provider-group" aria-label="Quotas {providerName(group.id)}">
-				<header class="provider-heading"><ProviderMark provider={group.id} size={29}/><h2>{providerName(group.id)}</h2><span>{group.accounts.length} {group.accounts.length === 1 ? 'compte' : 'comptes'}</span>{#if settings}<label class="display-choice" title="Affichage des quotas {providerName(group.id)} dans Boite et les clients de /v1/quotas"><span>Dans Boite / les clients</span><select value={display(group.id)} disabled={!!busy} onchange={(event) => chooseDisplay(group.id, event.currentTarget)}><option value="accounts">Détail par compte</option><option value="average">Moyenne des comptes</option></select></label><button class="button small windows-toggle" aria-expanded={windowsOpen === group.id} aria-controls="windows-{group.id}" title="Fenêtres de quota {providerName(group.id)} montrées dans Boite" onclick={() => windowsOpen = windowsOpen === group.id ? null : group.id}><SlidersHorizontal size={16}/>Fenêtres</button>{/if}</header>
+			<section class="provider-group" aria-label={t('quotas.group', { provider: providerName(group.id) })}>
+				<header class="provider-heading"><ProviderMark provider={group.id} size={29}/><h2>{providerName(group.id)}</h2><span>{t(group.accounts.length === 1 ? 'common.accountCount.one' : 'common.accountCount.other', { count: group.accounts.length })}</span>{#if settings}<label class="display-choice" title={t('quotas.displayTitle', { provider: providerName(group.id) })}><span>{t('quotas.displayLabel')}</span><select value={display(group.id)} disabled={!!busy} onchange={(event) => chooseDisplay(group.id, event.currentTarget)}><option value="accounts">{t('quotas.perAccount')}</option><option value="average">{t('quotas.average')}</option></select></label><button class="button small windows-toggle" aria-expanded={windowsOpen === group.id} aria-controls="windows-{group.id}" title={t('quotas.windowsTitle', { provider: providerName(group.id) })} onclick={() => windowsOpen = windowsOpen === group.id ? null : group.id}><SlidersHorizontal size={16}/>{t('quotas.windows')}</button>{/if}</header>
 					{#if settings && windowsOpen === group.id}
 						{@const current = choice(group.id)}
-						<div class="window-choices" id="windows-{group.id}" aria-label="Fenêtres {providerName(group.id)} dans Boite">
+						<div class="window-choices" id="windows-{group.id}" aria-label={t('quotas.windowsLabel', { provider: providerName(group.id) })}>
 							{#each windowsOf(group.id) as window (window.id)}
 								{@const primary = current.primary === window.id}
 								{@const shown = primary || !current.hidden.includes(window.id)}
 								<div class="window-choice" class:hidden-window={!shown}>
 									<span class="window-name">{usageLabel(window.label)}</span>
-									<button class="primary-choice" class:on={primary} aria-pressed={primary} disabled={!!busy} onclick={() => choosePrimary(group.id, primary ? null : window.id)}><Star size={16}/>{primary ? 'Principale' : 'Rendre principale'}</button>
-									<button class="switch" class:on={shown} role="switch" aria-checked={shown} aria-label="Afficher {usageLabel(window.label)} dans Boite" disabled={!!busy || primary} onclick={() => toggleShown(group.id, window.id)}><span></span></button>
+									<button class="primary-choice" class:on={primary} aria-pressed={primary} disabled={!!busy} onclick={() => choosePrimary(group.id, primary ? null : window.id)}><Star size={16}/>{t(primary ? 'quotas.primary' : 'quotas.makePrimary')}</button>
+									<button class="switch" class:on={shown} role="switch" aria-checked={shown} aria-label={t('quotas.showWindow', { label: usageLabel(window.label) })} disabled={!!busy || primary} onclick={() => toggleShown(group.id, window.id)}><span></span></button>
 								</div>
-							{:else}<p class="quota-unavailable">Aucune fenêtre lue pour ce fournisseur.</p>{/each}
-							{#if !current.primary && windowsOf(group.id).length}<p class="window-default">Sans fenêtre principale, Boite met la semaine en avant.</p>{/if}
+							{:else}<p class="quota-unavailable">{t('quotas.noWindow')}</p>{/each}
+							{#if !current.primary && windowsOf(group.id).length}<p class="window-default">{t('quotas.defaultWindow')}</p>{/if}
 						</div>
 					{/if}
 				<div class="ledger">
@@ -79,11 +82,11 @@
 						<article class="quota-row" class:disabled-row={!account.enabled}>
 							<div class="account-identity"><AccountName {account} {rename} {busy}/>{#if subscription?.label || account.plan}<p class="account-plan">{subscription?.label ?? account.plan}</p>{/if}{#if account.email}<PrivateEmail email={account.email}/>{/if}<AccountResets {account} {busy} updated={resetUpdated}/></div>
 							<div class="quota-details">
-								{#if quota?.verification_required}<div class="verification-needed"><p>Google demande de vérifier ce compte.</p>{#if quota.verification_available}<a class="button" href={`/admin/api/accounts/${encodeURIComponent(account.id)}/verification`} target="_blank" rel="noopener noreferrer" data-sveltekit-reload>Vérifier le compte Google<ExternalLink size={16}/></a>{:else}<p>Ouvrez Antigravity avec ce compte pour terminer la vérification.</p>{/if}</div>{/if}
-								<div class="quota-windows">{#if quota?.windows.length}{#each quota.windows as window (window.id)}<div class="quota-window"><QuotaMeter value={window.remaining_percent} label={usageLabel(window.label)}/><p class="reset-date" title={window.reset_at ? `Réinitialisation : ${formatDate(window.reset_at)}` : undefined}><RefreshCw size={16}/>{resetLabel(window.reset_at)}</p></div>{/each}{:else if !quota?.verification_required}<p class="quota-unavailable">{quota?.error ? privateLabel(quota.error) : 'Quota non communiqué'}</p>{/if}</div>
-								{#if quota?.credits?.length}<div class="credit-windows">{#each quota.credits as credit (credit.id)}<div class="credit-window"><div><span>{usageLabel(credit.label)}</span><strong>{credit.enabled === false ? 'Désactivé' : credit.unlimited ? 'Illimités' : creditValue(credit.remaining, credit.unit)}{#if credit.enabled !== false && credit.remaining != null}<span class="muted">{' restants'}</span>{/if}</strong></div>{#if credit.used != null}<p>{creditValue(credit.used, credit.unit)}{' utilisés'}{#if credit.limit != null}{' sur '}{creditValue(credit.limit, credit.unit)}{/if}</p>{/if}{#if credit.reset_at}<p class="reset-date"><RefreshCw size={16}/>{resetLabel(credit.reset_at)}</p>{/if}</div>{/each}</div>{/if}
+								{#if quota?.verification_required}<div class="verification-needed"><p>{t('quotas.googleVerify')}</p>{#if quota.verification_available}<a class="button" href={`/admin/api/accounts/${encodeURIComponent(account.id)}/verification`} target="_blank" rel="noopener noreferrer" data-sveltekit-reload>{t('common.verifyGoogle')}<ExternalLink size={16}/></a>{:else}<p>{t('common.openAntigravity')}</p>{/if}</div>{/if}
+								<div class="quota-windows">{#if quota?.windows.length}{#each quota.windows as window (window.id)}<div class="quota-window"><QuotaMeter value={window.remaining_percent} label={usageLabel(window.label)}/><p class="reset-date" title={window.reset_at ? t('quotas.resetAt', { date: formatDate(window.reset_at) }) : undefined}><RefreshCw size={16}/>{resetLabel(window.reset_at)}</p></div>{/each}{:else if !quota?.verification_required}<p class="quota-unavailable">{quota?.error ? privateLabel(quota.error) : t('quotas.notReported')}</p>{/if}</div>
+								{#if quota?.credits?.length}<div class="credit-windows">{#each quota.credits as credit (credit.id)}<div class="credit-window"><div><span>{usageLabel(credit.label)}</span><strong>{credit.enabled === false ? t('common.disabled') : credit.unlimited ? t('quotas.unlimited') : creditValue(credit.remaining, credit.unit)}{#if credit.enabled !== false && credit.remaining != null}<span class="muted">{` ${t('quotas.remaining')}`}</span>{/if}</strong></div>{#if credit.used != null}<p>{credit.limit != null ? t('quotas.usedOf', { used: creditValue(credit.used, credit.unit), limit: creditValue(credit.limit, credit.unit) }) : t('quotas.used', { used: creditValue(credit.used, credit.unit) })}</p>{/if}{#if credit.reset_at}<p class="reset-date"><RefreshCw size={16}/>{resetLabel(credit.reset_at)}</p>{/if}</div>{/each}</div>{/if}
 							</div>
-							<div class="account-state"><span class="state-badge" class:warning={!!quota?.error || accountWarning(account) || (account.enabled && !!account.reserve_reached)} class:inactive={!account.enabled}><span class="status-pip"></span>{!account.enabled ? 'Désactivé' : quota?.error ? 'À vérifier' : account.reserve_reached && ['ready', 'active'].includes(account.status) ? 'Réserve atteinte' : accountStatus(account)}</span><button class="icon-button" disabled={!!busy} onclick={() => refresh(account.id)} title="Actualiser ce compte" aria-label="Actualiser {privateLabel(account.name)}"><RefreshCw size={19}/></button></div>
+							<div class="account-state"><span class="state-badge" class:warning={!!quota?.error || accountWarning(account) || (account.enabled && !!account.reserve_reached)} class:inactive={!account.enabled}><span class="status-pip"></span>{!account.enabled ? t('common.disabled') : quota?.error ? t('status.check') : account.reserve_reached && ['ready', 'active'].includes(account.status) ? t('status.reserveReached') : accountStatus(account)}</span><button class="icon-button" disabled={!!busy} onclick={() => refresh(account.id)} title={t('quotas.refreshAccount')} aria-label={t('quotas.refreshNamed', { name: privateLabel(account.name) })}><RefreshCw size={19}/></button></div>
 						</article>
 					{/each}
 				</div>

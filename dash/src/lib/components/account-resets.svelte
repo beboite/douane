@@ -3,6 +3,7 @@
 	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
 	import X from '@lucide/svelte/icons/x';
 	import { management, privateLabel, formatDate, newResetRequestId, type Account, type ResetAvailability } from '$lib/management';
+	import { t, type StringKey } from '$lib/i18n.svelte';
 	let { account, busy, updated }: { account: Account; busy: string; updated: () => Promise<void> } = $props();
 	let availability = $state.raw<ResetAvailability | null>(null);
 	let checking = $state(false);
@@ -33,9 +34,10 @@
 		try {
 			sessionStorage.setItem(storageKey, requestId); pending = true;
 			const response = await management.redeemReset(account.id, requestId);
-			const messages = { reset: 'Quota réinitialisé.', already_redeemed: 'Ce reset a déjà été appliqué.', nothing_to_reset: 'Le quota est déjà disponible. Aucun reset utilisé.', no_credit: 'Aucun reset disponible.' };
-			result = messages[response.outcome];
-			if (!result) throw new Error('Le serveur n’a pas confirmé le résultat du reset.');
+			const messages: Record<string, StringKey> = { reset: 'resets.reset', already_redeemed: 'resets.alreadyRedeemed', nothing_to_reset: 'resets.nothingToReset', no_credit: 'resets.noCredit' };
+			const message = messages[response.outcome];
+			if (!message) throw new Error(t('resets.unconfirmed'));
+			result = t(message);
 			sessionStorage.removeItem(storageKey); pending = false;
 			await check(); await updated();
 		} catch (error) { failure = privateLabel((error as Error).message); }
@@ -45,24 +47,24 @@
 
 {#if supported}
 	<div class="reset-control">
-		{#if canReset || pending}<button class="button reset-button" disabled={!!busy || checking} onclick={open}><RefreshCw size={17}/>{pending ? 'Reprendre le reset' : `Réinitialiser (${availability?.available_count})`}</button>
-		{:else if checking}<span class="reset-status">Vérification des resets</span>
-		{:else if availability?.status === 'ready'}<span class="reset-status">0 reset disponible</span>
-		{:else if availability?.status !== 'unsupported'}<button class="reset-retry" disabled={!!busy} onclick={check}>Vérifier les resets</button>{/if}
+		{#if canReset || pending}<button class="button reset-button" disabled={!!busy || checking} onclick={open}><RefreshCw size={17}/>{pending ? t('resets.resume') : t('resets.button', { count: availability?.available_count ?? 0 })}</button>
+		{:else if checking}<span class="reset-status">{t('resets.checking')}</span>
+		{:else if availability?.status === 'ready'}<span class="reset-status">{t('resets.none')}</span>
+		{:else if availability?.status !== 'unsupported'}<button class="reset-retry" disabled={!!busy} onclick={check}>{t('resets.check')}</button>{/if}
 		{#if failure && !dialog?.open}<p class="reset-error" role="alert">{failure}</p>{/if}
 		{#if availability?.error && !failure && availability.status !== 'unsupported'}<p class="reset-error">{privateLabel(availability.error)}</p>{/if}
 	</div>
 	<dialog bind:this={dialog} oncancel={(event) => { if (saving) event.preventDefault(); }}>
 		<div class="reset-dialog">
-			<header><h2>Réinitialiser le quota</h2><button class="icon-button" aria-label="Fermer la confirmation" disabled={saving} onclick={() => dialog?.close()}><X size={22}/></button></header>
+			<header><h2>{t('resets.title')}</h2><button class="icon-button" aria-label={t('resets.closeConfirmation')} disabled={saving} onclick={() => dialog?.close()}><X size={22}/></button></header>
 			<p class="reset-account">{privateLabel(account.name)}</p>
-			{#if result}<p class="reset-result" role="status">{result}</p><div class="dialog-actions"><button class="button primary" onclick={() => dialog?.close()}>Fermer</button></div>
+			{#if result}<p class="reset-result" role="status">{result}</p><div class="dialog-actions"><button class="button primary" onclick={() => dialog?.close()}>{t('common.close')}</button></div>
 			{:else}
-				<p>Cette action consomme 1 reset pour rétablir le quota du compte. Elle est irréversible.</p>
-				{#if availability?.next_expires_at}<p>Le reset qui expire le {formatDate(availability.next_expires_at)} sera utilisé en premier.</p>{/if}
-				{#if pending}<p>Une tentative est en attente de confirmation. Réessayer vérifie la même opération.</p>{/if}
+				<p>{t('resets.warning')}</p>
+				{#if availability?.next_expires_at}<p>{t('resets.expiresFirst', { date: formatDate(availability.next_expires_at) })}</p>{/if}
+				{#if pending}<p>{t('resets.pending')}</p>{/if}
 				{#if failure}<p class="reset-error" role="alert">{failure}</p>{/if}
-				<div class="dialog-actions"><button class="button" disabled={saving} onclick={() => dialog?.close()}>Annuler</button><button class="button primary" disabled={saving || !!busy} onclick={redeem}>{saving ? 'Réinitialisation en cours' : pending ? 'Réessayer le même reset' : 'Utiliser 1 reset'}</button></div>
+				<div class="dialog-actions"><button class="button" disabled={saving} onclick={() => dialog?.close()}>{t('common.cancel')}</button><button class="button primary" disabled={saving || !!busy} onclick={redeem}>{saving ? t('resets.running') : pending ? t('resets.retrySame') : t('resets.use')}</button></div>
 			{/if}
 		</div>
 	</dialog>

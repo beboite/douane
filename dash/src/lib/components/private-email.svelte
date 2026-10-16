@@ -1,11 +1,12 @@
 <script lang="ts">
 	import Eye from '@lucide/svelte/icons/eye';
 	import EyeOff from '@lucide/svelte/icons/eye-off';
+	import { t } from '$lib/i18n.svelte';
 	let { email }: { email: string } = $props();
 	let revealed = $state(false);
 </script>
 
-<button class="private-email" aria-label={revealed ? 'Masquer cet email' : 'Afficher cet email'} aria-pressed={revealed} title={revealed ? 'Masquer cet email' : 'Afficher cet email'} onclick={() => revealed = !revealed}>
+<button class="private-email" aria-label={t(revealed ? 'email.hide' : 'email.show')} aria-pressed={revealed} title={t(revealed ? 'email.hide' : 'email.show')} onclick={() => revealed = !revealed}>
 	<span class:blurred={!revealed} aria-hidden={!revealed}>{email}</span>
 	{#if revealed}<EyeOff size={16}/>{:else}<Eye size={16}/>{/if}
 </button>

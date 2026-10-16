@@ -1,6 +1,7 @@
 <script lang="ts">
 	import Pencil from '@lucide/svelte/icons/pencil';
-	import { dialects, type Account, type Dialect, type EndpointPatch } from '$lib/management';
+	import { dialects, dialectLabel as labelOf, type Account, type Dialect, type EndpointPatch } from '$lib/management';
+	import { t } from '$lib/i18n.svelte';
 	let { account, busy, save }: { account: Account; busy: string; save: (account: Account, patch: EndpointPatch) => Promise<boolean> } = $props();
 	let editing = $state(false);
 	let route = $state('');
@@ -8,7 +9,7 @@
 	let dialect = $state<Dialect | ''>('');
 	let models = $state('');
 	let key = $state('');
-	const dialectLabel = $derived(dialects.find(option => option.id === (account.dialect ?? ''))?.label ?? '');
+	const dialectLabel = $derived(labelOf(account.dialect ?? ''));
 	function open() {
 		route = account.route ?? ''; baseUrl = account.base_url ?? ''; dialect = account.dialect ?? ''; models = (account.models ?? []).join(', '); key = ''; editing = true;
 	}
@@ -29,19 +30,19 @@
 
 {#if editing}
 	<form class="endpoint-editor" onsubmit={submit}>
-		<label>Préfixe des modèles<input bind:value={route} required pattern="[a-z0-9][a-z0-9_\-]{'{0,31}'}" autocomplete="off" spellcheck="false"/></label>
-		<label>Adresse de l'API<input type="url" bind:value={baseUrl} required/></label>
-		<label>Format de l'API<select bind:value={dialect}>{#each dialects as option (option.id)}<option value={option.id}>{option.label}</option>{/each}</select></label>
-		<label>Modèles servis<input bind:value={models} placeholder="Tous les modèles de l'API" autocomplete="off" spellcheck="false"/></label>
-		<label>Nouvelle clé d'API<input type="password" bind:value={key} placeholder="Inchangée" autocomplete="off" spellcheck="false"/></label>
-		<div class="editor-actions"><button class="button primary" disabled={!!busy}>Enregistrer</button><button type="button" class="button" onclick={() => { editing = false; key = ''; }}>Annuler</button></div>
+		<label>{t('endpoint.route')}<input bind:value={route} required pattern="[a-z0-9][a-z0-9_\-]{'{0,31}'}" autocomplete="off" spellcheck="false"/></label>
+		<label>{t('endpoint.url')}<input type="url" bind:value={baseUrl} required/></label>
+		<label>{t('endpoint.format')}<select bind:value={dialect}>{#each dialects as option (option)}<option value={option}>{labelOf(option)}</option>{/each}</select></label>
+		<label>{t('endpoint.models')}<input bind:value={models} placeholder={t('endpoint.modelsPlaceholder')} autocomplete="off" spellcheck="false"/></label>
+		<label>{t('endpoint.newKey')}<input type="password" bind:value={key} placeholder={t('endpoint.unchanged')} autocomplete="off" spellcheck="false"/></label>
+		<div class="editor-actions"><button class="button primary" disabled={!!busy}>{t('common.save')}</button><button type="button" class="button" onclick={() => { editing = false; key = ''; }}>{t('common.cancel')}</button></div>
 	</form>
 {:else if account.route || account.base_url}
 	<div class="endpoint-line">
 		{#if account.route}<code>{account.route}/</code>{/if}
 		<span class="endpoint-url" title={account.base_url ?? ''}>{account.base_url}</span>
 		{#if dialectLabel}<span class="endpoint-format">{dialectLabel}</span>{/if}
-		<button class="icon-button" aria-label="Modifier l'endpoint" title="Modifier l'endpoint" disabled={!!busy} onclick={open}><Pencil size={15}/></button>
+		<button class="icon-button" aria-label={t('endpoint.edit')} title={t('endpoint.edit')} disabled={!!busy} onclick={open}><Pencil size={15}/></button>
 	</div>
 {/if}
 

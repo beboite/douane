@@ -1,3 +1,5 @@
+import { language, locale, t, type StringKey } from './i18n.svelte';
+
 export type Provider = { id: string; name: string; oauth: boolean; quota: boolean; docs_url: string; credential?: boolean; base_url?: string };
 export type Account = {
 	id: string; name: string; provider: string; email?: string | null; plan?: string | null;
@@ -7,10 +9,12 @@ export type Account = {
 	route?: string | null; base_url?: string | null; dialect?: Dialect | null; models?: string[];
 };
 export type Dialect = 'chat' | 'responses' | 'messages';
-export const dialects: { id: Dialect | ''; label: string }[] = [{ id: 'chat', label: 'Chat Completions' }, { id: 'responses', label: 'Responses' }, { id: 'messages', label: 'Messages (Anthropic)' }, { id: '', label: 'Celui du client' }];
+export const dialects: (Dialect | '')[] = ['chat', 'responses', 'messages', ''];
+export function dialectLabel(id: Dialect | '') { return id === '' ? t('dialect.client') : { chat: 'Chat Completions', responses: 'Responses', messages: 'Messages (Anthropic)' }[id]; }
 export type EndpointPatch = { route?: string; base_url?: string; dialect?: Dialect | null; models?: string[]; api_key?: string };
 export type ReserveWindow = 'five-hour' | 'daily' | 'weekly' | 'monthly';
-export const reserveWindows: { id: ReserveWindow; label: string }[] = [{ id: 'five-hour', label: '5 h' }, { id: 'daily', label: 'Jour' }, { id: 'weekly', label: 'Semaine' }, { id: 'monthly', label: 'Mois' }];
+export const reserveWindows: ReserveWindow[] = ['five-hour', 'daily', 'weekly', 'monthly'];
+export function reserveWindowLabel(id: ReserveWindow) { return t(`reserveWindow.${id}`); }
 export function reserveWindow(id: string): ReserveWindow | null { return ({ 'five-hour': 'five-hour', daily: 'daily', weekly: 'weekly', 'seven-day': 'weekly', seven_day: 'weekly', monthly: 'monthly' } as Record<string, ReserveWindow>)[id] ?? null; }
 export type QuotaWindow = { id: string; label: string; remaining_percent: number | null; reset_at?: string | null };
 export type Subscription = { id: string; label: string; multiplier?: number | null; source: string };
@@ -40,7 +44,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 		headers: { ...(init?.body ? { 'content-type': 'application/json' } : {}), ...init?.headers }
 	});
 	if (!response.ok) {
-		let message = `Le serveur a répondu ${response.status}.`;
+		let message = t('api.serverStatus', { status: response.status });
 		try {
 			const body = await response.json();
 			message = body.errors?.length ? importErrors(body.errors) : typeof body.error === 'string' ? body.error : body.error?.message ?? body.message ?? message;
@@ -76,30 +80,38 @@ export const management = {
 };
 
 export const providerNames: Record<string, string> = {
-	codex: 'Codex', claude: 'Claude', gemini: 'Gemini', antigravity: 'Antigravity', qwen: 'Qwen', kimi: 'Kimi', copilot: 'GitHub Copilot', iflow: 'iFlow', opencode_go: 'OpenCode Go', xai: 'Grok', grok: 'Grok', openai_compatible: 'Compatible OpenAI'
+	codex: 'Codex', claude: 'Claude', gemini: 'Gemini', antigravity: 'Antigravity', qwen: 'Qwen', kimi: 'Kimi', copilot: 'GitHub Copilot', iflow: 'iFlow', opencode_go: 'OpenCode Go', xai: 'Grok', grok: 'Grok', openai_compatible: 'OpenAI-compatible'
 };
-export function privateLabel(value: string, showEmails = false) { return showEmails ? value : value.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, 'compte'); }
-export function importErrors(errors: ImportError[]) { return errors.map(error => typeof error === 'string' ? error : `${error.name ? `${privateLabel(error.name)} : ` : ''}${error.error}`).join(' '); }
-export function accountStatus(account: Account) { return !account.enabled ? 'Désactivé' : ({ ready:'Actif',active:'Actif',disabled:'Désactivé',exhausted:'Quota épuisé',cooldown:'En pause',expired:'Connexion expirée',error:'À vérifier' }[account.status] ?? 'À vérifier'); }
+export function privateLabel(value: string, showEmails = false) { return showEmails ? value : value.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, t('private.account')); }
+export function importErrors(errors: ImportError[]) { return errors.map(error => typeof error === 'string' ? error : error.name ? t('api.errorPrefix', { name: privateLabel(error.name), error: error.error }) : error.error).join(' '); }
+const statusKeys: Record<string, StringKey> = { ready: 'status.active', active: 'status.active', disabled: 'common.disabled', exhausted: 'status.exhausted', cooldown: 'status.cooldown', expired: 'status.expired', error: 'status.check' };
+export function accountStatus(account: Account) { return t(!account.enabled ? 'common.disabled' : statusKeys[account.status] ?? 'status.check'); }
 export function accountWarning(account: Account) { return account.enabled && (!!account.last_error || !['ready','active'].includes(account.status)); }
-export function providerName(id: string) { return providerNames[id] ?? id; }
-export function formatCount(value: number | undefined) { return value == null ? '-' : new Intl.NumberFormat('fr-FR', { notation: value >= 10000 ? 'compact' : 'standard', maximumFractionDigits: 1 }).format(value); }
-export function formatDate(value?: string | null) { return value ? new Intl.DateTimeFormat('fr-FR', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }).format(new Date(value)) : '-'; }
+/** The dashboard's name for a provider; `fallback` is the server's name for an unknown id. */
+export function providerName(id: string, fallback = id) { return id === 'openai_compatible' ? t('provider.openaiCompatible') : providerNames[id] ?? fallback; }
+export function formatDecimal(value: number) { return new Intl.NumberFormat(locale(), { maximumFractionDigits: 1 }).format(value); }
+export function formatCount(value: number | undefined) { return value == null ? '-' : new Intl.NumberFormat(locale(), { notation: value >= 10000 ? 'compact' : 'standard', maximumFractionDigits: 1 }).format(value); }
+/** A 12-hour English clock reads `1:49 PM`, not `01:49 PM`; French keeps `13:49`. */
+function hour() { return language() === 'en' ? 'numeric' as const : '2-digit' as const; }
+export function formatDate(value?: string | null) { return value ? new Intl.DateTimeFormat(locale(), { day: '2-digit', month: 'short', hour: hour(), minute: '2-digit' }).format(new Date(value)) : '-'; }
 export function resetLabel(value?: string | null) {
-	if (!value) return 'Date non communiquée';
+	if (!value) return t('date.unknown');
 	const date = new Date(value);
-	if (Number.isNaN(date.getTime())) return 'Date non communiquée';
+	if (Number.isNaN(date.getTime())) return t('date.unknown');
 	const distant = Math.abs(date.getTime() - Date.now()) > 7 * 24 * 60 * 60 * 1000;
-	return new Intl.DateTimeFormat('fr-FR', { weekday: 'long', ...(distant ? { day: 'numeric', month: 'short' } as const : {}), hour: '2-digit', minute: '2-digit' }).format(date);
+	return new Intl.DateTimeFormat(locale(), { weekday: 'long', ...(distant ? { day: 'numeric', month: 'short' } as const : {}), hour: hour(), minute: '2-digit' }).format(date);
 }
 export function creditValue(value: number | null | undefined, unit: string) {
-	if (value == null) return 'Non communiqué';
-	if (unit === 'USD') return new Intl.NumberFormat('fr-FR', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(value);
-	if (/^[A-Z]{3}_minor$/.test(unit)) return new Intl.NumberFormat('fr-FR', { style: 'currency', currency: unit.slice(0, 3), maximumFractionDigits: 2 }).format(value / 100);
-	return `${new Intl.NumberFormat('fr-FR', { maximumFractionDigits: 2 }).format(value)} ${unit === 'credits' ? 'crédits' : unit}`;
+	if (value == null) return t('credit.unknown');
+	if (unit === 'USD') return new Intl.NumberFormat(locale(), { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(value);
+	if (/^[A-Z]{3}_minor$/.test(unit)) return new Intl.NumberFormat(locale(), { style: 'currency', currency: unit.slice(0, 3), maximumFractionDigits: 2 }).format(value / 100);
+	return `${new Intl.NumberFormat(locale(), { maximumFractionDigits: 2 }).format(value)} ${unit === 'credits' ? t('credit.credits') : unit}`;
 }
+const usageKeys: Record<string, StringKey> = { weekly: 'usage.weekly', 'codex weekly': 'usage.weekly', 'grok weekly': 'usage.weekly', monthly: 'usage.monthly', '5 hours': 'usage.fiveHours', 'five hour': 'usage.fiveHours', 'extra usage': 'usage.extra', 'additional usage': 'usage.extra', 'codex credits': 'usage.codexCredits', 'credit balance': 'usage.creditBalance', 'premium requests': 'usage.premiumRequests', chat: 'usage.chat', completions: 'usage.completions' };
+/** A display label for a quota label the server sends in English. */
 export function usageLabel(label: string) {
-	return ({ weekly: 'Semaine', 'codex weekly': 'Semaine', 'grok weekly': 'Semaine', monthly: 'Mois', '5 hours': '5 heures', 'five hour': '5 heures', 'extra usage': 'Usage supplémentaire', 'additional usage': 'Usage supplémentaire', 'codex credits': 'Crédits Codex', 'credit balance': 'Solde des crédits', 'premium requests': 'Requêtes premium', chat: 'Chat', completions: 'Complétions' } as Record<string, string>)[label.toLowerCase()] ?? label;
+	const key = usageKeys[label.toLowerCase()];
+	return key ? t(key) : label;
 }
 export function newResetRequestId() {
 	if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();

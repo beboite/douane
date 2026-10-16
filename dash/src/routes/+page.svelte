@@ -18,9 +18,11 @@
 	import ConnectDialog from '$lib/components/connect-dialog.svelte';
 	import DouaneMark from '$lib/components/douane-mark.svelte';
 	import { management, importErrors, type Account, type Quota, type Provider, type Model, type Call, type Status, type Settings, type QuotaDisplay, type QuotaWindowChoice, type ReserveWindow, type EndpointPatch } from '$lib/management';
-	const groups = [
-		{ label:'Abonnements', items:[{ id:'quotas',label:'Quotas',icon:Gauge },{ id:'overview',label:"Vue d'ensemble",icon:LayoutDashboard },{ id:'accounts',label:'Comptes',icon:Users },{ id:'models',label:'Modèles',icon:Boxes }] },
-		{ label:'Service',items:[{ id:'activity',label:'Requêtes',icon:Activity },{ id:'settings',label:'Réglages',icon:Settings2 },{ id:'quickstart',label:'Démarrage rapide',icon:Rocket }] }
+	import LanguageSetting from '$lib/components/language-setting.svelte';
+	import { t, type StringKey } from '$lib/i18n.svelte';
+	const groups: { label: StringKey; items: { id: string; label: StringKey; icon: typeof Gauge }[] }[] = [
+		{ label:'nav.subscriptions', items:[{ id:'quotas',label:'nav.quotas',icon:Gauge },{ id:'overview',label:'nav.overview',icon:LayoutDashboard },{ id:'accounts',label:'nav.accounts',icon:Users },{ id:'models',label:'nav.models',icon:Boxes }] },
+		{ label:'nav.service',items:[{ id:'activity',label:'nav.activity',icon:Activity },{ id:'settings',label:'nav.settings',icon:Settings2 },{ id:'quickstart',label:'nav.quickstart',icon:Rocket }] }
 	];
 	const mobileItems = groups.flatMap(group => group.items).filter(item => ['quotas','accounts','activity','settings'].includes(item.id));
 	let screen = $state('quotas');
@@ -37,7 +39,7 @@
 	let busy = $state('');
 	let failure = $state('');
 	let notice = $state('');
-	let pageTitle = $derived(groups.flatMap(g => g.items).find(item => item.id === screen)?.label ?? 'Quotas');
+	let pageTitle = $derived(t(groups.flatMap(g => g.items).find(item => item.id === screen)?.label ?? 'nav.quotas'));
 	let loadingRequest: Promise<void> | null = null;
 	async function load(silent = false) {
 		if (loadingRequest) return loadingRequest;
@@ -69,59 +71,59 @@
 	async function setQuotaDisplay(provider: string, display: QuotaDisplay) {
 		const next = { ...settings?.quota_display };
 		if (display === 'average') next[provider] = display; else delete next[provider];
-		await mutate('settings', () => management.settingsSave({ quota_display: next }), 'Affichage dans Boite enregistré.');
+		await mutate('settings', () => management.settingsSave({ quota_display: next }), t('notice.displaySaved'));
 	}
 	async function setQuotaWindows(provider: string, choice: QuotaWindowChoice) {
 		const next = { ...settings?.quota_windows };
 		if (choice.hidden?.length || choice.primary) next[provider] = { hidden: choice.hidden ?? [], primary: choice.primary ?? null }; else delete next[provider];
-		await mutate('settings', () => management.settingsSave({ quota_windows: next }), 'Fenêtres affichées dans Boite enregistrées.');
+		await mutate('settings', () => management.settingsSave({ quota_windows: next }), t('notice.windowsSaved'));
 	}
 	async function rename(account: Account, name: string) {
-		if (busy) throw new Error('Une action est déjà en cours.');
+		if (busy) throw new Error(t('notice.busy'));
 		busy = 'rename';
 		try { const result = await management.renameAccount(account.id, name); accounts = accounts.map(item => item.id === account.id ? result.account : item); }
 		finally { busy = ''; }
 	}
 	function updateEndpoint(account: Account, patch: EndpointPatch) {
-		return mutate('endpoint', () => management.updateEndpoint(account.id, patch), 'Endpoint enregistré.');
+		return mutate('endpoint', () => management.updateEndpoint(account.id, patch), t('notice.endpointSaved'));
 	}
 	function setReserve(account: Account, reserve: number | null, windows: ReserveWindow[]) {
-		return mutate('reserve', () => management.setAccountReserve(account.id, reserve, windows), reserve == null ? 'Réserve retirée.' : 'Réserve enregistrée.');
+		return mutate('reserve', () => management.setAccountReserve(account.id, reserve, windows), t(reserve == null ? 'notice.reserveRemoved' : 'notice.reserveSaved'));
 	}
 	async function importFiles(files: FileList) {
 		const selected = Array.from(files);
 		await mutate('import',async () => {
-			const contents = await Promise.all(selected.map(async file => { if (file.size > 2*1024*1024) throw new Error(`${file.name} dépasse la limite de 2 Mo.`); try { return { name:file.name,content:JSON.parse(await file.text()) }; } catch { throw new Error(`${file.name} : le fichier doit contenir du JSON valide.`); } }));
+			const contents = await Promise.all(selected.map(async file => { if (file.size > 2*1024*1024) throw new Error(t('notice.fileTooLarge', { name: file.name })); try { return { name:file.name,content:JSON.parse(await file.text()) }; } catch { throw new Error(t('notice.invalidJson', { name: file.name })); } }));
 			const result = await management.importAccounts(contents);
-			if (result.errors?.length) { await load(true); throw new Error(`${result.imported} compte(s) importé(s). ${importErrors(result.errors)}`); }
-			if (!result.imported) throw new Error("Le fichier n'a ajouté aucun compte.");
-		},'Comptes importés.');
+			if (result.errors?.length) { await load(true); throw new Error(t('notice.partialImport', { count: result.imported, errors: importErrors(result.errors) })); }
+			if (!result.imported) throw new Error(t('notice.nothingImported'));
+		},t('notice.imported'));
 	}
 	onMount(() => { hashChange(); void load(); const timer = setInterval(() => { if (!document.hidden && !busy) void load(true); },15_000); return () => clearInterval(timer); });
 </script>
 
-<svelte:head><title>{pageTitle} · douane</title><meta name="description" content="Gérez vos abonnements, leurs quotas et les requêtes de vos outils."/></svelte:head>
+<svelte:head><title>{pageTitle} · douane</title><meta name="description" content={t('page.description')}/></svelte:head>
 <svelte:window onhashchange={hashChange} onkeydown={(event) => { if (event.key === 'Escape') mobileOpen = false; }}/>
 <svelte:document onvisibilitychange={() => { if (!document.hidden) void load(true); }}/>
 
 <div class="app-shell">
-	{#if mobileOpen}<button class="nav-backdrop" aria-label="Fermer le menu" onclick={() => mobileOpen = false}></button>{/if}
+	{#if mobileOpen}<button class="nav-backdrop" aria-label={t('nav.closeMenu')} onclick={() => mobileOpen = false}></button>{/if}
 	<aside id="main-navigation" class="sidebar" class:mobile-open={mobileOpen}>
-		<div class="brand"><span class="brand-symbol"><DouaneMark/></span><span>douane</span><button class="icon-button mobile-close" aria-label="Fermer le menu" onclick={() => mobileOpen = false}><X size={18}/></button></div>
-		<nav aria-label="Navigation principale">{#each groups as group (group.label)}<div class="nav-group"><p>{group.label}</p>{#each group.items as item (item.id)}{@const Icon = item.icon}<button class="nav-link" class:active={screen === item.id} aria-current={screen === item.id ? 'page' : undefined} onclick={() => navigate(item.id)}><Icon size={17}/><span>{item.label}</span>{#if item.id === 'accounts' && accounts.length}<span class="nav-count">{accounts.length}</span>{/if}</button>{/each}</div>{/each}</nav>
-		<div class="sidebar-bottom"><button class="sidebar-help" onclick={() => navigate('quickstart')}>Configurer un outil<ChevronRight size={19}/></button></div>
+		<div class="brand"><span class="brand-symbol"><DouaneMark/></span><span>douane</span><button class="icon-button mobile-close" aria-label={t('nav.closeMenu')} onclick={() => mobileOpen = false}><X size={18}/></button></div>
+		<nav aria-label={t('nav.main')}>{#each groups as group (group.label)}<div class="nav-group"><p>{t(group.label)}</p>{#each group.items as item (item.id)}{@const Icon = item.icon}<button class="nav-link" class:active={screen === item.id} aria-current={screen === item.id ? 'page' : undefined} onclick={() => navigate(item.id)}><Icon size={17}/><span>{t(item.label)}</span>{#if item.id === 'accounts' && accounts.length}<span class="nav-count">{accounts.length}</span>{/if}</button>{/each}</div>{/each}</nav>
+		<div class="sidebar-bottom"><button class="sidebar-help" onclick={() => navigate('quickstart')}>{t('nav.setupTool')}<ChevronRight size={19}/></button></div>
 	</aside>
 	<div class="workspace">
 		<main id="main-content">
-			{#if failure}<div class="notice error" role="alert"><span>{failure}</span><button class="button small" onclick={() => load()} disabled={loading}>Réessayer</button></div>{/if}
-			{#if notice}<div class="notice success" role="status">{notice}<button class="icon-button" onclick={() => notice = ''} aria-label="Fermer la notification"><X size={14}/></button></div>{/if}
-			{#if loading && !summary}<div class="loading-state" role="status"><RefreshCw size={18} class="spinning"/><span>Chargement de vos abonnements...</span></div>{/if}
-			{#if screen === 'quotas'}<QuotasView {accounts} {quotas} {busy} {refresh} {rename} {settings} {setQuotaDisplay} {setQuotaWindows} resetUpdated={() => load(true)} connect={() => connectOpen = true}/>
-			{:else if screen === 'accounts'}<AccountsView {accounts} {quotas} {busy} {rename} {setReserve} {updateEndpoint} connect={() => connectOpen = true} {importFiles} toggle={(account) => mutate('account',() => management.setAccountEnabled(account.id,!account.enabled),account.enabled ? 'Compte désactivé.' : 'Compte activé.')} remove={(account) => mutate('account',() => management.deleteAccount(account.id),'Compte supprimé.')}/>
-			{:else if screen === 'settings'}{#if settings}{#key JSON.stringify(settings)}<SettingsView {settings} {providers} {busy} save={(next) => mutate('settings',() => management.settingsSave(next),'Réglages enregistrés.')}/>{/key}{:else}<div class="page-heading"><div><h1>Réglages</h1><p class="page-description">Les réglages seront disponibles lorsque le serveur répondra.</p></div></div>{/if}
-			{:else}{#key screen}<DataViews {screen} {summary} {calls} {models} {accounts} {busy} {navigate} toggleModel={(model) => mutate('model',() => management.setModelEnabled(model.id,model.enabled === false),'Modèle mis à jour.')}/>{/key}{/if}
+			{#if failure}<div class="notice error" role="alert"><span>{failure}</span><button class="button small" onclick={() => load()} disabled={loading}>{t('common.retry')}</button></div>{/if}
+			{#if notice}<div class="notice success" role="status">{notice}<button class="icon-button" onclick={() => notice = ''} aria-label={t('page.dismissNotice')}><X size={14}/></button></div>{/if}
+			{#if loading && !summary}<div class="loading-state" role="status"><RefreshCw size={18} class="spinning"/><span>{t('page.loading')}</span></div>{/if}
+			{#if screen === 'quotas'}<QuotasView {accounts} {quotas} {providers} {busy} {refresh} {rename} {settings} {setQuotaDisplay} {setQuotaWindows} resetUpdated={() => load(true)} connect={() => connectOpen = true}/>
+			{:else if screen === 'accounts'}<AccountsView {accounts} {quotas} {busy} {rename} {setReserve} {updateEndpoint} connect={() => connectOpen = true} {importFiles} toggle={(account) => mutate('account',() => management.setAccountEnabled(account.id,!account.enabled),t(account.enabled ? 'notice.accountDisabled' : 'notice.accountEnabled'))} remove={(account) => mutate('account',() => management.deleteAccount(account.id),t('notice.accountDeleted'))}/>
+			{:else if screen === 'settings'}{#if settings}{#key JSON.stringify(settings)}<SettingsView {settings} {providers} {busy} save={(next) => mutate('settings',() => management.settingsSave(next),t('notice.settingsSaved'))}/>{/key}{:else}<div class="page-heading"><div><h1>{t('nav.settings')}</h1><p class="page-description">{t('page.settingsUnavailable')}</p></div></div><LanguageSetting/>{/if}
+			{:else}{#key screen}<DataViews {screen} {summary} {calls} {models} {accounts} {busy} {navigate} toggleModel={(model) => mutate('model',() => management.setModelEnabled(model.id,model.enabled === false),t('notice.modelUpdated'))}/>{/key}{/if}
 		</main>
 	</div>
 </div>
-<nav class="mobile-nav" aria-label="Navigation mobile">{#each mobileItems as item (item.id)}{@const Icon = item.icon}<button class:active={screen === item.id} aria-current={screen === item.id ? 'page' : undefined} onclick={() => navigate(item.id)}><Icon size={19}/><span>{item.label}</span></button>{/each}<button onclick={() => mobileOpen = true} aria-label="Ouvrir le menu" aria-expanded={mobileOpen} aria-controls="main-navigation"><Menu size={19}/><span>Menu</span></button></nav>
-{#if connectOpen}<ConnectDialog {providers} close={() => connectOpen = false} completed={() => { notice = 'Compte connecté.'; void load(true); }} {importFiles}/>{/if}
+<nav class="mobile-nav" aria-label={t('nav.mobile')}>{#each mobileItems as item (item.id)}{@const Icon = item.icon}<button class:active={screen === item.id} aria-current={screen === item.id ? 'page' : undefined} onclick={() => navigate(item.id)}><Icon size={19}/><span>{t(item.label)}</span></button>{/each}<button onclick={() => mobileOpen = true} aria-label={t('nav.openMenu')} aria-expanded={mobileOpen} aria-controls="main-navigation"><Menu size={19}/><span>{t('nav.menu')}</span></button></nav>
+{#if connectOpen}<ConnectDialog {providers} close={() => connectOpen = false} completed={() => { notice = t('notice.accountConnected'); void load(true); }} {importFiles}/>{/if}

@@ -8,7 +8,8 @@
 	import ChevronRight from '@lucide/svelte/icons/chevron-right';
 	import ProviderMark from './provider-mark.svelte';
 	import { copyText } from '$lib/clipboard';
-	import { management, importErrors, providerName, dialects, type Dialect, type Provider, type OAuthSession, type OAuthStatus } from '$lib/management';
+	import { t } from '$lib/i18n.svelte';
+	import { management, importErrors, providerName, dialects, dialectLabel, type Dialect, type Provider, type OAuthSession, type OAuthStatus } from '$lib/management';
 	let { providers, close, completed, importFiles }: { providers: Provider[]; close: () => void; completed: () => void; importFiles: (files: FileList) => void } = $props();
 	let dialog: HTMLDialogElement;
 	let fileInput = $state<HTMLInputElement>();
@@ -27,13 +28,12 @@
 	let dialect = $state<Dialect | ''>('chat');
 	const custom = $derived(manual === 'openai_compatible');
 	let codeCopied = $state(false);
-	const copyFailureMessage = 'Copie refusée par le navigateur. Sélectionnez le code pour le copier.';
 	let mounted = false;
 	const endpoints: Record<string,string> = { opencode_go:'https://opencode.ai/zen/go',xai:'https://cli-chat-proxy.grok.com/v1',openai_compatible:'',kimi:'https://api.kimi.com/coding/v1',qwen:'https://portal.qwen.ai/v1' };
 	onMount(() => { mounted = true; dialog.showModal(); return () => { mounted = false; dialog.close(); credential = ''; callback = ''; }; });
 	async function start(provider: string) {
 		pending = true; failure = ''; callback = ''; status = ''; terminal = false; codeCopied = false;
-		try { const attempt = await management.startOAuth(provider); if (mounted) { session = attempt; status = attempt.user_code ? "En attente d'autorisation. La connexion est vérifiée automatiquement." : ''; } }
+		try { const attempt = await management.startOAuth(provider); if (mounted) { session = attempt; status = attempt.user_code ? t('connect.waiting') : ''; } }
 		catch (error) { if (mounted) failure = (error as Error).message; }
 		finally { pending = false; }
 	}
@@ -53,9 +53,9 @@
 			if (!mounted || session?.id !== attempt.id) return 5;
 			if (requiredAction(attempt, result)) return 5;
 			if ((result.account_id || result.account?.id) && ['complete','completed','connected','success'].includes(result.status)) connected();
-			else if (result.status === 'expired') { terminal = true; failure = 'Cette connexion a expiré. Choisissez le fournisseur pour recommencer.'; }
-			else if (result.error || result.status === 'error') { terminal = true; failure = result.error || "Le fournisseur a refusé la connexion. Recommencez pour réessayer."; }
-			else status = result.status === 'exchanging' ? 'Autorisation reçue, connexion du compte en cours.' : attempt.user_code ? "En attente d'autorisation. La connexion est vérifiée automatiquement." : 'La connexion attend encore votre autorisation.';
+			else if (result.status === 'expired') { terminal = true; failure = t('connect.expired'); }
+			else if (result.error || result.status === 'error') { terminal = true; failure = result.error || t('connect.refused'); }
+			else status = t(result.status === 'exchanging' ? 'connect.exchanging' : attempt.user_code ? 'connect.waiting' : 'connect.stillWaiting');
 			return Math.min(60,Math.max(5,result.interval ?? attempt.interval ?? 5));
 		} catch (error) { if (mounted) failure = (error as Error).message; return attempt.interval ?? 5; }
 		finally { pending = false; }
@@ -71,7 +71,7 @@
 	async function finish(event: SubmitEvent) {
 		event.preventDefault(); const attempt = session; if (!attempt || pending) return;
 		pending = true; failure = '';
-		try { const result = await management.oauthCallback(attempt.id,callback.trim(),attempt.state); if (!result.account?.id) throw new Error("Le serveur n'a pas confirmé l'ajout du compte."); if (mounted) connected(); }
+		try { const result = await management.oauthCallback(attempt.id,callback.trim(),attempt.state); if (!result.account?.id) throw new Error(t('connect.unconfirmed')); if (mounted) connected(); }
 		catch (error) {
 			if (mounted) failure = (error as Error).message;
 			try {
@@ -87,51 +87,51 @@
 	}
 	async function saveCredential(event: SubmitEvent) {
 		event.preventDefault(); pending = true; failure = '';
-		try { const result = await management.importCredential({ type:manual,name:accountName,access_token:credential,base_url:endpoint,...(custom ? { route:route.trim().toLowerCase(),...(dialect ? { dialect } : {}) } : {}) }); if (result.errors?.length || !result.imported) throw new Error(result.errors?.length ? importErrors(result.errors) : "Le compte n'a pas été ajouté."); if (mounted) connected(); }
+		try { const result = await management.importCredential({ type:manual,name:accountName,access_token:credential,base_url:endpoint,...(custom ? { route:route.trim().toLowerCase(),...(dialect ? { dialect } : {}) } : {}) }); if (result.errors?.length || !result.imported) throw new Error(result.errors?.length ? importErrors(result.errors) : t('connect.notAdded')); if (mounted) connected(); }
 		catch (error) { if (mounted) failure = (error as Error).message; }
 		finally { pending = false; }
 	}
 	function reset() { session = null; manual = ''; credential = ''; callback = ''; failure = ''; status = ''; terminal = false; route = ''; dialect = 'chat'; }
-	async function copyCode() { if (!session?.user_code) return; try { await copyText(session.user_code); codeCopied = true; if (failure === copyFailureMessage) failure = ''; } catch { codeCopied = false; failure = copyFailureMessage; } }
+	async function copyCode() { if (!session?.user_code) return; try { await copyText(session.user_code); codeCopied = true; if (failure === t('connect.copyRefused')) failure = ''; } catch { codeCopied = false; failure = t('connect.copyRefused'); } }
 </script>
 
 <dialog bind:this={dialog} oncancel={close} class="connect-dialog">
-	<div class="dialog-heading"><div><h2>Connecter un compte</h2><p>Ajoutez un abonnement à douane.</p></div><button class="icon-button" onclick={close} aria-label="Fermer"><X size={18}/></button></div>
+	<div class="dialog-heading"><div><h2>{t('common.connectAccount')}</h2><p>{t('connect.subtitle')}</p></div><button class="icon-button" onclick={close} aria-label={t('common.close')}><X size={18}/></button></div>
 	{#if success}
-		<div class="connection-success"><span><Check size={24}/></span><h3>Compte connecté</h3><p>Votre abonnement est maintenant disponible dans douane.</p><button class="button primary" onclick={close}>Voir mes comptes</button></div>
+		<div class="connection-success"><span><Check size={24}/></span><h3>{t('connect.success')}</h3><p>{t('connect.successText')}</p><button class="button primary" onclick={close}>{t('connect.viewAccounts')}</button></div>
 	{:else if session}
 		{#if session.verification_required}
 			<div class="oauth-flow">
-				<p>Google demande de vérifier ce compte avant la connexion.</p>
-				{#if session.verification_available}<a class="button primary" href={`/admin/api/oauth/${encodeURIComponent(session.id)}/verification`} target="_blank" rel="noopener noreferrer" data-sveltekit-reload>Vérifier le compte Google<ExternalLink size={16}/></a>{:else}<p>Ouvrez Antigravity avec ce compte pour terminer la vérification.</p>{/if}
-				<p>Une fois la vérification terminée, recommencez la connexion.</p>
-				<div class="flow-controls"><button class="button" disabled={pending} onclick={() => session && start(session.provider)}>Recommencer la connexion</button><button class="button subtle" disabled={pending} onclick={reset}>Choisir un autre fournisseur</button></div>
+				<p>{t('connect.googleVerify')}</p>
+				{#if session.verification_available}<a class="button primary" href={`/admin/api/oauth/${encodeURIComponent(session.id)}/verification`} target="_blank" rel="noopener noreferrer" data-sveltekit-reload>{t('common.verifyGoogle')}<ExternalLink size={16}/></a>{:else}<p>{t('common.openAntigravity')}</p>{/if}
+				<p>{t('connect.afterVerify')}</p>
+				<div class="flow-controls"><button class="button" disabled={pending} onclick={() => session && start(session.provider)}>{t('connect.restart')}</button><button class="button subtle" disabled={pending} onclick={reset}>{t('common.chooseOtherProvider')}</button></div>
 			</div>
 		{:else if session.provider === 'antigravity' && session.error_code === 'google_project_unavailable'}
 			<div class="oauth-flow" role="status">
-				<h3>Activation Antigravity incomplète</h3>
-				<p>La connexion Google a réussi, mais Google n'a pas fourni le projet nécessaire à ce compte.</p>
-				<p>Pour une première utilisation, ouvrez l'application Antigravity avec ce compte et terminez l'accueil. Si Antigravity refuse aussi la connexion, suivez le message affiché par Google.</p>
-				<a class="button" href="https://antigravity.google/docs/getting-started" target="_blank" rel="noopener noreferrer external">Ouvrir le guide Antigravity<ExternalLink size={16}/></a>
-				<div class="flow-controls"><button class="button primary" disabled={pending} onclick={() => session && start(session.provider)}>Recommencer la connexion</button><button class="button subtle" disabled={pending} onclick={reset}>Choisir un autre fournisseur</button></div>
+				<h3>{t('connect.antigravityTitle')}</h3>
+				<p>{t('connect.antigravityProject')}</p>
+				<p>{t('connect.antigravityFirstUse')}</p>
+				<a class="button" href="https://antigravity.google/docs/getting-started" target="_blank" rel="noopener noreferrer external">{t('connect.antigravityGuide')}<ExternalLink size={16}/></a>
+				<div class="flow-controls"><button class="button primary" disabled={pending} onclick={() => session && start(session.provider)}>{t('connect.restart')}</button><button class="button subtle" disabled={pending} onclick={reset}>{t('common.chooseOtherProvider')}</button></div>
 			</div>
 		{:else}
 		<div class="oauth-flow">
-			{#if session.user_code}<p>Ouvrez la page {providerName(session.provider)} et saisissez ce code pour autoriser la connexion.</p><div class="device-code"><span>{session.user_code}</span><button class="icon-button" onclick={copyCode} aria-label="Copier le code">{#if codeCopied}<Check size={16}/>{:else}<Copy size={16}/>{/if}</button></div>{:else}<p>Ouvrez la page du fournisseur et autorisez la connexion.</p>{/if}
-			<a class="button primary" href={session.url} target="_blank" rel="noopener noreferrer external" data-sveltekit-reload>Ouvrir la connexion<ExternalLink size={14}/></a>
-			{#if !session.user_code}<p class="flow-hint">Si le retour vers localhost ne charge pas, copiez son URL complète. Claude peut aussi afficher un code à coller ici.</p><form onsubmit={finish}><label for="callback">URL de retour ou code de connexion</label><input id="callback" type="text" placeholder="URL de retour ou code#state" bind:value={callback} required maxlength="8192" autocomplete="off" spellcheck="false"/><button class="button primary" disabled={pending || terminal || !callback.trim()}>Terminer la connexion</button></form>{/if}
-			<div class="flow-controls"><button class="button" disabled={pending || terminal} onclick={() => check()}>Vérifier la connexion</button><button class="button subtle" disabled={pending} onclick={reset}>Choisir un autre fournisseur</button></div>{#if status}<p class="muted small" role="status">{status}</p>{/if}
+			{#if session.user_code}<p>{t('connect.enterCode', { provider: providerName(session.provider) })}</p><div class="device-code"><span>{session.user_code}</span><button class="icon-button" onclick={copyCode} aria-label={t('connect.copyCode')}>{#if codeCopied}<Check size={16}/>{:else}<Copy size={16}/>{/if}</button></div>{:else}<p>{t('connect.authorize')}</p>{/if}
+			<a class="button primary" href={session.url} target="_blank" rel="noopener noreferrer external" data-sveltekit-reload>{t('connect.open')}<ExternalLink size={14}/></a>
+			{#if !session.user_code}<p class="flow-hint">{t('connect.callbackHint')}</p><form onsubmit={finish}><label for="callback">{t('connect.callbackLabel')}</label><input id="callback" type="text" placeholder={t('connect.callbackPlaceholder')} bind:value={callback} required maxlength="8192" autocomplete="off" spellcheck="false"/><button class="button primary" disabled={pending || terminal || !callback.trim()}>{t('connect.finish')}</button></form>{/if}
+			<div class="flow-controls"><button class="button" disabled={pending || terminal} onclick={() => check()}>{t('connect.check')}</button><button class="button subtle" disabled={pending} onclick={reset}>{t('common.chooseOtherProvider')}</button></div>{#if status}<p class="muted small" role="status">{status}</p>{/if}
 		</div>
 		{/if}
 	{:else if manual && custom}
-		<div class="oauth-flow"><p>Une clé d'API devient un préfixe de modèles : avec <code>deepseek</code>, ses modèles s'appellent <code>deepseek/nom-du-modèle</code>. Plusieurs clés sous le même préfixe tournent entre elles. La clé disparaît de ce formulaire après l'enregistrement.</p><form onsubmit={saveCredential}><label for="account-name">Nom</label><input id="account-name" bind:value={accountName} placeholder="DeepSeek" required/><label for="route">Préfixe des modèles</label><input id="route" bind:value={route} required pattern="[a-z0-9][a-z0-9_\-]{'{0,31}'}" placeholder="deepseek" autocomplete="off" spellcheck="false"/><label for="endpoint">Adresse de l'API</label><input id="endpoint" type="url" bind:value={endpoint} required placeholder="https://api.deepseek.com/v1"/><label for="dialect">Format de l'API</label><select id="dialect" bind:value={dialect}>{#each dialects as option (option.id)}<option value={option.id}>{option.label}</option>{/each}</select><label for="credential">Clé d'API</label><input id="credential" type="password" bind:value={credential} required autocomplete="off" spellcheck="false"/><button class="button primary" disabled={pending || !credential.trim() || !route.trim()}>Ajouter l'endpoint</button></form><button class="button subtle" style="margin-top:15px" disabled={pending} onclick={reset}>Choisir un autre fournisseur</button></div>
+		<div class="oauth-flow"><p>{t('connect.customIntro1')}<code>deepseek</code>{t('connect.customIntro2')}<code>{t('connect.customModel')}</code>{t('connect.customIntro3')}</p><form onsubmit={saveCredential}><label for="account-name">{t('connect.name')}</label><input id="account-name" bind:value={accountName} placeholder="DeepSeek" required/><label for="route">{t('endpoint.route')}</label><input id="route" bind:value={route} required pattern="[a-z0-9][a-z0-9_\-]{'{0,31}'}" placeholder="deepseek" autocomplete="off" spellcheck="false"/><label for="endpoint">{t('endpoint.url')}</label><input id="endpoint" type="url" bind:value={endpoint} required placeholder="https://api.deepseek.com/v1"/><label for="dialect">{t('endpoint.format')}</label><select id="dialect" bind:value={dialect}>{#each dialects as option (option)}<option value={option}>{dialectLabel(option)}</option>{/each}</select><label for="credential">{t('endpoint.key')}</label><input id="credential" type="password" bind:value={credential} required autocomplete="off" spellcheck="false"/><button class="button primary" disabled={pending || !credential.trim() || !route.trim()}>{t('connect.addEndpoint')}</button></form><button class="button subtle" style="margin-top:15px" disabled={pending} onclick={reset}>{t('common.chooseOtherProvider')}</button></div>
 	{:else if manual}
-		<div class="oauth-flow"><p>Ajoutez le jeton de connexion de votre abonnement. Il disparaît de ce formulaire après l'enregistrement.</p><form onsubmit={saveCredential}><label for="account-name">Nom du compte</label><input id="account-name" bind:value={accountName} placeholder="Mon abonnement" required/><label for="credential">Jeton de connexion</label><input id="credential" type="password" bind:value={credential} required autocomplete="off" spellcheck="false"/><label for="endpoint">Adresse du fournisseur</label><input id="endpoint" type="url" bind:value={endpoint} required placeholder="https://votre-fournisseur/v1"/><button class="button primary" disabled={pending || !credential.trim()}>Ajouter le compte</button></form><button class="button subtle" style="margin-top:15px" disabled={pending} onclick={reset}>Choisir un autre fournisseur</button></div>
+		<div class="oauth-flow"><p>{t('connect.tokenIntro')}</p><form onsubmit={saveCredential}><label for="account-name">{t('connect.accountName')}</label><input id="account-name" bind:value={accountName} placeholder={t('connect.accountNamePlaceholder')} required/><label for="credential">{t('connect.token')}</label><input id="credential" type="password" bind:value={credential} required autocomplete="off" spellcheck="false"/><label for="endpoint">{t('connect.providerUrl')}</label><input id="endpoint" type="url" bind:value={endpoint} required placeholder={t('connect.providerUrlPlaceholder')}/><button class="button primary" disabled={pending || !credential.trim()}>{t('connect.addAccount')}</button></form><button class="button subtle" style="margin-top:15px" disabled={pending} onclick={reset}>{t('common.chooseOtherProvider')}</button></div>
 	{:else}
-		<div class="provider-options">{#each providers as provider (provider.id)}<button class="provider-option" disabled={pending} onclick={() => { if (provider.oauth) void start(provider.id); else { manual = provider.id; endpoint = provider.base_url ?? endpoints[provider.id] ?? ''; accountName = provider.id === 'openai_compatible' ? '' : provider.name; } }}><span class="provider-logo"><ProviderMark provider={provider.id} size={28}/></span><span>{provider.name}<small>{provider.oauth ? 'Connecter mon abonnement' : provider.id === 'openai_compatible' ? "Ajouter une clé d'API" : "Ajouter un jeton"}</small></span><ChevronRight size={15}/></button>{/each}{#if !providers.length}<p class="muted small">Aucun fournisseur disponible. Importez un fichier d'authentification pour ajouter un compte.</p>{/if}</div>
-		<div class="dialog-import"><div><h3>Vous avez déjà un fichier ?</h3><p>Importez un ou plusieurs fichiers d'authentification JSON.</p></div><button class="button" disabled={pending} onclick={() => fileInput?.click()}><Upload size={14}/>Importer</button><input hidden type="file" accept=".json,application/json" multiple bind:this={fileInput} onchange={(event) => { if (event.currentTarget.files?.length) { importFiles(event.currentTarget.files); close(); } }}/></div>
+		<div class="provider-options">{#each providers as provider (provider.id)}<button class="provider-option" disabled={pending} onclick={() => { if (provider.oauth) void start(provider.id); else { manual = provider.id; endpoint = provider.base_url ?? endpoints[provider.id] ?? ''; accountName = provider.id === 'openai_compatible' ? '' : providerName(provider.id, provider.name); } }}><span class="provider-logo"><ProviderMark provider={provider.id} size={28}/></span><span>{providerName(provider.id, provider.name)}<small>{t(provider.oauth ? 'connect.oauthOption' : provider.id === 'openai_compatible' ? 'connect.apiKeyOption' : 'connect.tokenOption')}</small></span><ChevronRight size={15}/></button>{/each}{#if !providers.length}<p class="muted small">{t('connect.noProvider')}</p>{/if}</div>
+		<div class="dialog-import"><div><h3>{t('connect.haveFile')}</h3><p>{t('connect.importFiles')}</p></div><button class="button" disabled={pending} onclick={() => fileInput?.click()}><Upload size={14}/>{t('common.import')}</button><input hidden type="file" accept=".json,application/json" multiple bind:this={fileInput} onchange={(event) => { if (event.currentTarget.files?.length) { importFiles(event.currentTarget.files); close(); } }}/></div>
 	{/if}
-	{#if pending}<p class="muted small" role="status">Connexion en cours...</p>{/if}
+	{#if pending}<p class="muted small" role="status">{t('connect.pending')}</p>{/if}
 	{#if failure}<div class="notice error" role="alert">{failure}</div>{/if}
 </dialog>
 
