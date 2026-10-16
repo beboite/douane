@@ -20,6 +20,7 @@ douane connects your Claude, ChatGPT (Codex), Antigravity, Grok, GitHub Copilot 
 - Per-account reserve: stop spending an account at 5 % (or any share) of its longest quota window, or of the windows you pick (5 hours, weekly, both), so you keep some for yourself.
 - Request history with latency, token and cache counters; never conversation bodies or credentials.
 - OAuth and device sign-in from the dashboard, JSON import of existing CLI credentials, and `douanectl` for scripting.
+- A dashboard in English and French that follows the browser's language; **Settings** keeps another choice.
 
 ## Providers
 
@@ -73,7 +74,7 @@ douane --config douane.toml --check   # validate, create nothing
 douane --config douane.toml
 ```
 
-Open `http://127.0.0.1:8787/admin`, choose **Connecter un compte** (connect an account) and sign in to a provider. When douane runs on another machine, paste the callback URL or code shown by the provider back into the dialog: the provider's localhost redirect does not need to reach the server.
+Open `http://127.0.0.1:8787/admin`, choose **Connect an account** and sign in to a provider. When douane runs on another machine, paste the callback URL or code shown by the provider back into the dialog: the provider's localhost redirect does not need to reach the server.
 
 Then point a client at it:
 
@@ -92,7 +93,7 @@ Model ids carry their provider prefix, for example `claude/...` or `codex/...`. 
 
 ## Clients
 
-The dashboard's **Configurer un outil** page writes these settings for you, with your own address.
+The dashboard's **Set up a tool** page writes these settings for you, with your own address.
 
 | Client | Settings |
 | --- | --- |
@@ -169,7 +170,9 @@ Any OpenAI-, Anthropic- or Responses-compatible API becomes a route: its keys se
 | `dialect` | What the API speaks: `chat`, `responses` or `messages`; douane translates the client's format to it. Absent forwards the client's format unchanged |
 | `models` | Model ids to serve; empty serves every model the API lists at `/v1/models` |
 
-The dashboard's **Connecter un compte** page adds one, and each endpoint's pencil edits it in place. From a shell or an agent, the key comes from a file or stdin, never from the command line:
+![Connect dialog adding a DeepSeek key as the deepseek route](docs/images/endpoint.png)
+
+The dashboard's **Connect an account** dialog adds one, and each endpoint's pencil edits it in place. From a shell or an agent, the key comes from a file or stdin, never from the command line:
 
 ```sh
 douanectl endpoint add deepseek https://api.deepseek.com/v1 --key-file deepseek.key --dialect chat
@@ -184,7 +187,7 @@ The same fields go through `POST /admin/api/accounts/import` with `{"type":"open
 
 ## Routing and quotas
 
-Pick a strategy in **Réglages** (settings), globally or per provider. It applies to new conversations:
+Pick a strategy in **Settings**, globally or per provider. It applies to new conversations:
 
 | Strategy | Behaviour |
 | --- | --- |
@@ -245,7 +248,7 @@ pnpm check
 pnpm build
 ```
 
-Commit `dash/build` with the source change, then rebuild Rust to embed it. `pnpm dev` runs the dashboard alone and expects the management API at the same origin or behind a proxy for `/admin/api`.
+Commit `dash/build` with the source change, then rebuild Rust to embed it. `pnpm dev` runs the dashboard alone and expects the management API at the same origin or behind a proxy for `/admin/api`. `pnpm mock` serves the built dashboard with sample data on `http://127.0.0.1:5199/admin/`, without douane or any account; the README images come from it.
 
 CI tests Rust on the minimum supported version, checks and builds the dashboard, and builds the Docker image on amd64 and arm64, then runs [`docker/smoke.sh`](docker/smoke.sh) against it; a pull request runs only the jobs its files touch. Tests run against local fake upstreams; they do not prove that a real provider accepts a given account or model.
 
