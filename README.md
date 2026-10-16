@@ -53,7 +53,7 @@ On Windows, unzip the archive and run `douane.exe --config douane.toml` from tha
 
 ### Douane in Boite
 
-[Boite](https://github.com/beboite/boite) installs Douane from **Settings > Plugins**: it downloads the executable for its platform from the release named in [`boite-plugin.json`](boite-plugin.json), checks its SHA-256 and runs it on `127.0.0.1`. Douane's accounts, database and configuration live outside the plugin folder, so uninstalling or updating the plugin keeps the accounts. Each release opens a pull request that moves `boite-plugin.json` to the new executables; Boite offers that version once it is merged.
+[Boite](https://github.com/beboite/boite) installs Douane from **Settings > Plugins**: it downloads the executable for its platform from the release named in `boite-plugin.json` at the repository root (written by the first release), checks its SHA-256 and runs it on `127.0.0.1`. Douane's accounts, database and configuration live outside the plugin folder, so uninstalling or updating the plugin keeps the accounts. Each release opens a pull request that moves `boite-plugin.json` to the new executables; Boite offers that version once it is merged.
 
 ### Docker
 
