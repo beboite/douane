@@ -457,11 +457,10 @@ impl AccountStore {
         let mut accounts = self.accounts.write().await;
         // Reimporting the same identity rotates its tokens without duplicating it
         // or silently re-enabling a credential the user disabled.
-        if let Some(previous) = accounts.values().find(|existing| {
-            existing.provider == account.provider
-                && ((account.account_id.is_some() && existing.account_id == account.account_id)
-                    || (account.email.is_some() && existing.email == account.email))
-        }) {
+        if let Some(previous) = accounts
+            .values()
+            .find(|existing| same_identity(existing, &account))
+        {
             account.id = previous.id.clone();
             account.created_at = previous.created_at.clone();
             account.enabled = previous.enabled;
@@ -478,6 +477,48 @@ impl AccountStore {
                 .organization_id
                 .or_else(|| previous.organization_id.clone());
         }
+        self.persist(&account)?;
+        let summary = account.summary();
+        accounts.insert(account.id.clone(), account);
+        Ok(summary)
+    }
+
+    /// Every stored record, tokens included, for a configuration export.
+    /// This is the one deliberate exit of credentials from the broker: the
+    /// export route sends them to the operator who asked for a backup.
+    pub async fn export(&self) -> Vec<AccountCredential> {
+        self.accounts.read().await.values().cloned().collect()
+    }
+
+    /// Restores one record of an export. A record naming a stored account by
+    /// id, or by identity as `import` matches it, replaces that account in
+    /// place under its local id; any other record is added. Cooldowns and
+    /// errors belong to the instance that recorded them and are cleared.
+    pub async fn restore(&self, record: Value) -> Result<AccountSummary, SubscriptionError> {
+        let mut account: AccountCredential = serde_json::from_value(record)
+            .map_err(|_| SubscriptionError::InvalidImport("invalid account record"))?;
+        check_record(&account)?;
+        account.cooldown_until = None;
+        account.last_error = None;
+        let mut accounts = self.accounts.write().await;
+        let previous = accounts
+            .get(&account.id)
+            .filter(|existing| existing.provider == account.provider)
+            .or_else(|| {
+                accounts
+                    .values()
+                    .find(|existing| same_identity(existing, &account))
+            });
+        if let Some(previous) = previous {
+            account.id = previous.id.clone();
+            account.created_at = previous.created_at.clone();
+        } else if !valid_id(&account.id) || accounts.contains_key(&account.id) {
+            account.id = random_id();
+        }
+        if parse_timestamp(&account.created_at).is_none() {
+            account.created_at = now();
+        }
+        account.updated_at = now();
         self.persist(&account)?;
         let summary = account.summary();
         accounts.insert(account.id.clone(), account);
@@ -785,6 +826,68 @@ impl AccountStore {
         }
         result
     }
+}
+
+/// Two records name the same sign-in: same provider and same account id or
+/// email. Custom endpoints carry neither and never match this way.
+fn same_identity(existing: &AccountCredential, account: &AccountCredential) -> bool {
+    existing.provider == account.provider
+        && ((account.account_id.is_some() && existing.account_id == account.account_id)
+            || (account.email.is_some() && existing.email == account.email))
+}
+
+/// The checks `parse_import` applies, for a stored record coming back from
+/// an export.
+fn check_record(account: &AccountCredential) -> Result<(), SubscriptionError> {
+    let token = account.access_token.trim();
+    if token.is_empty() || token.len() > 65_536 || token.chars().any(char::is_control) {
+        return Err(SubscriptionError::InvalidImport("missing access token"));
+    }
+    if account.name.trim().is_empty()
+        || account.name.len() > 200
+        || account.email.as_ref().is_some_and(|v| v.len() > 320)
+    {
+        return Err(SubscriptionError::InvalidImport(
+            "account label is missing or too long",
+        ));
+    }
+    if account
+        .expires_at
+        .as_deref()
+        .is_some_and(|t| parse_timestamp(t).is_none())
+    {
+        return Err(SubscriptionError::InvalidImport("invalid expiry timestamp"));
+    }
+    if account
+        .base_url
+        .as_deref()
+        .is_some_and(|url| !valid_base_url(url))
+    {
+        return Err(SubscriptionError::InvalidImport("invalid base URL"));
+    }
+    if account.route.is_some() || account.dialect.is_some() {
+        if account.provider != SubscriptionProvider::OpenaiCompatible {
+            return Err(SubscriptionError::InvalidEndpoint(
+                "route and dialect apply only to openai_compatible endpoints",
+            ));
+        }
+        if account.route.as_deref().is_some_and(|r| !valid_route(r)) {
+            return Err(SubscriptionError::InvalidEndpoint(ROUTE_RULE));
+        }
+        if account
+            .dialect
+            .as_deref()
+            .is_some_and(|d| !valid_dialect(d))
+        {
+            return Err(SubscriptionError::InvalidEndpoint(DIALECT_RULE));
+        }
+        if account.route.is_some() && account.base_url.is_none() {
+            return Err(SubscriptionError::InvalidEndpoint(
+                "an endpoint with a route needs its base_url",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn valid_id(id: &str) -> bool {

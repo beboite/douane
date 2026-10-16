@@ -505,7 +505,7 @@ impl QuotaService {
                     self.client
                         .get("https://opencode.ai/zen/go/v1/usage")
                         .bearer_auth(&account.access_token)
-                        .header("User-Agent", "douane/0.2.0"),
+                        .header("User-Agent", concat!("douane/", env!("CARGO_PKG_VERSION"))),
                 )
                 .await?;
                 let windows = parse_opencode_go(&value, observed);

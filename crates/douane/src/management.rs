@@ -236,6 +236,161 @@ pub async fn import(State(state): State<Arc<AppState>>, Json(body): Json<Value>)
     )
         .into_response()
 }
+/// Bundle format written by `export` and read by `restore`.
+const EXPORT_FORMAT: &str = "douane-export";
+const EXPORT_VERSION: u64 = 1;
+/// Most accounts one restore accepts.
+const MAX_RESTORE_ACCOUNTS: usize = 1000;
+
+/// The whole configuration as one JSON file: settings, disabled models and
+/// every stored account with its tokens. Refresh tokens rotate, so an
+/// account restored elsewhere must leave this instance.
+pub async fn export(State(state): State<Arc<AppState>>) -> Response {
+    let (settings, disabled_models) = {
+        let config = state.config.read().await;
+        (config.settings.clone(), config.disabled_models.clone())
+    };
+    let exported_at = crate::subscriptions::now();
+    let date = exported_at.get(..10).unwrap_or("export").to_owned();
+    let body = json!({
+        "format": EXPORT_FORMAT,
+        "version": EXPORT_VERSION,
+        "exported_at": exported_at,
+        "settings": settings,
+        "disabled_models": disabled_models,
+        "accounts": state.accounts.export().await,
+    });
+    let mut response = Json(body).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    if let Ok(value) = header::HeaderValue::from_str(&format!(
+        "attachment; filename=\"douane-export-{date}.json\""
+    )) {
+        headers.insert(header::CONTENT_DISPOSITION, value);
+    }
+    response
+}
+
+/// Restores an export. The body is the bundle itself, which restores its
+/// accounts only, or `{"bundle": <bundle>, "settings": true}`, which also
+/// applies its settings and disabled models. Settings are checked before any
+/// account changes, so a refused bundle changes nothing.
+pub async fn restore(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
+    let (bundle, apply_settings) = match body.get("bundle") {
+        Some(bundle) => match body.get("settings") {
+            None => (bundle, false),
+            Some(Value::Bool(apply)) => (bundle, *apply),
+            Some(_) => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "settings beside bundle must be true or false",
+                );
+            }
+        },
+        None => (&body, false),
+    };
+    if bundle.get("format").and_then(Value::as_str) != Some(EXPORT_FORMAT) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "not a douane export: format must be \"douane-export\"",
+        );
+    }
+    if bundle.get("version").and_then(Value::as_u64) != Some(EXPORT_VERSION) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "unsupported export version {}; this douane reads version {EXPORT_VERSION}",
+                bundle.get("version").unwrap_or(&Value::Null)
+            ),
+        );
+    }
+    let Some(records) = bundle.get("accounts").and_then(Value::as_array) else {
+        return error(StatusCode::BAD_REQUEST, "accounts must be a list");
+    };
+    if records.len() > MAX_RESTORE_ACCOUNTS {
+        return error(
+            StatusCode::BAD_REQUEST,
+            &format!("restore at most {MAX_RESTORE_ACCOUNTS} accounts at once"),
+        );
+    }
+    let configuration = if apply_settings {
+        let settings: crate::settings::Settings =
+            match serde_json::from_value(bundle.get("settings").cloned().unwrap_or(json!({}))) {
+                Ok(settings) => settings,
+                Err(_) => return error(StatusCode::BAD_REQUEST, "invalid settings in the export"),
+            };
+        if let Err(e) = settings.validate() {
+            return error(StatusCode::BAD_REQUEST, &e.to_string());
+        }
+        let disabled: BTreeSet<String> = match serde_json::from_value(
+            bundle.get("disabled_models").cloned().unwrap_or(json!([])),
+        ) {
+            Ok(disabled) => disabled,
+            Err(_) => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "disabled_models must be a list of model ids",
+                );
+            }
+        };
+        Some((settings, disabled))
+    } else {
+        None
+    };
+    if let Some((settings, disabled)) = configuration {
+        let _write = state.config_write.lock().await;
+        let mut config = state.config.read().await.clone();
+        config.settings = settings;
+        config.disabled_models = disabled;
+        if let Some(path) = &state.config_path {
+            if config.save(path).await.is_err() {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "cannot save configuration",
+                );
+            }
+        }
+        *state.config.write().await = config;
+    }
+    let mut accounts = vec![];
+    let mut errors = vec![];
+    for (index, record) in records.iter().enumerate() {
+        match state.accounts.restore(record.clone()).await {
+            Ok(account) => accounts.push(account),
+            Err(e) => errors.push(json!({
+                "index": index,
+                "name": record.get("name").and_then(Value::as_str),
+                "error": e.to_string(),
+            })),
+        }
+    }
+    state.refresh_models().await;
+    let ids: Vec<String> = accounts.iter().map(|a| a.id.clone()).collect();
+    let worker = state.clone();
+    tokio::spawn(async move {
+        for id in ids {
+            let _ = worker.quotas.refresh(&id).await;
+        }
+    });
+    (
+        if accounts.is_empty() && !errors.is_empty() {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::OK
+        },
+        Json(json!({
+            "restored": accounts.len(),
+            "accounts": accounts,
+            "errors": errors,
+            "settings": apply_settings,
+        })),
+    )
+        .into_response()
+}
+
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct AccountPatch {

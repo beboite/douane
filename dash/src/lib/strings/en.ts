@@ -57,6 +57,9 @@ export const en = {
 	'notice.settingsSaved': 'Settings saved.',
 	'notice.modelUpdated': 'Model updated.',
 	'notice.accountConnected': 'Account connected.',
+	'notice.partialRestore': '{count} account(s) restored. {errors}',
+	'notice.restored.one': '{count} account restored.',
+	'notice.restored.other': '{count} accounts restored.',
 
 	'api.serverStatus': 'The server returned {status}.',
 	'api.errorPrefix': '{name}: {error}',
@@ -332,7 +335,20 @@ export const en = {
 	'settings.languageDescription': 'Language of this dashboard, saved in this browser.',
 	'settings.languageAuto': 'Automatic',
 	'settings.languageEnglish': 'English',
-	'settings.languageFrench': 'Français'
+	'settings.languageFrench': 'Français',
+	'backup.title': 'Backup',
+	'backup.description': 'Move this configuration to another douane: settings, disabled models and every account.',
+	'backup.warning': 'The file holds live sign-ins and keys. Refresh tokens rotate, so an account works in one douane at a time: after a restore, remove it here. Keep the file private.',
+	'backup.export': 'Export',
+	'backup.exporting': 'Exporting...',
+	'backup.restore': 'Restore',
+	'backup.restoring': 'Restoring...',
+	'backup.confirm.one': '{name} holds {count} account. Accounts already here are updated, the others are added.',
+	'backup.confirm.other': '{name} holds {count} accounts. Accounts already here are updated, the others are added.',
+	'backup.withSettings': 'Also apply its settings and disabled models',
+	'backup.confirmButton': 'Restore accounts',
+	'backup.notExport': '{name} is not a douane export.',
+	'backup.tooLarge': '{name} is over the 32 MB limit.'
 };
 
 export type StringKey = keyof typeof en;

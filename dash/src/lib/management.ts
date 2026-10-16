@@ -33,6 +33,9 @@ export type OAuthSession = { id: string; provider: string; url: string; state: s
 export type OAuthStatus = Partial<OAuthSession> & { status: string; account?: Account };
 export type ImportError = string | { name?: string | null; error: string };
 export type ImportResult = { accounts?: Account[]; imported: number; errors: ImportError[] };
+export type RestoreResult = { accounts?: Account[]; restored: number; errors: ImportError[]; settings: boolean };
+/** A configuration export: settings, disabled models and every account with its tokens. */
+export type ExportBundle = { format: 'douane-export'; version: number; exported_at: string; settings: Settings; disabled_models: string[]; accounts: unknown[] };
 
 export class ApiError extends Error {
 	constructor(readonly status: number, message: string) { super(message); }
@@ -76,7 +79,9 @@ export const management = {
 	oauth: (id: string) => request<OAuthStatus>(`/oauth/${encodeURIComponent(id)}`),
 	oauthCallback: (id: string, code: string, state: string) => request<{ account: Account }>('/oauth/callback', { method: 'POST', body: JSON.stringify({ id, code, state }) }),
 	setModelEnabled: (id: string, enabled: boolean) => request(`/models/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ enabled }) }),
-	settingsSave: (settings: Partial<Settings>) => request<Settings>('/settings', { method: 'PATCH', body: JSON.stringify(settings) })
+	settingsSave: (settings: Partial<Settings>) => request<Settings>('/settings', { method: 'PATCH', body: JSON.stringify(settings) }),
+	exportConfig: () => request<ExportBundle>('/export'),
+	restore: (bundle: unknown, settings: boolean) => request<RestoreResult>('/restore', { method: 'POST', body: JSON.stringify({ bundle, settings }) })
 };
 
 export const providerNames: Record<string, string> = {

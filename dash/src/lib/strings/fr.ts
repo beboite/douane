@@ -59,6 +59,9 @@ export const fr: Record<StringKey, string> = {
 	'notice.settingsSaved': 'Réglages enregistrés.',
 	'notice.modelUpdated': 'Modèle mis à jour.',
 	'notice.accountConnected': 'Compte connecté.',
+	'notice.partialRestore': '{count} compte(s) restauré(s). {errors}',
+	'notice.restored.one': '{count} compte restauré.',
+	'notice.restored.other': '{count} comptes restaurés.',
 
 	'api.serverStatus': 'Le serveur a répondu {status}.',
 	'api.errorPrefix': '{name} : {error}',
@@ -334,5 +337,18 @@ export const fr: Record<StringKey, string> = {
 	'settings.languageDescription': 'Langue de ce tableau de bord, enregistrée dans ce navigateur.',
 	'settings.languageAuto': 'Automatique',
 	'settings.languageEnglish': 'English',
-	'settings.languageFrench': 'Français'
+	'settings.languageFrench': 'Français',
+	'backup.title': 'Sauvegarde',
+	'backup.description': 'Déplacez cette configuration vers une autre douane : réglages, modèles désactivés et tous les comptes.',
+	'backup.warning': 'Le fichier contient des connexions et des clés actives. Les jetons de renouvellement changent à chaque usage : un compte ne fonctionne que dans une douane à la fois. Après une restauration, retirez-le ici. Gardez le fichier privé.',
+	'backup.export': 'Exporter',
+	'backup.exporting': 'Export...',
+	'backup.restore': 'Restaurer',
+	'backup.restoring': 'Restauration...',
+	'backup.confirm.one': '{name} contient {count} compte. Les comptes déjà présents sont mis à jour, les autres sont ajoutés.',
+	'backup.confirm.other': '{name} contient {count} comptes. Les comptes déjà présents sont mis à jour, les autres sont ajoutés.',
+	'backup.withSettings': 'Appliquer aussi ses réglages et modèles désactivés',
+	'backup.confirmButton': 'Restaurer les comptes',
+	'backup.notExport': "{name} n'est pas un export douane.",
+	'backup.tooLarge': '{name} dépasse la limite de 32 Mo.'
 };

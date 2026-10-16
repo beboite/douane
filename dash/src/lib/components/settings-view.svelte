@@ -4,9 +4,10 @@
 	import GitBranch from '@lucide/svelte/icons/git-branch';
 	import ProviderMark from './provider-mark.svelte';
 	import LanguageSetting from './language-setting.svelte';
+	import BackupSetting from './backup-setting.svelte';
 	import { providerName, type Settings, type Provider, type Strategy } from '$lib/management';
 	import { t } from '$lib/i18n.svelte';
-	let { settings, providers, busy, save }: { settings: Settings; providers: Provider[]; busy: string; save: (settings: Settings) => Promise<boolean> } = $props();
+	let { settings, providers, busy, save, restore }: { settings: Settings; providers: Provider[]; busy: string; save: (settings: Settings) => Promise<boolean>; restore: (bundle: unknown, settings: boolean) => Promise<boolean> } = $props();
 	let draft = $state<Settings>(untrack(() => ({ ...settings, provider_strategies: { ...settings.provider_strategies } })));
 	const strategies: Strategy[] = ['round-robin', 'fill-first', 'reset-first', 'smart'];
 	// A routing choice saves on click with every visible edit; a refused save
@@ -27,6 +28,7 @@
 	<section class="settings-section"><div><h2>{t('settings.refresh')}</h2><p>{t('settings.refreshDescription')}</p></div><div class="settings-fields"><label>{t('settings.refreshEvery')}<span class="unit-field"><input type="number" min="30" max="86400" step="1" bind:value={draft.quota_refresh_seconds} required/><span>{t('settings.seconds')}</span></span></label><label>{t('settings.timeout')}<span class="unit-field"><input type="number" min="10" max="1800" step="1" bind:value={draft.request_timeout_seconds} required/><span>{t('settings.seconds')}</span></span></label><label>{t('settings.defaultProvider')}<select bind:value={draft.default_provider}><option value={null}>{t('settings.autoProvider')}</option>{#each providers as provider (provider.id)}<option value={provider.id}>{providerName(provider.id, provider.name)}</option>{/each}</select></label></div></section>
 	<div class="settings-footer"><button class="button primary" type="submit" disabled={!!busy}><Save size={14}/>{busy === 'settings' ? t('settings.saving') : t('settings.save')}</button></div>
 </form>
+<BackupSetting {busy} {restore}/>
 <LanguageSetting/>
 
 <style>

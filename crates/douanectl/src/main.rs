@@ -47,6 +47,20 @@ enum Command {
         #[arg(long)]
         callback_file: PathBuf,
     },
+    /// Save settings, disabled models and every account, tokens included, to
+    /// a file only its owner can read. Refresh tokens rotate: restore it in
+    /// one douane and remove the accounts from this one.
+    Export {
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Restore an export: accounts are added, or updated when already known.
+    Restore {
+        path: PathBuf,
+        /// Also apply the export's settings and disabled models.
+        #[arg(long)]
+        settings: bool,
+    },
     /// Custom API endpoints: one route (model prefix) per upstream, its keys
     /// rotating. Keys come from a file or stdin, never from arguments.
     #[command(subcommand)]
@@ -263,6 +277,40 @@ async fn endpoint(client: &reqwest::Client, root: &str, command: Endpoint) -> Re
         }
     }
 }
+/// Writes an export readable by its owner only where the OS has such modes;
+/// on Windows the file inherits the folder's access list.
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        options.mode(0o600);
+        // An existing file keeps its mode through open; tighten it first.
+        if path.exists() {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("restricting {}", path.display()))?;
+        }
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("writing {}", path.display()))?;
+    file.sync_all()?;
+    Ok(())
+}
+
+async fn export(client: &reqwest::Client, root: &str, output: &std::path::Path) -> Result<Value> {
+    let bundle = send(client.get(format!("{root}/admin/api/export"))).await?;
+    write_private(output, &serde_json::to_vec_pretty(&bundle)?)?;
+    Ok(json!({
+        "exported": bundle["accounts"].as_array().map_or(0, Vec::len),
+        "output": output.display().to_string(),
+    }))
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -273,6 +321,11 @@ async fn main() -> Result<()> {
     let command = match cli.command {
         Command::Endpoint(command) => {
             let value = endpoint(&client, root, command).await?;
+            println!("{}", serde_json::to_string_pretty(&value)?);
+            return Ok(());
+        }
+        Command::Export { output } => {
+            let value = export(&client, root, &output).await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             return Ok(());
         }
@@ -311,9 +364,39 @@ async fn main() -> Result<()> {
                 .post(format!("{root}/admin/api/oauth/callback"))
                 .json(&json!({"id":id,"code":callback.trim(),"state":""}))
         }
-        Command::Endpoint(_) => unreachable!("handled above"),
+        Command::Restore { path, settings } => {
+            let bundle: Value = serde_json::from_slice(
+                &tokio::fs::read(&path).await.context("reading the export")?,
+            )
+            .context("the export is not JSON")?;
+            client
+                .post(format!("{root}/admin/api/restore"))
+                .json(&json!({"bundle":bundle,"settings":settings}))
+        }
+        Command::Endpoint(_) | Command::Export { .. } => unreachable!("handled above"),
     };
     let value = send(request).await?;
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn an_export_file_is_readable_by_its_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory =
+            std::env::temp_dir().join(format!("douanectl-export-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("export.json");
+        // An existing readable file is tightened before it receives tokens.
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        super::write_private(&path, b"{}").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read(&path).unwrap(), b"{}");
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
 }

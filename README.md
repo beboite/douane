@@ -40,6 +40,21 @@ What a provider exposes depends on the account and plan. A quota douane cannot r
 
 ## Quick start
 
+### Executables
+
+Each [release](https://github.com/beboite/douane/releases/latest) attaches an archive per platform holding `douane`, `douanectl`, the license and this file: `douane-<version>-windows-x64.zip`, `-macos-arm64.tar.gz`, `-macos-x64.tar.gz`, `-linux-x64.tar.gz` and `-linux-arm64.tar.gz`. They need no runtime: Linux builds are static, the Windows build carries its C runtime. `SHA256SUMS` lists every file's checksum and `manifest.json` describes the raw executables for installers.
+
+```sh
+tar -xzf douane-<version>-linux-x64.tar.gz
+cd douane-<version>-linux-x64 && ./douane --config douane.toml
+```
+
+On Windows, unzip the archive and run `douane.exe --config douane.toml` from that folder. The executables are not signed: Windows SmartScreen asks for confirmation on first launch, and macOS needs `xattr -d com.apple.quarantine douane douanectl` after a browser download.
+
+### Douane in Boite
+
+[Boite](https://github.com/beboite/boite) installs Douane from **Settings > Plugins**: it downloads the executable for its platform from the release named in `boite-plugin.json` at the repository root (written by the first release), checks its SHA-256 and runs it on `127.0.0.1`. Douane's accounts, database and configuration live outside the plugin folder, so uninstalling or updating the plugin keeps the accounts. Each release opens a pull request that moves `boite-plugin.json` to the new executables; Boite offers that version once it is merged.
+
 ### Docker
 
 Images for `linux/amd64` and `linux/arm64` are on GitHub Container Registry: `latest` is the last release, `edge` follows `main`.
@@ -208,10 +223,22 @@ Banked resets for Claude and Codex appear on each account card. Using one asks f
 
 ## Security and data
 
-- Credentials stay in `auth_dir` as local files. They never appear in the dashboard, the management API, logs or errors, and refresh-token rotation is serialised and written to disk.
+- Credentials stay in `auth_dir` as local files. They never appear in the dashboard, logs or errors, and refresh-token rotation is serialised and written to disk. The management API returns them in one place only, a [configuration export](#export-and-restore).
+- On Linux and macOS, `auth_dir` is mode 0700 and each credential file 0600. On Windows, douane removes inherited permissions from `auth_dir` and grants full control to the current user alone; keep the configuration under that user's own profile, for example `%LOCALAPPDATA%\douane`.
 - SQLite stores request metadata only: time, model, account, status, latency and token or cache counts.
 - The default listener is loopback. To expose douane, put it behind a reverse proxy that authenticates the dashboard, and set `server.management_token_env` to require a bearer token on `/admin/api`. That token is separate from client access.
 - Google OAuth clients for Gemini and Antigravity are read from `oauth-clients.json` beside `auth_dir`, or from `DOUANE_GEMINI_*` and `DOUANE_ANTIGRAVITY_*` environment variables; douane ships none.
+
+## Export and restore
+
+**Settings > Backup** in the dashboard, or `GET /admin/api/export`, downloads `douane-export-<date>.json`: settings, disabled models and every account with its tokens and keys. **Restore** reads that file into another douane. An account whose identity is already there is updated in place, the others are added; settings and disabled models are applied only when asked (`{"bundle": <file>, "settings": true}` on `POST /admin/api/restore`).
+
+The file holds live sign-ins. Refresh tokens rotate on use, so an account must live in one douane at a time: after restoring it elsewhere, remove it from the first one. Keep the file private and delete it once restored.
+
+```sh
+douanectl export --output douane-export.json             # owner-only file on Linux and macOS
+douanectl --url http://127.0.0.1:8787 restore douane-export.json --settings
+```
 
 ## Command line
 
@@ -229,6 +256,8 @@ douanectl enable <account-id>
 douanectl remove <account-id>
 douanectl endpoint add <route> <base-url> --key-file <file|->
 douanectl endpoint set <route|account-id> [--base-url ...] [--dialect ...] [--models ...] [--key-file ...]
+douanectl export --output <file>
+douanectl restore <file> [--settings]
 ```
 
 `--url` targets another instance and `DOUANE_MANAGEMENT_TOKEN` supplies the management token. Secrets are read from files, never from arguments.

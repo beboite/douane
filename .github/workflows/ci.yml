@@ -29,6 +29,7 @@ jobs:
       rust: ${{ steps.filter.outputs.rust }}
       dashboard: ${{ steps.filter.outputs.dashboard }}
       image: ${{ steps.filter.outputs.image }}
+      binaries: ${{ steps.filter.outputs.binaries }}
       workflows: ${{ steps.filter.outputs.workflows }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -40,7 +41,7 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           if [[ "$GITHUB_EVENT_NAME" != pull_request ]]; then
-            printf '%s=true\n' rust dashboard image workflows >> "$GITHUB_OUTPUT"
+            printf '%s=true\n' rust dashboard image binaries workflows >> "$GITHUB_OUTPUT"
             exit 0
           fi
           files=$(git diff --name-only "$BASE_SHA...HEAD")
@@ -53,6 +54,8 @@ jobs:
             echo "rust=$(any '^(Cargo\.(toml|lock)|crates/|dash/build/)')"
             echo "dashboard=$(any '^dash/')"
             echo "image=$(any '^(Cargo\.(toml|lock)|crates/|dash/build/|Dockerfile|\.dockerignore|docker/|LICENSE)')"
+            # Release executables build for workflow and dependency changes.
+            echo "binaries=$(any '^Cargo\.(toml|lock)$|^crates/[^/]+/Cargo\.toml$')"
             echo "workflows=$workflows"
           } >> "$GITHUB_OUTPUT"
 
@@ -72,6 +75,37 @@ jobs:
         run: rustup toolchain install 1.90.0 --profile minimal && rustup default 1.90.0
       # Saved from main only: a pull request's cache is visible to that pull
       # request alone and would evict the one every pull request restores.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Test workspace
+        run: cargo test --workspace --all-targets --locked
+
+  # The same tests on the platforms the release executables run on.
+  rust-platforms:
+    name: Rust 1.90 (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      # The embedded dashboard must be byte-identical on every platform.
+      - name: Keep line endings
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.90
+        run: rustup toolchain install 1.90.0 --profile minimal && rustup default 1.90.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -116,6 +150,12 @@ jobs:
       # main publishes edge; a release passes its version tags.
       tags: ${{ inputs.image-tags || (github.event_name == 'push' && format('edge sha-{0}', github.sha) || '') }}
 
+  binaries:
+    name: Executables
+    needs: changes
+    if: needs.changes.outputs.binaries == 'true'
+    uses: ./.github/workflows/binaries.yml
+
   actionlint:
     needs: changes
     if: needs.changes.outputs.workflows == 'true'
@@ -137,7 +177,7 @@ jobs:
   required:
     name: CI required
     if: always()
-    needs: [changes, rust, dashboard, image, actionlint]
+    needs: [changes, rust, rust-platforms, dashboard, image, binaries, actionlint]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -149,7 +189,7 @@ jobs:
           jobs = json.loads(os.environ['RESULTS'])
           assert jobs['changes']['result'] == 'success', jobs
           wanted = jobs['changes']['outputs']
-          for name, key in (('rust', 'rust'), ('dashboard', 'dashboard'), ('image', 'image'), ('actionlint', 'workflows')):
+          for name, key in (('rust', 'rust'), ('rust-platforms', 'rust'), ('dashboard', 'dashboard'), ('image', 'image'), ('binaries', 'binaries'), ('actionlint', 'workflows')):
               expected = 'success' if wanted[key] == 'true' else 'skipped'
               assert jobs[name]['result'] == expected, (name, jobs[name]['result'])
           print('All applicable checks passed')

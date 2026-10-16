@@ -30,6 +30,8 @@ pub fn router(state: Arc<AppState>) -> Router {
     let management = Router::new()
         .route("/accounts", get(management::accounts))
         .route("/accounts/import", post(management::import))
+        .route("/export", get(management::export))
+        .route("/restore", post(management::restore))
         .route(
             "/accounts/{id}/verification",
             get(management::account_verification),
