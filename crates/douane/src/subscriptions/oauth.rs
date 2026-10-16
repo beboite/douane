@@ -18,6 +18,8 @@ const CLAUDE_SCOPE: &str =
 const XAI_CLIENT: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 const XAI_SCOPE: &str = "openid profile email offline_access grok-cli:access api:access";
 const XAI_DISCOVERY: &str = "https://auth.x.ai/.well-known/openid-configuration";
+/// The OpenCode GitHub app, which GitHub admits to the Copilot API.
+const COPILOT_CLIENT: &str = "Ov23li8tweQw6odWQebz";
 
 #[derive(Clone, Debug, Serialize)]
 pub struct OAuthAttempt {
@@ -46,6 +48,7 @@ struct Pending {
 
 #[derive(Clone)]
 struct DeviceFlow {
+    provider: SubscriptionProvider,
     code: String,
     token_endpoint: String,
     next_poll: time::OffsetDateTime,
@@ -63,6 +66,10 @@ pub struct OAuthManager {
     /// same answer and only looks like abuse on the account; a reconnect
     /// stores a new token, which is asked normally.
     revoked: std::sync::Mutex<BTreeMap<String, String>>,
+    /// GitHub's device flow and identity endpoints; tests use a loopback.
+    pub(crate) copilot_device_url: String,
+    pub(crate) copilot_token_url: String,
+    pub(crate) github_user_url: String,
 }
 
 impl OAuthManager {
@@ -76,6 +83,9 @@ impl OAuthManager {
             claude_token_url: "https://platform.claude.com/v1/oauth/token".into(),
             google,
             revoked: std::sync::Mutex::new(BTreeMap::new()),
+            copilot_device_url: "https://github.com/login/device/code".into(),
+            copilot_token_url: "https://github.com/login/oauth/access_token".into(),
+            github_user_url: "https://api.github.com/user".into(),
         }
     }
 
@@ -83,7 +93,8 @@ impl OAuthManager {
         match provider {
             SubscriptionProvider::Codex
             | SubscriptionProvider::Claude
-            | SubscriptionProvider::Xai => true,
+            | SubscriptionProvider::Xai
+            | SubscriptionProvider::Copilot => true,
             SubscriptionProvider::Gemini | SubscriptionProvider::Antigravity => {
                 self.google.supports(provider)
             }
@@ -98,6 +109,9 @@ impl OAuthManager {
     ) -> Result<OAuthAttempt, SubscriptionError> {
         if provider == SubscriptionProvider::Xai {
             return self.start_xai().await;
+        }
+        if provider == SubscriptionProvider::Copilot {
+            return self.start_copilot().await;
         }
         if matches!(
             provider,
@@ -559,6 +573,7 @@ impl OAuthManager {
             public: attempt.clone(),
             verifier: String::new(),
             device: Some(DeviceFlow {
+                provider: SubscriptionProvider::Xai,
                 code: device_code,
                 token_endpoint,
                 next_poll: time::OffsetDateTime::now_utc(),
@@ -568,6 +583,96 @@ impl OAuthManager {
         })
         .await;
         Ok(attempt)
+    }
+
+    /// GitHub's device flow: the user enters a code on github.com and the
+    /// resulting OAuth token serves the Copilot API until it is revoked.
+    async fn start_copilot(&self) -> Result<OAuthAttempt, SubscriptionError> {
+        let response = send_json(
+            self.client
+                .post(&self.copilot_device_url)
+                .header("User-Agent", crate::relay::COPILOT_USER_AGENT)
+                .form(&[("client_id", COPILOT_CLIENT), ("scope", "read:user")]),
+        )
+        .await?;
+        let device_code =
+            text(&response, &["device_code"]).ok_or(SubscriptionError::InvalidResponse)?;
+        let user_code =
+            text(&response, &["user_code"]).ok_or(SubscriptionError::InvalidResponse)?;
+        let url = text(&response, &["verification_uri"])
+            .filter(|url| {
+                reqwest::Url::parse(url)
+                    .is_ok_and(|u| u.scheme() == "https" && u.host_str() == Some("github.com"))
+            })
+            .ok_or(SubscriptionError::InvalidResponse)?;
+        let interval = response
+            .get("interval")
+            .and_then(Value::as_u64)
+            .unwrap_or(5)
+            .clamp(1, 60);
+        let expires = response
+            .get("expires_in")
+            .and_then(Value::as_i64)
+            .unwrap_or(900)
+            .clamp(1, 1800);
+        let attempt = OAuthAttempt {
+            id: random_id(),
+            provider: SubscriptionProvider::Copilot,
+            url,
+            state: random_id(),
+            redirect_uri: String::new(),
+            expires_at: timestamp(
+                time::OffsetDateTime::now_utc() + time::Duration::seconds(expires),
+            ),
+            status: "pending".into(),
+            account_id: None,
+            error: None,
+            error_code: None,
+            user_code: Some(user_code),
+            interval: Some(interval),
+            verification_required: false,
+            verification_available: false,
+        };
+        self.save_attempt(Pending {
+            public: attempt.clone(),
+            verifier: String::new(),
+            device: Some(DeviceFlow {
+                provider: SubscriptionProvider::Copilot,
+                code: device_code,
+                token_endpoint: self.copilot_token_url.clone(),
+                next_poll: time::OffsetDateTime::now_utc(),
+                interval,
+            }),
+            verification_url: None,
+        })
+        .await;
+        Ok(attempt)
+    }
+
+    /// The GitHub login behind a Copilot token, so a reconnect replaces the
+    /// account instead of adding a second one. Missing identity is no error.
+    async fn copilot_account(&self, token: &str) -> Value {
+        let mut account = json!({"type":"copilot","access_token":token});
+        if let Ok(user) = send_json(
+            self.client
+                .get(&self.github_user_url)
+                .header("Authorization", format!("token {token}"))
+                .header("User-Agent", crate::relay::COPILOT_USER_AGENT)
+                .timeout(Duration::from_secs(10)),
+        )
+        .await
+        {
+            if let Some(id) = user.get("id").and_then(Value::as_u64) {
+                account["account_id"] = json!(id.to_string());
+            }
+            if let Some(login) = text(&user, &["login"]) {
+                account["name"] = json!(login);
+            }
+            if let Some(email) = text(&user, &["email"]) {
+                account["email"] = json!(email);
+            }
+        }
+        account
     }
 
     async fn poll_device(&self, id: &str) {
@@ -593,38 +698,28 @@ impl OAuthManager {
             flow.next_poll = time::OffsetDateTime::now_utc() + time::Duration::seconds(31);
             flow.clone()
         };
+        let client_id = match flow.provider {
+            SubscriptionProvider::Copilot => COPILOT_CLIENT,
+            _ => XAI_CLIENT,
+        };
         let response = self
             .client
             .post(&flow.token_endpoint)
             .timeout(Duration::from_secs(30))
+            .header("Accept", "application/json")
             .form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-                ("client_id", XAI_CLIENT),
+                ("client_id", client_id),
                 ("device_code", flow.code.as_str()),
             ])
             .send()
             .await;
         let result = match response {
-            Ok(response) if response.status().is_success() => {
-                match response.json::<Value>().await {
-                    Ok(value) => match normalized_tokens(
-                        SubscriptionProvider::Xai,
-                        value,
-                        Some(&flow.token_endpoint),
-                    ) {
-                        Ok(value) => self.store.import(value, None).await,
-                        Err(error) => Err(error),
-                    },
-                    Err(_) => Err(SubscriptionError::InvalidResponse),
-                }
-            }
             Ok(response) => {
-                let status = response.status().as_u16();
-                let error = response
-                    .json::<Value>()
-                    .await
-                    .ok()
-                    .and_then(|v| text(&v, &["error"]));
+                let status = response.status();
+                let value = response.json::<Value>().await.ok();
+                // GitHub answers a pending authorization with 200 and an error.
+                let error = value.as_ref().and_then(|v| text(v, &["error"]));
                 if matches!(
                     error.as_deref(),
                     Some("authorization_pending" | "slow_down")
@@ -632,14 +727,43 @@ impl OAuthManager {
                     let mut attempts = self.pending.lock().await;
                     if let Some(device) = attempts.get_mut(id).and_then(|p| p.device.as_mut()) {
                         if error.as_deref() == Some("slow_down") {
-                            device.interval = (device.interval + 5).min(60);
+                            device.interval = value
+                                .as_ref()
+                                .and_then(|v| v.get("interval"))
+                                .and_then(Value::as_u64)
+                                .unwrap_or(device.interval + 5)
+                                .clamp(1, 60);
                         }
                         device.next_poll = time::OffsetDateTime::now_utc()
                             + time::Duration::seconds(device.interval as i64);
                     }
                     return;
                 }
-                Err(SubscriptionError::Upstream(status))
+                match value {
+                    _ if error.as_deref() == Some("expired_token") => {
+                        Err(SubscriptionError::Expired)
+                    }
+                    _ if error.as_deref() == Some("access_denied") => {
+                        Err(SubscriptionError::Upstream(403))
+                    }
+                    Some(value) if status.is_success() && error.is_none() => match flow.provider {
+                        SubscriptionProvider::Copilot => match text(&value, &["access_token"]) {
+                            Some(token) => {
+                                let account = self.copilot_account(&token).await;
+                                self.store.import(account, None).await
+                            }
+                            None => Err(SubscriptionError::InvalidResponse),
+                        },
+                        provider => {
+                            match normalized_tokens(provider, value, Some(&flow.token_endpoint)) {
+                                Ok(value) => self.store.import(value, None).await,
+                                Err(error) => Err(error),
+                            }
+                        }
+                    },
+                    _ if status.is_success() => Err(SubscriptionError::InvalidResponse),
+                    _ => Err(SubscriptionError::Upstream(status.as_u16())),
+                }
             }
             Err(_) => Err(SubscriptionError::Transport),
         };
@@ -932,6 +1056,70 @@ fn validate_xai_endpoint(endpoint: &str) -> Result<String, SubscriptionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GitHub keeps answering 200 while the user has not entered the code,
+    /// then hands over a token; the login names the account.
+    #[tokio::test]
+    async fn copilot_device_flow_waits_through_pending_answers_then_connects() {
+        use axum::{
+            Json, Router,
+            routing::{get, post},
+        };
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = polls.clone();
+        let router = Router::new()
+            .route(
+                "/device",
+                post(|| async {
+                    Json(json!({"device_code":"device-fixture","user_code":"ABCD-1234",
+                        "verification_uri":"https://github.com/login/device","interval":1,"expires_in":900}))
+                }),
+            )
+            .route(
+                "/token",
+                post(move || {
+                    let counter = counter.clone();
+                    async move {
+                        if counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                            Json(json!({"error":"authorization_pending"}))
+                        } else {
+                            Json(json!({"access_token":"gho_fixture","token_type":"bearer","scope":"read:user"}))
+                        }
+                    }
+                }),
+            )
+            .route("/user", get(|| async { Json(json!({"id":42,"login":"octocat"})) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(AccountStore::open(directory.path()).unwrap());
+        let mut manager = OAuthManager::new(reqwest::Client::new(), store.clone());
+        manager.copilot_device_url = format!("{base}/device");
+        manager.copilot_token_url = format!("{base}/token");
+        manager.github_user_url = format!("{base}/user");
+        let attempt = manager
+            .start(SubscriptionProvider::Copilot, None)
+            .await
+            .unwrap();
+        assert_eq!(attempt.user_code.as_deref(), Some("ABCD-1234"));
+        assert_eq!(attempt.url, "https://github.com/login/device");
+        let first = manager.status(&attempt.id).await.unwrap();
+        assert_eq!(first.status, "pending");
+        assert!(store.list().await.is_empty());
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let done = manager.status(&attempt.id).await.unwrap();
+        assert_eq!(done.status, "complete", "{:?}", done.error);
+        let accounts = store.list().await;
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].provider, SubscriptionProvider::Copilot);
+        assert_eq!(accounts[0].name, "octocat");
+        let credential = store.get(&accounts[0].id).await.unwrap();
+        assert_eq!(credential.access_token, "gho_fixture");
+        assert_eq!(credential.account_id.as_deref(), Some("42"));
+        assert!(credential.refresh_token.is_none() && credential.expires_at.is_none());
+        server.abort();
+    }
 
     #[test]
     fn revoked_refresh_tokens_are_terminal() {

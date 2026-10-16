@@ -32,9 +32,34 @@ pub struct Model {
     pub upstream_id: String,
     #[serde(default)]
     pub thinking: Option<Value>,
+    /// The custom endpoint route serving this model, absent for providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    /// Upstream paths the model accepts, when its provider says so
+    /// (`/v1/messages`, `/responses`, `/chat/completions`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoints: Vec<String>,
 }
 fn yes() -> bool {
     true
+}
+
+/// A blank enabled row; constructors name the fields they know.
+impl Default for Model {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            provider: SubscriptionProvider::OpenaiCompatible,
+            name: String::new(),
+            context_length: None,
+            max_output_tokens: None,
+            enabled: true,
+            upstream_id: String::new(),
+            thinking: None,
+            route: None,
+            endpoints: vec![],
+        }
+    }
 }
 
 /// The bundled catalog, each provider's models in that provider's own order.
@@ -72,7 +97,14 @@ pub struct AppState {
     pub config_write: tokio::sync::Mutex<()>,
     /// Last background quota refresh started for an account near its reserve.
     reserve_refresh: Mutex<BTreeMap<String, std::time::Instant>>,
+    /// Copilot models an account's plan refused although its catalog lists
+    /// them, by account and model, with the time of the refusal.
+    copilot_refused: Mutex<BTreeMap<(String, String), std::time::Instant>>,
 }
+
+/// How long a Copilot refusal hides a model: a plan change shows up the
+/// next day, or at once after a restart.
+const COPILOT_REFUSAL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
 impl AppState {
     pub fn new(mut config: Config, config_path: Option<PathBuf>) -> Result<Arc<Self>> {
@@ -116,7 +148,39 @@ impl AppState {
             management_token,
             config_write: tokio::sync::Mutex::new(()),
             reserve_refresh: Mutex::new(BTreeMap::new()),
+            copilot_refused: Mutex::new(BTreeMap::new()),
         }))
+    }
+
+    fn copilot_refuses(&self, account: &str, model: &str) -> bool {
+        self.copilot_refused
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(account.to_owned(), model.to_owned()))
+            .is_some_and(|at| at.elapsed() < COPILOT_REFUSAL)
+    }
+
+    /// Copilot's catalog lists models a plan cannot use; the first refusal
+    /// takes the model out of the list until no account refuses it.
+    pub(crate) async fn copilot_refused(&self, account: &str, model: &str) {
+        self.copilot_refused
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                (account.to_owned(), model.to_owned()),
+                std::time::Instant::now(),
+            );
+        let served = self
+            .accounts
+            .eligible_in(SubscriptionProvider::Copilot, None, Some(model))
+            .await
+            .iter()
+            .any(|other| !self.copilot_refuses(&other.id, model));
+        if !served {
+            self.models.write().await.retain(|m| {
+                !(m.provider == SubscriptionProvider::Copilot && m.upstream_id == model)
+            });
+        }
     }
 
     pub async fn refresh_models(&self) {
@@ -141,11 +205,9 @@ impl AppState {
                         id: id.clone(),
                         provider: account.provider,
                         name: id.clone(),
-                        context_length: None,
-                        max_output_tokens: None,
                         enabled: true,
                         upstream_id: id.clone(),
-                        thinking: None,
+                        ..Model::default()
                     })
                     .collect()
             };
@@ -198,6 +260,7 @@ impl AppState {
                                                 enabled: true,
                                                 upstream_id: String::new(),
                                                 thinking: m.get("thinking").cloned(),
+                                                ..Model::default()
                                             })
                                         })
                                         .filter(|m| {
@@ -216,15 +279,50 @@ impl AppState {
                     available = live;
                 }
             }
+            if account.provider == SubscriptionProvider::Copilot {
+                if let Some(live) = self.copilot_models(&account).await {
+                    available = live
+                        .into_iter()
+                        .filter(|m| account.models.is_empty() || account.models.contains(&m.id))
+                        .filter(|m| !self.copilot_refuses(&account.id, &m.id))
+                        .collect();
+                }
+            }
             for mut model in available {
                 model.upstream_id = model.id.clone();
-                model.id = format!("{}/{}", model.provider.as_str(), model.upstream_id);
+                model.route = account.route.clone();
+                model.id = format!("{}/{}", account.pool(), model.upstream_id);
                 model.enabled =
                     !disabled.contains(&model.id) && !disabled.contains(&model.upstream_id);
                 models.insert(model.id.clone(), model);
             }
         }
         *self.models.write().await = models.into_values().collect();
+    }
+
+    /// Copilot's own catalog: the models this account's plan enables, with
+    /// the upstream paths each one accepts.
+    async fn copilot_models(&self, account: &AccountCredential) -> Option<Vec<Model>> {
+        let base = account
+            .base_url
+            .as_deref()
+            .unwrap_or(crate::relay::COPILOT_API);
+        let response = self
+            .client
+            .get(crate::relay::endpoint(base, "/models"))
+            .bearer_auth(&account.access_token)
+            .header("User-Agent", crate::relay::COPILOT_USER_AGENT)
+            .header("X-GitHub-Api-Version", crate::relay::COPILOT_API_VERSION)
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let value = response.json::<Value>().await.ok()?;
+        let models = copilot_catalog(&value);
+        (!models.is_empty()).then_some(models)
     }
 
     /// Google renames Antigravity models without notice, so the bundled ids
@@ -260,49 +358,70 @@ impl AppState {
         if config.disabled_models.contains(requested) {
             return Err("model is disabled".into());
         }
+        // A prefix names a provider or a custom endpoint route; anything else
+        // is part of the model id (OpenRouter ids contain slashes).
+        let routes = self.accounts.routes().await;
+        let pool_of = |name: &str| -> Option<(SubscriptionProvider, Option<String>)> {
+            SubscriptionProvider::parse(name)
+                .map(|provider| (provider, None))
+                .or_else(|| {
+                    routes.contains(name).then(|| {
+                        (
+                            SubscriptionProvider::OpenaiCompatible,
+                            Some(name.to_owned()),
+                        )
+                    })
+                })
+        };
         let (prefix, model) = requested
             .split_once('/')
-            .filter(|(p, _)| SubscriptionProvider::parse(p).is_some())
-            .map(|(p, m)| (Some(p), m))
+            .and_then(|(p, m)| pool_of(p).map(|pool| (Some(pool), m)))
             .unwrap_or((None, requested));
-        let explicit = prefix
-            .or(provider_hint)
-            .or(config.settings.default_provider.as_deref());
+        let explicit = match prefix {
+            Some(pool) => Some(pool),
+            None => match provider_hint.or(config.settings.default_provider.as_deref()) {
+                Some(name) => Some(pool_of(name).ok_or("unknown provider")?),
+                None => None,
+            },
+        };
         let all_models = self.models.read().await;
-        let providers: Vec<SubscriptionProvider> = if let Some(p) = explicit {
-            vec![SubscriptionProvider::parse(p).ok_or("unknown provider")?]
+        let pools: Vec<(SubscriptionProvider, Option<String>)> = if let Some(pool) = explicit {
+            vec![pool]
         } else {
-            let mut providers = vec![];
+            let mut pools = vec![];
             for m in all_models
                 .iter()
                 .filter(|m| m.upstream_id == model && m.enabled)
             {
-                if !providers.contains(&m.provider) {
-                    providers.push(m.provider);
+                let pool = (m.provider, m.route.clone());
+                if !pools.contains(&pool) {
+                    pools.push(pool);
                 }
             }
             // Native names select the matching native provider ahead of aggregators.
-            providers.sort_by_key(|p| match (model, *p) {
+            pools.sort_by_key(|(p, _)| match (model, *p) {
                 (m, SubscriptionProvider::Codex) if m.starts_with("gpt-") => 0,
                 (m, SubscriptionProvider::Claude) if m.starts_with("claude-") => 0,
                 (m, SubscriptionProvider::Xai) if m.starts_with("grok-") => 0,
                 _ => 1,
             });
-            providers
+            pools
         };
         drop(all_models);
         let mut ordered = vec![];
-        for provider in providers {
-            if config
-                .disabled_models
-                .contains(&format!("{}/{model}", provider.as_str()))
-            {
+        for (provider, route) in pools {
+            let pool = route.as_deref().unwrap_or(provider.as_str());
+            if config.disabled_models.contains(&format!("{pool}/{model}")) {
                 continue;
             }
             let now = time::OffsetDateTime::now_utc();
             let mut eligible = vec![];
             let mut candidates = vec![];
-            for a in self.accounts.eligible(provider, Some(model)).await {
+            for a in self
+                .accounts
+                .eligible_in(provider, route.as_deref(), Some(model))
+                .await
+            {
                 let quota = self.quotas.get(&a.id).await;
                 if self.reserve_excludes_with(&a, quota.as_ref(), now) {
                     continue;
@@ -325,7 +444,8 @@ impl AppState {
             let strategy = config
                 .settings
                 .provider_strategies
-                .get(provider.as_str())
+                .get(pool)
+                .or_else(|| config.settings.provider_strategies.get(provider.as_str()))
                 .copied()
                 .unwrap_or(config.settings.strategy);
             let now = now.unix_timestamp();
@@ -334,7 +454,7 @@ impl AppState {
                     .affinity
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .get(provider.as_str(), key);
+                    .get(pool, key);
                 // A pin holds unless it would spend usage credits while another
                 // account still has subscription quota, or reset-first has an
                 // eligible account with an earlier weekly reset.
@@ -355,7 +475,7 @@ impl AppState {
                 .scheduler
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .order(provider.as_str(), strategy, &candidates, now);
+                .order(pool, strategy, &candidates, now);
             for id in order {
                 if let Some(a) = eligible.iter().find(|a| a.id == id) {
                     ordered.push(a.clone());
@@ -385,7 +505,11 @@ impl AppState {
         {
             return false;
         }
-        for other in self.accounts.eligible(account.provider, Some(model)).await {
+        for other in self
+            .accounts
+            .eligible_in(account.provider, account.route.as_deref(), Some(model))
+            .await
+        {
             if other.id != account.id
                 && !self
                     .quotas
@@ -583,6 +707,65 @@ fn antigravity_catalog(value: &Value) -> Vec<Model> {
             enabled: true,
             upstream_id: String::new(),
             thinking,
+            ..Model::default()
+        });
+    }
+    models
+}
+
+/// Paths of Copilot's API that douane can forward to.
+const COPILOT_PATHS: [&str; 3] = ["/v1/messages", "/responses", "/chat/completions"];
+
+/// The chat models a Copilot account's plan enables, from its `/models`
+/// answer. A model whose policy is not `enabled` is refused upstream, and
+/// one without `supported_endpoints` speaks Chat Completions only.
+pub(crate) fn copilot_catalog(value: &Value) -> Vec<Model> {
+    let Some(rows) = value["data"].as_array() else {
+        return vec![];
+    };
+    let mut models: Vec<Model> = vec![];
+    for row in rows {
+        let Some(id) = row["id"].as_str().filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        if row.pointer("/policy/state").and_then(Value::as_str) != Some("enabled")
+            || row.pointer("/capabilities/type").and_then(Value::as_str) != Some("chat")
+            || models.iter().any(|m| m.id == id)
+        {
+            continue;
+        }
+        let endpoints: Vec<String> = match row["supported_endpoints"].as_array() {
+            Some(paths) => paths
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|path| COPILOT_PATHS.contains(path))
+                .map(str::to_owned)
+                .collect(),
+            None => vec!["/chat/completions".into()],
+        };
+        if endpoints.is_empty() {
+            continue;
+        }
+        let limits = row.pointer("/capabilities/limits");
+        let levels: Vec<Value> = row
+            .pointer("/capabilities/supports/reasoning_effort")
+            .and_then(Value::as_array)
+            .map(|levels| levels.iter().filter(|l| l.is_string()).cloned().collect())
+            .unwrap_or_default();
+        models.push(Model {
+            id: id.into(),
+            provider: SubscriptionProvider::Copilot,
+            name: row["name"].as_str().unwrap_or(id).into(),
+            context_length: limits.and_then(|l| {
+                l["max_context_window_tokens"]
+                    .as_u64()
+                    .or_else(|| l["max_prompt_tokens"].as_u64())
+            }),
+            max_output_tokens: limits.and_then(|l| l["max_output_tokens"].as_u64()),
+            enabled: true,
+            thinking: (!levels.is_empty()).then(|| json!({ "levels": levels })),
+            endpoints,
+            ..Model::default()
         });
     }
     models

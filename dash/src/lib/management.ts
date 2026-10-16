@@ -4,7 +4,11 @@ export type Account = {
 	subscription?: Subscription | null;
 	enabled: boolean; status: string; last_error?: string | null; updated_at?: string | null;
 	reserve_percent?: number | null; reserve_windows?: ReserveWindow[]; reserve_measured?: boolean | null; reserve_reached?: boolean;
+	route?: string | null; base_url?: string | null; dialect?: Dialect | null; models?: string[];
 };
+export type Dialect = 'chat' | 'responses' | 'messages';
+export const dialects: { id: Dialect | ''; label: string }[] = [{ id: 'chat', label: 'Chat Completions' }, { id: 'responses', label: 'Responses' }, { id: 'messages', label: 'Messages (Anthropic)' }, { id: '', label: 'Celui du client' }];
+export type EndpointPatch = { route?: string; base_url?: string; dialect?: Dialect | null; models?: string[]; api_key?: string };
 export type ReserveWindow = 'five-hour' | 'daily' | 'weekly' | 'monthly';
 export const reserveWindows: { id: ReserveWindow; label: string }[] = [{ id: 'five-hour', label: '5 h' }, { id: 'daily', label: 'Jour' }, { id: 'weekly', label: 'Semaine' }, { id: 'monthly', label: 'Mois' }];
 export function reserveWindow(id: string): ReserveWindow | null { return ({ 'five-hour': 'five-hour', daily: 'daily', weekly: 'weekly', 'seven-day': 'weekly', seven_day: 'weekly', monthly: 'monthly' } as Record<string, ReserveWindow>)[id] ?? null; }
@@ -56,7 +60,8 @@ export const management = {
 	settings: () => request<Settings>('/settings'),
 	refreshQuotas: (account_id?: string) => request('/quotas/refresh', { method: 'POST', body: JSON.stringify({ account_id }) }),
 	importAccounts: (files: { name: string; content: unknown }[]) => request<ImportResult>('/accounts/import', { method: 'POST', body: JSON.stringify({ files }) }),
-	importCredential: (credential: { type: string; name: string; access_token: string; base_url: string }) => request<ImportResult>('/accounts/import', { method: 'POST', body: JSON.stringify(credential) }),
+	importCredential: (credential: { type: string; name: string; access_token: string; base_url: string; route?: string; dialect?: Dialect }) => request<ImportResult>('/accounts/import', { method: 'POST', body: JSON.stringify(credential) }),
+	updateEndpoint: (id: string, patch: EndpointPatch) => request<{ account: Account }>(`/accounts/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(patch) }),
 	setAccountEnabled: (id: string, enabled: boolean) => request(`/accounts/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ enabled }) }),
 	renameAccount: (id: string, name: string) => request<{ account: Account }>(`/accounts/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ name }) }),
 	setAccountReserve: (id: string, reserve_percent: number | null, reserve_windows: ReserveWindow[]) => request<{ account: Account }>(`/accounts/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ reserve_percent, reserve_windows }) }),
@@ -94,7 +99,7 @@ export function creditValue(value: number | null | undefined, unit: string) {
 	return `${new Intl.NumberFormat('fr-FR', { maximumFractionDigits: 2 }).format(value)} ${unit === 'credits' ? 'crédits' : unit}`;
 }
 export function usageLabel(label: string) {
-	return ({ weekly: 'Semaine', 'codex weekly': 'Semaine', 'grok weekly': 'Semaine', monthly: 'Mois', '5 hours': '5 heures', 'five hour': '5 heures', 'extra usage': 'Usage supplémentaire', 'additional usage': 'Usage supplémentaire', 'codex credits': 'Crédits Codex', 'credit balance': 'Solde des crédits' } as Record<string, string>)[label.toLowerCase()] ?? label;
+	return ({ weekly: 'Semaine', 'codex weekly': 'Semaine', 'grok weekly': 'Semaine', monthly: 'Mois', '5 hours': '5 heures', 'five hour': '5 heures', 'extra usage': 'Usage supplémentaire', 'additional usage': 'Usage supplémentaire', 'codex credits': 'Crédits Codex', 'credit balance': 'Solde des crédits', 'premium requests': 'Requêtes premium', chat: 'Chat', completions: 'Complétions' } as Record<string, string>)[label.toLowerCase()] ?? label;
 }
 export function newResetRequestId() {
 	if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();

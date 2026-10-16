@@ -23,6 +23,7 @@ pub fn provider_name(provider: SubscriptionProvider) -> &'static str {
         SubscriptionProvider::Kimi => "Kimi",
         SubscriptionProvider::Xai => "Grok",
         SubscriptionProvider::OpencodeGo => "OpenCode Go",
+        SubscriptionProvider::Copilot => "GitHub Copilot",
         SubscriptionProvider::OpenaiCompatible => "Compatible OpenAI",
     }
 }
@@ -371,6 +372,10 @@ mod tests {
             last_error: (status == "error").then(|| "provider request failed".into()),
             reserve_percent: None,
             reserve_windows: vec![],
+            route: None,
+            base_url: None,
+            dialect: None,
+            models: vec![],
             created_at: "2026-10-01T00:00:00Z".into(),
             updated_at: "2026-10-01T00:00:00Z".into(),
         }

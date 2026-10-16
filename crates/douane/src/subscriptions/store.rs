@@ -21,6 +21,7 @@ pub enum SubscriptionProvider {
     Kimi,
     Xai,
     OpencodeGo,
+    Copilot,
     OpenaiCompatible,
 }
 
@@ -35,6 +36,7 @@ impl SubscriptionProvider {
             Self::Kimi => "kimi",
             Self::Xai => "xai",
             Self::OpencodeGo => "opencode_go",
+            Self::Copilot => "copilot",
             Self::OpenaiCompatible => "openai_compatible",
         }
     }
@@ -49,6 +51,7 @@ impl SubscriptionProvider {
             "kimi" | "kimi.ai" | "kimi-ai" => Some(Self::Kimi),
             "xai" | "grok" => Some(Self::Xai),
             "opencode_go" | "opencode-go" | "opencode" => Some(Self::OpencodeGo),
+            "copilot" | "github-copilot" | "github_copilot" => Some(Self::Copilot),
             "openai" | "openai_compatible" | "openai-compatible" => Some(Self::OpenaiCompatible),
             _ => None,
         }
@@ -112,6 +115,19 @@ impl SubscriptionTier {
             SubscriptionProvider::OpencodeGo if plan == "go" || plan == "opencode_go" => {
                 ("go", "OpenCode Go", None)
             }
+            // GitHub names the plan by its SKU; education plans carry their own.
+            SubscriptionProvider::Copilot => match plan.as_str() {
+                sku if sku.contains("educational") || sku == "student" => {
+                    ("student", "Copilot Student", None)
+                }
+                sku if sku.contains("plus") => ("pro_plus", "Copilot Pro+", None),
+                "free" | "free_limited_copilot" => ("free", "Copilot Free", None),
+                "pro" | "copilot_pro" | "individual" | "monthly_subscriber"
+                | "yearly_subscriber" => ("pro", "Copilot Pro", None),
+                "business" | "copilot_business" => ("business", "Copilot Business", None),
+                "enterprise" | "copilot_enterprise" => ("enterprise", "Copilot Enterprise", None),
+                _ => return None,
+            },
             _ => return None,
         };
         Some(Self {
@@ -138,6 +154,16 @@ pub struct AccountSummary {
     pub last_error: Option<String>,
     pub reserve_percent: Option<f64>,
     pub reserve_windows: Vec<String>,
+    /// A custom endpoint's model prefix, address, wire format and model
+    /// filter. Absent for subscriptions; never a credential.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dialect: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -189,12 +215,68 @@ pub struct AccountCredential {
     /// Window kinds the reserve watches; empty watches the longest window.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) reserve_windows: Vec<String>,
+    /// Model prefix of a custom endpoint (`deepseek` serves `deepseek/...`).
+    /// Keys sharing a route rotate; keys on different routes never mix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) route: Option<String>,
+    /// Wire format a custom endpoint speaks: `chat`, `responses` or
+    /// `messages`. Absent forwards the client's own format unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) dialect: Option<String>,
 }
 
 /// A reserve is a share strictly between 0 and 100.
 pub fn valid_reserve(percent: f64) -> bool {
     percent.is_finite() && percent > 0.0 && percent < 100.0
 }
+
+/// A route names a custom endpoint in model ids (`deepseek/deepseek-chat`):
+/// 1 to 32 lowercase letters, digits, `-` or `_`, never a provider's name,
+/// which would make `<route>/<model>` ambiguous.
+pub fn valid_route(route: &str) -> bool {
+    route.len() <= 32
+        && route
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && route
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+        && SubscriptionProvider::parse(route).is_none()
+}
+
+/// Wire formats a custom endpoint can speak.
+pub fn valid_dialect(dialect: &str) -> bool {
+    matches!(dialect, "chat" | "responses" | "messages")
+}
+
+/// An upstream address: http or https, without credentials or a query.
+pub fn valid_base_url(url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|parsed| {
+        matches!(parsed.scheme(), "http" | "https")
+            && parsed.host_str().is_some()
+            && parsed.username().is_empty()
+            && parsed.password().is_none()
+            && parsed.query().is_none()
+    })
+}
+
+/// Fields a custom endpoint can change in place; `None` keeps the value.
+#[derive(Default)]
+pub struct EndpointPatch {
+    pub route: Option<String>,
+    pub base_url: Option<String>,
+    /// `Some(None)` returns to forwarding the client's own format.
+    pub dialect: Option<Option<String>>,
+    /// An empty list serves every model the endpoint lists.
+    pub models: Option<Vec<String>>,
+    pub api_key: Option<String>,
+}
+
+const ROUTE_RULE: &str = "route must be 1 to 32 lowercase letters, digits, - or _, and not a provider name such as claude, codex, openai or copilot";
+const DIALECT_RULE: &str = "dialect must be chat, responses or messages";
+const BASE_URL_RULE: &str =
+    "base_url must be an http or https address without credentials or query";
 
 /// Known reserve window kinds, deduplicated in shortest-first order, or
 /// `None` when one is unknown.
@@ -269,9 +351,25 @@ impl AccountCredential {
             last_error: self.last_error.clone(),
             reserve_percent: self.reserve(),
             reserve_windows: self.reserve_windows(),
+            route: self.route.clone(),
+            base_url: (self.provider == SubscriptionProvider::OpenaiCompatible)
+                .then(|| self.base_url.clone())
+                .flatten(),
+            dialect: self.dialect.clone(),
+            models: if self.provider == SubscriptionProvider::OpenaiCompatible {
+                self.models.clone()
+            } else {
+                vec![]
+            },
             created_at: self.created_at.clone(),
             updated_at: self.updated_at.clone(),
         }
+    }
+
+    /// The pool this account serves: a custom endpoint's route, otherwise
+    /// its provider. Scheduling, affinity and model prefixes use it.
+    pub(crate) fn pool(&self) -> &str {
+        self.route.as_deref().unwrap_or(self.provider.as_str())
     }
 
     pub(crate) fn needs_refresh(&self) -> bool {
@@ -444,9 +542,115 @@ impl AccountStore {
         Ok(())
     }
 
+    /// Routes of the custom endpoints currently configured.
+    pub async fn routes(&self) -> std::collections::BTreeSet<String> {
+        self.accounts
+            .read()
+            .await
+            .values()
+            .filter_map(|account| account.route.clone())
+            .collect()
+    }
+
+    /// Changes a custom endpoint in place. Its key stays in the account file
+    /// and never comes back in the summary.
+    pub async fn update_endpoint(
+        &self,
+        id: &str,
+        patch: EndpointPatch,
+    ) -> Result<AccountSummary, SubscriptionError> {
+        let route = patch.route.map(|r| r.trim().to_ascii_lowercase());
+        if route.as_deref().is_some_and(|r| !valid_route(r)) {
+            return Err(SubscriptionError::InvalidEndpoint(ROUTE_RULE));
+        }
+        let base_url = patch.base_url.map(|url| url.trim().to_owned());
+        if base_url.as_deref().is_some_and(|url| !valid_base_url(url)) {
+            return Err(SubscriptionError::InvalidEndpoint(BASE_URL_RULE));
+        }
+        let dialect = patch
+            .dialect
+            .map(|d| d.map(|d| d.trim().to_ascii_lowercase()));
+        if dialect
+            .as_ref()
+            .and_then(Option::as_deref)
+            .is_some_and(|d| !valid_dialect(d))
+        {
+            return Err(SubscriptionError::InvalidEndpoint(DIALECT_RULE));
+        }
+        let api_key = patch.api_key.map(|key| key.trim().to_owned());
+        if api_key.as_deref().is_some_and(|key| {
+            key.is_empty() || key.len() > 8192 || key.chars().any(char::is_control)
+        }) {
+            return Err(SubscriptionError::InvalidEndpoint(
+                "api_key must be 1 to 8192 characters without control characters",
+            ));
+        }
+        let models = patch.models.map(|models| {
+            models
+                .into_iter()
+                .map(|m| m.trim().to_owned())
+                .filter(|m| !m.is_empty())
+                .collect::<Vec<_>>()
+        });
+        if models
+            .as_ref()
+            .is_some_and(|models| models.len() > 500 || models.iter().any(|m| m.len() > 200))
+        {
+            return Err(SubscriptionError::InvalidEndpoint(
+                "models takes at most 500 ids of 200 characters",
+            ));
+        }
+        let mut accounts = self.accounts.write().await;
+        let current = accounts.get(id).ok_or(SubscriptionError::NotFound)?;
+        if current.provider != SubscriptionProvider::OpenaiCompatible {
+            return Err(SubscriptionError::InvalidEndpoint(
+                "only openai_compatible endpoints take a route, base_url, dialect, models or api_key",
+            ));
+        }
+        let mut account = current.clone();
+        if let Some(route) = route {
+            account.route = Some(route);
+        }
+        if let Some(url) = base_url {
+            account.base_url = Some(url);
+        }
+        if let Some(dialect) = dialect {
+            account.dialect = dialect;
+        }
+        if let Some(models) = models {
+            account.models = models;
+        }
+        if let Some(key) = api_key {
+            account.access_token = key;
+            account.last_error = None;
+            account.cooldown_until = None;
+        }
+        if account.route.is_some() && account.base_url.is_none() {
+            return Err(SubscriptionError::InvalidEndpoint(
+                "an endpoint with a route needs its base_url",
+            ));
+        }
+        account.updated_at = now();
+        self.persist(&account)?;
+        let summary = account.summary();
+        accounts.insert(account.id.clone(), account);
+        Ok(summary)
+    }
+
     pub async fn eligible(
         &self,
         provider: SubscriptionProvider,
+        model: Option<&str>,
+    ) -> Vec<AccountCredential> {
+        self.eligible_in(provider, None, model).await
+    }
+
+    /// Accounts of one pool: a provider's own accounts, or the keys of one
+    /// custom endpoint route. Keys on different routes never serve each other.
+    pub async fn eligible_in(
+        &self,
+        provider: SubscriptionProvider,
+        route: Option<&str>,
         model: Option<&str>,
     ) -> Vec<AccountCredential> {
         self.accounts
@@ -455,6 +659,7 @@ impl AccountStore {
             .values()
             .filter(|account| {
                 account.provider == provider
+                    && account.route.as_deref() == route
                     && matches!(account.summary().status.as_str(), "ready" | "error")
                     && model.is_none_or(|model| {
                         (account.models.is_empty() || account.models.iter().any(|m| m == model))
@@ -707,6 +912,28 @@ fn parse_import(
             ))?;
         object.insert("type".into(), serde_json::json!("xai"));
     }
+    // OpenCode keeps its GitHub Copilot login under the provider's id; the
+    // GitHub OAuth token serves the Copilot API directly and does not expire.
+    if let Some(native) = value
+        .get("github-copilot")
+        .filter(|record| record.is_object())
+        .cloned()
+    {
+        let token = text(&native, &["refresh", "access", "access_token"]).ok_or(
+            SubscriptionError::InvalidImport("missing GitHub Copilot token"),
+        )?;
+        let mut record = serde_json::json!({"type":"copilot","access_token":token});
+        if let Some(domain) = text(&native, &["enterpriseUrl"]) {
+            record["base_url"] = serde_json::json!(format!(
+                "https://copilot-api.{}",
+                domain
+                    .trim_start_matches("https://")
+                    .trim_start_matches("http://")
+                    .trim_end_matches('/')
+            ));
+        }
+        value = record;
+    }
     let (provider, token) = if let Some(oauth) = value.get("claudeAiOauth") {
         (SubscriptionProvider::Claude, oauth)
     } else if let Some(tokens) = value.get("tokens") {
@@ -762,15 +989,27 @@ fn parse_import(
     let base_url = text(&value, &["base_url", "resource_url"]).or_else(|| {
         (provider == SubscriptionProvider::Xai).then(|| "https://cli-chat-proxy.grok.com/v1".into())
     });
-    if let Some(url) = &base_url {
-        let parsed = reqwest::Url::parse(url)
-            .map_err(|_| SubscriptionError::InvalidImport("invalid base URL"))?;
-        if !matches!(parsed.scheme(), "http" | "https")
-            || !parsed.username().is_empty()
-            || parsed.password().is_some()
-            || parsed.query().is_some()
-        {
-            return Err(SubscriptionError::InvalidImport("invalid base URL"));
+    if base_url.as_deref().is_some_and(|url| !valid_base_url(url)) {
+        return Err(SubscriptionError::InvalidImport("invalid base URL"));
+    }
+    let route = text(&value, &["route", "prefix"]).map(|r| r.trim().to_ascii_lowercase());
+    let dialect = text(&value, &["dialect", "format"]).map(|d| d.trim().to_ascii_lowercase());
+    if route.is_some() || dialect.is_some() {
+        if provider != SubscriptionProvider::OpenaiCompatible {
+            return Err(SubscriptionError::InvalidEndpoint(
+                "route and dialect apply only to openai_compatible endpoints",
+            ));
+        }
+        if route.as_deref().is_some_and(|r| !valid_route(r)) {
+            return Err(SubscriptionError::InvalidEndpoint(ROUTE_RULE));
+        }
+        if dialect.as_deref().is_some_and(|d| !valid_dialect(d)) {
+            return Err(SubscriptionError::InvalidEndpoint(DIALECT_RULE));
+        }
+        if route.is_some() && base_url.is_none() {
+            return Err(SubscriptionError::InvalidEndpoint(
+                "an endpoint with a route needs its base_url",
+            ));
         }
     }
     let created = now();
@@ -829,12 +1068,15 @@ fn parse_import(
         model_exhaustion: BTreeMap::new(),
         reserve_percent: None,
         reserve_windows: vec![],
+        route,
+        dialect,
     };
     apply_identity(&mut account);
     account.name = name
         .filter(|v| !v.trim().is_empty())
         .or_else(|| text(&value, &["name", "label"]))
         .or_else(|| account.email.clone())
+        .or_else(|| account.route.clone())
         .unwrap_or_else(|| format!("{} account", provider.as_str()));
     if account.name.len() > 200 || account.email.as_ref().is_some_and(|v| v.len() > 320) {
         return Err(SubscriptionError::InvalidImport(

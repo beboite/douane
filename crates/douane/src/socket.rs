@@ -217,7 +217,7 @@ async fn connect_pool(
             Ok(account) if account_eligible(&account, model) => account,
             _ => continue,
         };
-        let (url, _) = relay::upstream(&account, Dialect::Responses, model);
+        let (url, _) = relay::upstream(&account, Dialect::Responses, model, &[]);
         let url = url
             .replacen("https://", "wss://", 1)
             .replacen("http://", "ws://", 1);
@@ -379,13 +379,13 @@ async fn run(mut downstream: WebSocket, state: Arc<AppState>, headers: HeaderMap
             return;
         }
     };
+    // Codex and a plain OpenAI endpoint keep a native socket; every other
+    // pool, custom routes included, goes through the HTTP bridge.
     if let Some(account) = candidates.first().filter(|a| {
-        !matches!(
-            a.provider,
-            SubscriptionProvider::Codex | SubscriptionProvider::OpenaiCompatible
-        )
+        !(a.provider == SubscriptionProvider::Codex
+            || (a.provider == SubscriptionProvider::OpenaiCompatible && a.route.is_none()))
     }) {
-        initial["model"] = json!(format!("{}/{}", account.provider.as_str(), model));
+        initial["model"] = json!(format!("{}/{}", account.pool(), model));
         crate::socket_compat::run(downstream, state, headers, initial).await;
         return;
     }

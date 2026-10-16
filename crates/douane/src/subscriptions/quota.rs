@@ -223,6 +223,8 @@ pub struct QuotaService {
     cache: RwLock<BTreeMap<String, QuotaSnapshot>>,
     verification_urls: RwLock<BTreeMap<String, String>>,
     failures: RwLock<BTreeMap<String, Failures>>,
+    /// GitHub's Copilot entitlement endpoint; tests point it at a loopback.
+    pub(crate) copilot_user_url: String,
 }
 
 impl QuotaService {
@@ -243,6 +245,7 @@ impl QuotaService {
             cache: RwLock::new(BTreeMap::new()),
             verification_urls: RwLock::new(BTreeMap::new()),
             failures: RwLock::new(BTreeMap::new()),
+            copilot_user_url: "https://api.github.com/copilot_internal/user".into(),
         }
     }
 
@@ -551,6 +554,18 @@ impl QuotaService {
                 let windows = parse_kimi(&value, observed);
                 (value, windows)
             }
+            SubscriptionProvider::Copilot => {
+                let value = send_json(
+                    self.client
+                        .get(&self.copilot_user_url)
+                        .header("Authorization", format!("token {}", account.access_token))
+                        .header("User-Agent", crate::relay::COPILOT_USER_AGENT)
+                        .header("X-GitHub-Api-Version", crate::relay::COPILOT_API_VERSION),
+                )
+                .await?;
+                let windows = parse_copilot(&value, observed);
+                (value, windows)
+            }
             SubscriptionProvider::OpenaiCompatible | SubscriptionProvider::Qwen => {
                 return Err(SubscriptionError::Unsupported);
             }
@@ -560,7 +575,23 @@ impl QuotaService {
             return Err(SubscriptionError::InvalidResponse);
         }
         let plan = text(&value, &["plan_type", "planType", "subscription_type"]);
-        let mut subscription = subscription_from_value(account.provider, &value, "provider_usage");
+        let mut subscription = if account.provider == SubscriptionProvider::Copilot {
+            // The SKU names education and free plans; the plan alone does not.
+            text(&value, &["access_type_sku"])
+                .and_then(|sku| {
+                    SubscriptionTier::detect(account.provider, Some(&sku), None, "provider_usage")
+                })
+                .or_else(|| {
+                    SubscriptionTier::detect(
+                        account.provider,
+                        text(&value, &["copilot_plan"]).as_deref(),
+                        None,
+                        "provider_usage",
+                    )
+                })
+        } else {
+            subscription_from_value(account.provider, &value, "provider_usage")
+        };
         let mut organization_id = None;
         // Usage and account metadata are different provider resources. A
         // metadata outage must not discard a successful quota observation.
@@ -1171,6 +1202,56 @@ fn parse_opencode_go(value: &Value, observed: time::OffsetDateTime) -> Vec<Quota
     windows
 }
 
+/// Copilot's monthly premium requests. Chat and completions are unlimited
+/// on paid plans and need no bar; a limited one still gets its window.
+/// None is account-wide: included models keep answering once premium
+/// requests run out, so an empty bar must not take the account out.
+fn parse_copilot(value: &Value, observed: time::OffsetDateTime) -> Vec<QuotaWindow> {
+    let reset_at = reset(
+        field(value, &["quota_reset_date_utc", "quota_reset_date"]),
+        None,
+        observed,
+    )
+    .or_else(|| {
+        // A bare date resets at midnight UTC.
+        value["quota_reset_date"]
+            .as_str()
+            .and_then(|date| parse_timestamp(&format!("{date}T00:00:00Z")))
+            .map(timestamp)
+    });
+    let mut windows = Vec::new();
+    for (key, id, label) in [
+        ("premium_interactions", "premium", "Premium requests"),
+        ("chat", "chat", "Chat"),
+        ("completions", "completions", "Completions"),
+    ] {
+        let Some(quota) = value
+            .get("quota_snapshots")
+            .and_then(|snapshots| snapshots.get(key))
+            .filter(|quota| quota.is_object())
+        else {
+            continue;
+        };
+        if quota["unlimited"].as_bool() == Some(true) {
+            continue;
+        }
+        let limit = number(quota.get("entitlement")).filter(|limit| *limit > 0.0);
+        let left = number(field(quota, &["remaining", "quota_remaining"]));
+        let remaining_percent = number(quota.get("percent_remaining"))
+            .or_else(|| Some(left? / limit? * 100.0))
+            .map(|percent| percent.clamp(0.0, 100.0));
+        windows.push(QuotaWindow {
+            id: id.into(),
+            label: label.into(),
+            remaining_percent,
+            reset_at: reset_at.clone(),
+            used: limit.zip(left).map(|(limit, left)| (limit - left).max(0.0)),
+            limit,
+        });
+    }
+    windows
+}
+
 fn parse_antigravity(value: &Value, observed: time::OffsetDateTime) -> Vec<QuotaWindow> {
     let mut windows = Vec::new();
     if let Some(groups) = value.get("groups").and_then(Value::as_array) {
@@ -1268,6 +1349,46 @@ fn parse_kimi(value: &Value, observed: time::OffsetDateTime) -> Vec<QuotaWindow>
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn copilot_premium_requests_get_a_bar_and_unlimited_ones_none() {
+        let student = json!({
+            "copilot_plan":"individual","access_type_sku":"free_educational_quota",
+            "quota_reset_date":"2026-11-01","quota_reset_date_utc":"2026-11-01T00:00:00.000Z",
+            "quota_snapshots":{
+                "chat":{"unlimited":true,"entitlement":0,"remaining":0,"percent_remaining":100.0},
+                "completions":{"unlimited":true,"entitlement":0,"remaining":0,"percent_remaining":100.0},
+                "premium_interactions":{"unlimited":false,"entitlement":200,"remaining":150,"percent_remaining":75.0}
+            }
+        });
+        let windows = parse_copilot(&student, observed());
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].id, "premium");
+        assert_eq!(windows[0].remaining_percent, Some(75.0));
+        assert_eq!(windows[0].used, Some(50.0));
+        assert_eq!(windows[0].limit, Some(200.0));
+        assert_eq!(windows[0].reset_at.as_deref(), Some("2026-11-01T00:00:00Z"));
+        // An empty premium bar must not take the account out: included models
+        // keep answering.
+        assert!(!is_global(&windows[0].id));
+        assert_eq!(
+            SubscriptionTier::detect(
+                SubscriptionProvider::Copilot,
+                Some("free_educational_quota"),
+                None,
+                "provider_usage"
+            )
+            .map(|tier| tier.label),
+            Some("Copilot Student".into())
+        );
+        // A free plan's limited chat gets its own bar, read from counts alone.
+        let free = json!({"quota_reset_date":"2026-11-01","quota_snapshots":{
+            "chat":{"unlimited":false,"entitlement":50,"remaining":10}}});
+        let windows = parse_copilot(&free, observed());
+        assert_eq!(windows[0].id, "chat");
+        assert_eq!(windows[0].remaining_percent, Some(20.0));
+        assert_eq!(windows[0].reset_at.as_deref(), Some("2026-11-01T00:00:00Z"));
+    }
 
     fn observed() -> time::OffsetDateTime {
         parse_timestamp("2026-10-03T12:00:00Z").unwrap()
