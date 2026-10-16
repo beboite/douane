@@ -12,6 +12,7 @@ Static SVG brand marks bundled with the dashboard. No package or runtime CDN is 
 | Antigravity | `antigravity.svg` | [Official Google white icon](https://antigravity.google/assets/image/brand/antigravity-icon__white.svg), listed in [press assets](https://antigravity.google/press) | Google brand asset, not MIT; retain Google's [brand guidelines](https://about.google/brand-resource-center/guidance/). Unmodified white icon, distinct from Gemini. |
 | Gemini | `gemini.svg` | [LobeHub 1.95.1, Gemini color](https://unpkg.com/@lobehub/icons-static-svg@1.95.1/icons/gemini-color.svg) | MIT library asset; original multicolor star. |
 | Kimi | `kimi.svg` | [LobeHub 1.95.1, Kimi color](https://unpkg.com/@lobehub/icons-static-svg@1.95.1/icons/kimi-color.svg) | MIT library asset; original white K and blue dot, transparent background. |
+| GitHub Copilot | `copilot.svg` | [LobeHub 1.95.1, GithubCopilot](https://unpkg.com/@lobehub/icons-static-svg@1.95.1/icons/githubcopilot.svg) | MIT library asset; white monochrome variant. |
 | Qwen | `qwen.svg` | [LobeHub 1.95.1, Qwen color](https://unpkg.com/@lobehub/icons-static-svg@1.95.1/icons/qwen-color.svg) | MIT library asset; original violet gradient. |
 
 LobeHub's package metadata declares MIT and points to [the library license](https://github.com/lobehub/lobe-icons/blob/master/LICENSE). Logo trademarks remain with their respective owners. Google's press asset is recorded separately rather than represented as an open-source grant.

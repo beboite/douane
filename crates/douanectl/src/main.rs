@@ -47,6 +47,221 @@ enum Command {
         #[arg(long)]
         callback_file: PathBuf,
     },
+    /// Custom API endpoints: one route (model prefix) per upstream, its keys
+    /// rotating. Keys come from a file or stdin, never from arguments.
+    #[command(subcommand)]
+    Endpoint(Endpoint),
+}
+#[derive(Subcommand)]
+enum Endpoint {
+    /// List endpoints with their route, address, format and models.
+    List,
+    /// Add a key for a route: `douanectl endpoint add deepseek
+    /// https://api.deepseek.com/v1 --key-file key.txt`. Adding a second key
+    /// to a route makes them rotate.
+    Add {
+        route: String,
+        base_url: String,
+        /// File holding the API key; `-` reads it from stdin.
+        #[arg(long)]
+        key_file: PathBuf,
+        #[arg(long)]
+        name: Option<String>,
+        /// chat, responses or messages; absent forwards the client's format.
+        #[arg(long)]
+        dialect: Option<String>,
+        /// Comma-separated model ids to serve; absent serves every listed model.
+        #[arg(long, value_delimiter = ',')]
+        models: Option<Vec<String>>,
+    },
+    /// Change every key of a route (or one account id) in place.
+    Set {
+        route_or_id: String,
+        #[arg(long)]
+        base_url: Option<String>,
+        /// chat, responses or messages; `client` forwards the client's format.
+        #[arg(long)]
+        dialect: Option<String>,
+        /// Comma-separated model ids; an empty value serves every model.
+        #[arg(long, value_delimiter = ',')]
+        models: Option<Vec<String>>,
+        /// Rename the route.
+        #[arg(long)]
+        route: Option<String>,
+        /// Replace the key; needs a route with a single key, or an id.
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+    },
+    /// Remove every key of a route, or one account id.
+    Remove { route_or_id: String },
+}
+
+async fn read_key(path: &std::path::Path) -> Result<String> {
+    let raw = if path.as_os_str() == "-" {
+        let mut buffer = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer)
+            .context("reading the key from stdin")?;
+        buffer
+    } else {
+        tokio::fs::read_to_string(path)
+            .await
+            .context("reading the key file")?
+    };
+    let key = raw.trim().to_owned();
+    if key.is_empty() {
+        bail!("the key is empty");
+    }
+    Ok(key)
+}
+
+async fn send(request: reqwest::RequestBuilder) -> Result<Value> {
+    let request = match std::env::var("DOUANE_MANAGEMENT_TOKEN") {
+        Ok(token) => request.bearer_auth(token),
+        Err(_) => request,
+    };
+    let response = request.send().await.context("cannot reach douane")?;
+    let status = response.status();
+    let value: Value = response.json().await.context("invalid server response")?;
+    if !status.is_success() {
+        bail!(
+            "douane returned {status}: {}",
+            value["error"]["message"]
+                .as_str()
+                .or_else(|| value.pointer("/errors/0/error").and_then(Value::as_str))
+                .unwrap_or("request failed")
+        );
+    }
+    Ok(value)
+}
+
+/// Accounts a route or an id names, custom endpoints only.
+async fn endpoint_accounts(
+    client: &reqwest::Client,
+    root: &str,
+    route_or_id: &str,
+) -> Result<Vec<Value>> {
+    let listing = send(client.get(format!("{root}/admin/api/accounts"))).await?;
+    let found: Vec<Value> = listing["accounts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|a| a["provider"] == "openai_compatible")
+        .filter(|a| a["route"] == route_or_id || a["id"] == route_or_id)
+        .cloned()
+        .collect();
+    if found.is_empty() {
+        bail!("no custom endpoint has the route or id {route_or_id}");
+    }
+    Ok(found)
+}
+
+async fn endpoint(client: &reqwest::Client, root: &str, command: Endpoint) -> Result<Value> {
+    match command {
+        Endpoint::List => {
+            let listing = send(client.get(format!("{root}/admin/api/accounts"))).await?;
+            let rows: Vec<Value> = listing["accounts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|a| a["provider"] == "openai_compatible")
+                .map(|a| {
+                    json!({"id":a["id"],"name":a["name"],"route":a["route"],"base_url":a["base_url"],
+                        "dialect":a["dialect"],"models":a["models"],"enabled":a["enabled"],"status":a["status"]})
+                })
+                .collect();
+            Ok(json!({ "endpoints": rows }))
+        }
+        Endpoint::Add {
+            route,
+            base_url,
+            key_file,
+            name,
+            dialect,
+            models,
+        } => {
+            let key = read_key(&key_file).await?;
+            let mut content =
+                json!({"type":"openai_compatible","route":route,"base_url":base_url,"api_key":key});
+            if let Some(dialect) = dialect {
+                content["dialect"] = json!(dialect);
+            }
+            if let Some(models) = models {
+                content["models"] = json!(models);
+            }
+            send(
+                client
+                    .post(format!("{root}/admin/api/accounts/import"))
+                    .json(&json!({"files":[{"name":name,"content":content}]})),
+            )
+            .await
+        }
+        Endpoint::Set {
+            route_or_id,
+            base_url,
+            dialect,
+            models,
+            route,
+            key_file,
+        } => {
+            let accounts = endpoint_accounts(client, root, &route_or_id).await?;
+            let mut patch = json!({});
+            if let Some(url) = base_url {
+                patch["base_url"] = json!(url);
+            }
+            if let Some(dialect) = dialect {
+                patch["dialect"] = if dialect == "client" {
+                    Value::Null
+                } else {
+                    json!(dialect)
+                };
+            }
+            if let Some(models) = models {
+                patch["models"] = json!(
+                    models
+                        .into_iter()
+                        .filter(|m| !m.is_empty())
+                        .collect::<Vec<_>>()
+                );
+            }
+            if let Some(route) = route {
+                patch["route"] = json!(route);
+            }
+            if let Some(path) = key_file {
+                if accounts.len() != 1 {
+                    bail!(
+                        "{route_or_id} has {} keys; replace one by its account id",
+                        accounts.len()
+                    );
+                }
+                patch["api_key"] = json!(read_key(&path).await?);
+            }
+            if patch.as_object().is_some_and(|p| p.is_empty()) {
+                bail!("give --base-url, --dialect, --models, --route or --key-file");
+            }
+            let mut changed = vec![];
+            for account in accounts {
+                let id = account["id"].as_str().unwrap_or_default();
+                let result = send(
+                    client
+                        .patch(format!("{root}/admin/api/accounts/{id}"))
+                        .json(&patch),
+                )
+                .await?;
+                changed.push(result["account"].clone());
+            }
+            Ok(json!({ "updated": changed }))
+        }
+        Endpoint::Remove { route_or_id } => {
+            let accounts = endpoint_accounts(client, root, &route_or_id).await?;
+            let mut removed = vec![];
+            for account in accounts {
+                let id = account["id"].as_str().unwrap_or_default();
+                send(client.delete(format!("{root}/admin/api/accounts/{id}"))).await?;
+                removed.push(json!(id));
+            }
+            Ok(json!({ "removed": removed }))
+        }
+    }
 }
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -55,7 +270,15 @@ async fn main() -> Result<()> {
         .timeout(std::time::Duration::from_secs(60))
         .build()?;
     let root = cli.url.trim_end_matches('/');
-    let mut request = match cli.command {
+    let command = match cli.command {
+        Command::Endpoint(command) => {
+            let value = endpoint(&client, root, command).await?;
+            println!("{}", serde_json::to_string_pretty(&value)?);
+            return Ok(());
+        }
+        command => command,
+    };
+    let request = match command {
         Command::Health => client.get(format!("{root}/health")),
         Command::Status => client.get(format!("{root}/admin/api/summary")),
         Command::Accounts => client.get(format!("{root}/admin/api/accounts")),
@@ -88,22 +311,9 @@ async fn main() -> Result<()> {
                 .post(format!("{root}/admin/api/oauth/callback"))
                 .json(&json!({"id":id,"code":callback.trim(),"state":""}))
         }
+        Command::Endpoint(_) => unreachable!("handled above"),
     };
-    if let Ok(token) = std::env::var("DOUANE_MANAGEMENT_TOKEN") {
-        request = request.bearer_auth(token);
-    }
-    let response = request.send().await.context("cannot reach douane")?;
-    let status = response.status();
-    let value: Value = response.json().await.context("invalid server response")?;
-    if !status.is_success() {
-        bail!(
-            "douane returned {status}: {}",
-            value["error"]["message"]
-                .as_str()
-                .or_else(|| value.pointer("/errors/0/error").and_then(Value::as_str))
-                .unwrap_or("request failed")
-        );
-    }
+    let value = send(request).await?;
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }

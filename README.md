@@ -6,7 +6,7 @@
 
 One self-hosted endpoint for every AI subscription you pay for.
 
-douane connects your Claude, ChatGPT (Codex), Antigravity, Grok and OpenCode Go subscriptions, then serves them to any coding tool through OpenAI- and Anthropic-compatible APIs. It watches each account's quota, picks the account that should serve the next conversation, and keeps a conversation on the same account so the provider's prompt cache stays warm. A single Rust binary with an embedded dashboard; no Node.js, Docker or external database at runtime.
+douane connects your Claude, ChatGPT (Codex), Antigravity, Grok, GitHub Copilot and OpenCode Go subscriptions, plus any API key you hold, then serves them to any coding tool through OpenAI- and Anthropic-compatible APIs. It watches each account's quota, picks the account that should serve the next conversation, and keeps a conversation on the same account so the provider's prompt cache stays warm. A single Rust binary with an embedded dashboard; no Node.js, Docker or external database at runtime.
 
 ![Quotas page: accounts grouped by provider, with five-hour and weekly windows, resets and extra credits](docs/images/quotas.png)
 
@@ -31,7 +31,9 @@ douane connects your Claude, ChatGPT (Codex), Antigravity, Grok and OpenCode Go 
 | Grok (SuperGrok) | Device code in the dashboard | Weekly or monthly credit windows |
 | OpenCode Go | Subscription key in the manual form | Five-hour, weekly and monthly windows |
 | Gemini CLI, Kimi | Credential import | Read from the provider |
-| Qwen, OpenAI-compatible upstreams | Credential import | Not reported |
+| GitHub Copilot | Device code in the dashboard, or OpenCode's `auth.json` | Monthly premium requests |
+| Qwen | Credential import | Not reported |
+| Custom endpoints (DeepSeek, OpenRouter, Groq, NVIDIA NIM...) | An API key in the dashboard or `douanectl endpoint add` | Not reported |
 
 What a provider exposes depends on the account and plan. A quota douane cannot read stays unknown; it is never estimated.
 
@@ -150,6 +152,36 @@ after restart, expiry, account/model changes or compaction that alters the
 recorded context. Start a new conversation in that case. Acceptance by a live
 Google account remains separate from the local compatibility tests.
 
+### GitHub Copilot clients
+
+Copilot signs in with GitHub's device flow through the OpenCode GitHub app, the way OpenCode does; an existing OpenCode login imports as is (its `auth.json`). The model list is Copilot's own catalog: models whose policy is enabled for the account, each sent to the path Copilot lists for it (`/v1/messages` for Claude models, `/responses`, or `/chat/completions`). A client's own format is forwarded untouched when the model accepts it.
+
+Copilot bills a premium request when its user starts a turn. douane marks tool results and other follow-ups as the agent's own (`x-initiator: agent`), as OpenCode does. The catalog can list a model the plan does not serve; the first `model_not_supported` refusal hides that model for 24 hours or until a restart, and the account stays usable.
+
+## Custom endpoints
+
+Any OpenAI-, Anthropic- or Responses-compatible API becomes a route: its keys serve the models it lists under a prefix of your choice, so `deepseek` serves `deepseek/deepseek-v4-pro`. Keys sharing a route rotate and fail over like accounts of one provider; keys on different routes never serve each other's models.
+
+| Field | Meaning |
+| --- | --- |
+| `route` | Model prefix: 1 to 32 lowercase letters, digits, `-` or `_`, never a provider's name |
+| `base_url` | The API root, usually ending in `/v1` |
+| `dialect` | What the API speaks: `chat`, `responses` or `messages`; douane translates the client's format to it. Absent forwards the client's format unchanged |
+| `models` | Model ids to serve; empty serves every model the API lists at `/v1/models` |
+
+The dashboard's **Connecter un compte** page adds one, and each endpoint's pencil edits it in place. From a shell or an agent, the key comes from a file or stdin, never from the command line:
+
+```sh
+douanectl endpoint add deepseek https://api.deepseek.com/v1 --key-file deepseek.key --dialect chat
+printf %s "$GROQ_API_KEY" | douanectl endpoint add groq https://api.groq.com/openai/v1 --key-file - --dialect chat
+douanectl endpoint set deepseek --models deepseek-v4-pro,deepseek-flash
+douanectl endpoint set deepseek --key-file new.key
+douanectl endpoint list
+douanectl endpoint remove groq
+```
+
+The same fields go through `POST /admin/api/accounts/import` with `{"type":"openai_compatible","route":...,"base_url":...,"api_key":...}`, and `PATCH /admin/api/accounts/{id}` changes `route`, `base_url`, `dialect`, `models` or `api_key`. An account without a route keeps its previous behavior under `openai_compatible/`.
+
 ## Routing and quotas
 
 Pick a strategy in **Réglages** (settings), globally or per provider. It applies to new conversations:
@@ -192,6 +224,8 @@ douanectl complete <oauth-session-id> --callback-file callback.txt
 douanectl disable <account-id>
 douanectl enable <account-id>
 douanectl remove <account-id>
+douanectl endpoint add <route> <base-url> --key-file <file|->
+douanectl endpoint set <route|account-id> [--base-url ...] [--dialect ...] [--models ...] [--key-file ...]
 ```
 
 `--url` targets another instance and `DOUANE_MANAGEMENT_TOKEN` supplies the management token. Secrets are read from files, never from arguments.

@@ -27,6 +27,101 @@ pub fn error(status: StatusCode, message: &str) -> Response {
     )
         .into_response()
 }
+/// GitHub Copilot's API. Enterprise accounts carry their own base URL.
+pub const COPILOT_API: &str = "https://api.githubcopilot.com";
+/// Copilot identifies the integration by the OAuth app and these headers;
+/// douane signs in through the OpenCode app and presents itself the same way.
+pub const COPILOT_USER_AGENT: &str = "opencode/1.19.2";
+pub const COPILOT_API_VERSION: &str = "2026-06-01";
+
+/// The wire format a custom endpoint was configured with.
+fn configured_dialect(value: &str) -> Option<Dialect> {
+    match value {
+        "chat" => Some(Dialect::Chat),
+        "responses" => Some(Dialect::Responses),
+        "messages" => Some(Dialect::Messages),
+        _ => None,
+    }
+}
+
+fn copilot_path(dialect: Dialect) -> &'static str {
+    match dialect {
+        Dialect::Messages => "/v1/messages",
+        Dialect::Responses => "/responses",
+        _ => "/chat/completions",
+    }
+}
+
+/// Copilot serves each model on the paths its catalog lists. The client's
+/// own format goes through untouched when the model accepts it; otherwise
+/// Messages, then Responses, then Chat Completions.
+fn copilot_wire(client: Dialect, endpoints: &[String]) -> Dialect {
+    if endpoints.is_empty() {
+        return Dialect::Chat;
+    }
+    let accepts = |dialect: Dialect| endpoints.iter().any(|e| e == copilot_path(dialect));
+    if client != Dialect::Gemini && accepts(client) {
+        return client;
+    }
+    [Dialect::Messages, Dialect::Responses, Dialect::Chat]
+        .into_iter()
+        .find(|dialect| accepts(*dialect))
+        .unwrap_or(Dialect::Chat)
+}
+
+/// Copilot bills a premium request for each turn its user starts; tool
+/// results and other follow-ups are the agent's own and say so.
+pub(crate) fn copilot_initiator(body: &Value, wire: Dialect) -> &'static str {
+    let user_turn = match wire {
+        Dialect::Messages => body["messages"]
+            .as_array()
+            .and_then(|messages| messages.last())
+            .is_some_and(|last| {
+                last["role"] == "user"
+                    && (last["content"].is_string()
+                        || last["content"].as_array().is_some_and(|parts| {
+                            parts.iter().any(|part| part["type"] != "tool_result")
+                        }))
+            }),
+        Dialect::Responses => {
+            body["input"].is_string()
+                || body["input"]
+                    .as_array()
+                    .and_then(|items| items.last())
+                    .is_some_and(|last| last["role"] == "user")
+        }
+        _ => body["messages"]
+            .as_array()
+            .and_then(|messages| messages.last())
+            .is_some_and(|last| last["role"] == "user"),
+    };
+    if user_turn { "user" } else { "agent" }
+}
+
+/// Copilot needs to be told when a request carries an image.
+pub(crate) fn copilot_vision(body: &Value, wire: Dialect) -> bool {
+    let image = |part: &Value| {
+        matches!(
+            part["type"].as_str(),
+            Some("image" | "image_url" | "input_image")
+        ) || (part["type"] == "tool_result"
+            && part["content"]
+                .as_array()
+                .is_some_and(|inner| inner.iter().any(|p| p["type"] == "image")))
+    };
+    let items = match wire {
+        Dialect::Responses => body["input"].as_array(),
+        _ => body["messages"].as_array(),
+    };
+    items.is_some_and(|items| {
+        items.iter().any(|item| {
+            item["content"]
+                .as_array()
+                .is_some_and(|parts| parts.iter().any(image))
+        })
+    })
+}
+
 pub fn endpoint(base: &str, path: &str) -> String {
     let base = base.trim_end_matches('/');
     if base.ends_with("/v1") && path.starts_with("/v1/") {
@@ -40,6 +135,7 @@ pub(crate) fn upstream(
     account: &AccountCredential,
     client: Dialect,
     model: &str,
+    endpoints: &[String],
 ) -> (String, Dialect) {
     use SubscriptionProvider::*;
     let (base, wire, path) = match account.provider {
@@ -84,8 +180,16 @@ pub(crate) fn upstream(
             Dialect::Chat,
             "/v1/chat/completions",
         ),
+        Copilot => {
+            let wire = copilot_wire(client, endpoints);
+            (COPILOT_API, wire, copilot_path(wire))
+        }
         OpenaiCompatible => {
-            let wire = client;
+            let wire = account
+                .dialect
+                .as_deref()
+                .and_then(configured_dialect)
+                .unwrap_or(client);
             (
                 "https://api.openai.com",
                 wire,
@@ -223,6 +327,20 @@ pub(crate) fn upstream_headers(account: &AccountCredential, incoming: &HeaderMap
                 }
             }
         }
+        SubscriptionProvider::Copilot => {
+            out.insert(
+                header::USER_AGENT,
+                header::HeaderValue::from_static(COPILOT_USER_AGENT),
+            );
+            out.insert(
+                "x-github-api-version",
+                header::HeaderValue::from_static(COPILOT_API_VERSION),
+            );
+            out.insert(
+                "openai-intent",
+                header::HeaderValue::from_static("conversation-edits"),
+            );
+        }
         SubscriptionProvider::Antigravity => {
             out.insert(
                 header::USER_AGENT,
@@ -308,7 +426,19 @@ pub async fn forward(
                 continue;
             }
         };
-        let (mut url, to) = upstream(&account, from, &model);
+        let endpoints: Vec<String> = if account.provider == SubscriptionProvider::Copilot {
+            state
+                .models
+                .read()
+                .await
+                .iter()
+                .find(|m| m.provider == account.provider && m.upstream_id == model)
+                .map(|m| m.endpoints.clone())
+                .unwrap_or_default()
+        } else {
+            vec![]
+        };
+        let (mut url, to) = upstream(&account, from, &model, &endpoints);
         if uri.path().ends_with("/responses/compact") {
             if to != Dialect::Responses {
                 return error(
@@ -430,6 +560,32 @@ pub async fn forward(
                 translated["requestId"] = json!(format!("douane-{:016x}", rand::random::<u64>()));
             }
         }
+        // Headers that depend on the request itself, not on the account.
+        let mut request_headers = HeaderMap::new();
+        if account.provider == SubscriptionProvider::Copilot {
+            request_headers.insert(
+                "x-initiator",
+                header::HeaderValue::from_static(copilot_initiator(&translated, to)),
+            );
+            if copilot_vision(&translated, to) {
+                request_headers.insert(
+                    "copilot-vision-request",
+                    header::HeaderValue::from_static("true"),
+                );
+            }
+            if let Some(id) = session.as_deref().and_then(|s| s.parse().ok()) {
+                request_headers.insert("x-interaction-id", id);
+            }
+            if to == Dialect::Messages {
+                request_headers.insert(
+                    "anthropic-version",
+                    headers
+                        .get("anthropic-version")
+                        .cloned()
+                        .unwrap_or(header::HeaderValue::from_static("2023-06-01")),
+                );
+            }
+        }
         let bytes = match serde_json::to_vec(&translated) {
             Ok(v) => Bytes::from(v),
             Err(_) => return error(StatusCode::BAD_REQUEST, "cannot serialize request"),
@@ -443,7 +599,11 @@ pub async fn forward(
             let send = state
                 .client
                 .post(&url)
-                .headers(upstream_headers(&account, &headers))
+                .headers({
+                    let mut sent = upstream_headers(&account, &headers);
+                    sent.extend(request_headers.clone());
+                    sent
+                })
                 .body(bytes.clone())
                 .send();
             let result = match tokio::time::timeout(idle, send).await {
@@ -478,6 +638,47 @@ pub async fn forward(
         };
         if !last_status.is_success() {
             let advised = cooldown_seconds(response.headers(), unix_now());
+            // Copilot refuses a request it cannot serve with 400; the account
+            // is fine, and a model its plan lacks leaves the list.
+            if account.provider == SubscriptionProvider::Copilot
+                && last_status == StatusCode::BAD_REQUEST
+            {
+                let body = read_bounded(response, 64 * 1024, idle)
+                    .await
+                    .unwrap_or_default();
+                let refusal: Option<Value> = serde_json::from_slice(&body).ok();
+                let code = refusal
+                    .as_ref()
+                    .and_then(|v| v.pointer("/error/code"))
+                    .and_then(Value::as_str);
+                if code == Some("model_not_supported") {
+                    const UNSERVED: &str =
+                        "GitHub Copilot does not serve this model on this account's plan";
+                    call.fail(UNSERVED);
+                    state.copilot_refused(&account.id, &model).await;
+                    last_reason = Some(UNSERVED.into());
+                    continue;
+                }
+                call.fail("upstream request refused");
+                if native && refusal.is_some() {
+                    let mut answer = (last_status, Body::from(body)).into_response();
+                    answer.headers_mut().extend(passed);
+                    answer.headers_mut().insert(
+                        header::CONTENT_TYPE,
+                        header::HeaderValue::from_static("application/json"),
+                    );
+                    return answer;
+                }
+                let message: Option<String> = refusal
+                    .as_ref()
+                    .and_then(|v| v.pointer("/error/message"))
+                    .and_then(Value::as_str)
+                    .map(|m| m.chars().take(300).collect());
+                return error(
+                    last_status,
+                    &message.unwrap_or_else(|| "upstream request refused".into()),
+                );
+            }
             let (response, refusal) = if to == Dialect::Gemini && !native {
                 let body = read_bounded(response, 64 * 1024, idle)
                     .await
@@ -548,7 +749,7 @@ pub async fn forward(
                 .affinity
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .bind(account.provider.as_str(), key, &account.id);
+                .bind(account.pool(), key, &account.id);
         }
         // Codex was asked for a stream above, and its backend can answer one
         // without a content type.
@@ -1111,7 +1312,7 @@ impl CallGuard {
             call: Call {
                 id: format!("{:032x}", rand::random::<u128>()),
                 started_at: crate::subscriptions::now(),
-                provider: account.provider.as_str().into(),
+                provider: account.pool().into(),
                 account_id: account.id.clone(),
                 model: model.into(),
                 status: 200,

@@ -15,8 +15,8 @@ pub use quota::{
 };
 pub use reset::{ResetError, ResetManager, ResetOutcome, ResetRedemption, ResetStatus};
 pub use store::{
-    AccountCredential, AccountStore, AccountSummary, SubscriptionProvider, SubscriptionTier,
-    reserve_windows, valid_reserve,
+    AccountCredential, AccountStore, AccountSummary, EndpointPatch, SubscriptionProvider,
+    SubscriptionTier, reserve_windows, valid_base_url, valid_dialect, valid_reserve, valid_route,
 };
 
 pub struct GoogleVerification {
@@ -72,6 +72,8 @@ pub enum SubscriptionError {
         "reserve_windows accepts five-hour, daily, weekly and monthly; empty watches the longest window"
     )]
     InvalidReserveWindows,
+    #[error("{0}")]
+    InvalidEndpoint(&'static str),
 }
 
 impl SubscriptionError {

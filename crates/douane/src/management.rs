@@ -236,7 +236,7 @@ pub async fn import(State(state): State<Arc<AppState>>, Json(body): Json<Value>)
     )
         .into_response()
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct AccountPatch {
     name: Option<String>,
@@ -246,6 +246,20 @@ pub struct AccountPatch {
     reserve_percent: Option<Option<f64>>,
     /// Absent keeps the watched windows; `[]` watches the longest window.
     reserve_windows: Option<Vec<String>>,
+    /// Custom endpoints only: model prefix, address, wire format (`null`
+    /// forwards the client's own), served models (`[]` serves all) and key.
+    route: Option<String>,
+    base_url: Option<String>,
+    #[serde(default, deserialize_with = "present_text")]
+    dialect: Option<Option<String>>,
+    models: Option<Vec<String>>,
+    api_key: Option<String>,
+}
+
+fn present_text<'de, D: serde::Deserializer<'de>>(
+    value: D,
+) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(value).map(Some)
 }
 
 fn present<'de, D: serde::Deserializer<'de>>(value: D) -> Result<Option<Option<f64>>, D::Error> {
@@ -288,21 +302,62 @@ pub async fn update_account(
             &crate::subscriptions::SubscriptionError::InvalidReserveWindows.to_string(),
         );
     }
+    let endpoint = crate::subscriptions::EndpointPatch {
+        route: body.route,
+        base_url: body.base_url,
+        dialect: body.dialect,
+        models: body.models,
+        api_key: body.api_key,
+    };
+    let endpoint_change = endpoint.route.is_some()
+        || endpoint.base_url.is_some()
+        || endpoint.dialect.is_some()
+        || endpoint.models.is_some()
+        || endpoint.api_key.is_some();
     if name.is_none()
         && body.enabled.is_none()
         && reserve.is_none()
         && body.reserve_windows.is_none()
+        && !endpoint_change
     {
         return error(
             StatusCode::BAD_REQUEST,
-            "provide a name, enabled state or reserve",
+            "provide a name, enabled state, reserve or endpoint field",
         );
     }
-    match state
-        .accounts
-        .update(&id, name, body.enabled, reserve, body.reserve_windows)
-        .await
+    // The endpoint change is validated first, so a refused one leaves the
+    // account untouched.
+    if endpoint_change {
+        if let Err(e) = state.accounts.update_endpoint(&id, endpoint).await {
+            return error(
+                match e {
+                    crate::subscriptions::SubscriptionError::NotFound => StatusCode::NOT_FOUND,
+                    crate::subscriptions::SubscriptionError::InvalidEndpoint(_) => {
+                        StatusCode::BAD_REQUEST
+                    }
+                    _ => StatusCode::INTERNAL_SERVER_ERROR,
+                },
+                &e.to_string(),
+            );
+        }
+        state.refresh_models().await;
+    }
+    let result = if name.is_none()
+        && body.enabled.is_none()
+        && reserve.is_none()
+        && body.reserve_windows.is_none()
     {
+        match state.accounts.get(&id).await {
+            Some(account) => Ok(account.summary()),
+            None => Err(crate::subscriptions::SubscriptionError::NotFound),
+        }
+    } else {
+        state
+            .accounts
+            .update(&id, name, body.enabled, reserve, body.reserve_windows)
+            .await
+    };
+    match result {
         Ok(a) => {
             let account = account_value(&state, a, time::OffsetDateTime::now_utc()).await;
             Json(json!({ "account": account })).into_response()
@@ -447,25 +502,27 @@ pub async fn public_models(
     State(state): State<Arc<AppState>>,
     Query(query): Query<Params>,
 ) -> Json<Value> {
-    let ready: BTreeSet<_> = state
+    // A pool is a provider, or one custom endpoint route.
+    let ready: BTreeSet<String> = state
         .accounts
         .list()
         .await
         .into_iter()
         .filter(|a| a.enabled)
-        .map(|a| a.provider)
+        .map(|a| a.route.unwrap_or_else(|| a.provider.as_str().to_owned()))
         .collect();
     let upstream = query.ids.as_deref() == Some("upstream");
     let models = state.models.read().await;
     let mut listed: Vec<_> = models
         .iter()
         .filter(|m| {
+            let pool = m.route.as_deref().unwrap_or(m.provider.as_str());
             m.enabled
-                && ready.contains(&m.provider)
+                && ready.contains(pool)
                 && query
                     .provider
                     .as_ref()
-                    .is_none_or(|p| p.split(',').any(|p| p == m.provider.as_str()))
+                    .is_none_or(|p| p.split(',').any(|p| p == pool || p == m.provider.as_str()))
         })
         .collect();
     if upstream {
@@ -496,7 +553,7 @@ fn public_model(model: &crate::state::Model, upstream: bool) -> Value {
     } else {
         &model.id
     };
-    json!({"id":id,"object":"model","created":0,"owned_by":model.provider.as_str(),"name":model.name,"label":model.name,"context_length":model.context_length,"context_window":model.context_length,"max_output_tokens":model.max_output_tokens,"thinking":model.thinking,"reasoning_efforts":reasoning_efforts(model.thinking.as_ref()),"supported_endpoint_types":["anthropic","openai","openai-response"],"supports_websockets":true})
+    json!({"id":id,"object":"model","created":0,"owned_by":model.route.as_deref().unwrap_or(model.provider.as_str()),"name":model.name,"label":model.name,"context_length":model.context_length,"context_window":model.context_length,"max_output_tokens":model.max_output_tokens,"thinking":model.thinking,"reasoning_efforts":reasoning_efforts(model.thinking.as_ref()),"supported_endpoint_types":["anthropic","openai","openai-response"],"supports_websockets":true})
 }
 /// A model's effort levels as the Grok CLI lists them: highest first, `high`
 /// flagged as the default when the model offers it. Null without levels.
@@ -615,6 +672,7 @@ pub async fn providers(State(state): State<Arc<AppState>>) -> Json<Value> {
         {"id":"codex","oauth":true,"quota":true,"docs_url":"https://chatgpt.com/codex/settings/usage"},
         {"id":"opencode_go","oauth":false,"quota":true,"docs_url":"https://opencode.ai/docs/go/"},
         {"id":"xai","oauth":true,"quota":true,"docs_url":"https://grok.com"},
+        {"id":"copilot","oauth":true,"quota":true,"docs_url":"https://github.com/settings/copilot"},
         {"id":"antigravity","oauth":true,"quota":true,"docs_url":"https://antigravity.google"},
         {"id":"kimi","oauth":false,"quota":true,"docs_url":"https://kimi.com/code"},
         {"id":"qwen","oauth":false,"quota":false,"docs_url":"https://chat.qwen.ai"},
@@ -726,8 +784,7 @@ pub async fn patch_auth_file(
         Json(AccountPatch {
             name: None,
             enabled: Some(!body["disabled"].as_bool().unwrap_or(false)),
-            reserve_percent: None,
-            reserve_windows: None,
+            ..AccountPatch::default()
         }),
     )
     .await
@@ -872,9 +929,7 @@ mod tests {
             Path(ids[0].clone()),
             Json(AccountPatch {
                 name: Some("Renamed".into()),
-                enabled: None,
-                reserve_percent: None,
-                reserve_windows: None,
+                ..AccountPatch::default()
             }),
         )
         .await;
@@ -923,6 +978,7 @@ mod tests {
             enabled: true,
             upstream_id: "grok-test".into(),
             thinking,
+            ..crate::state::Model::default()
         };
         let scaled = model(Some(
             json!({"levels":["none","low","high","xhigh"],"zero_allowed":true}),

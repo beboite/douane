@@ -8,7 +8,7 @@
 	import ChevronRight from '@lucide/svelte/icons/chevron-right';
 	import ProviderMark from './provider-mark.svelte';
 	import { copyText } from '$lib/clipboard';
-	import { management, importErrors, type Provider, type OAuthSession, type OAuthStatus } from '$lib/management';
+	import { management, importErrors, providerName, dialects, type Dialect, type Provider, type OAuthSession, type OAuthStatus } from '$lib/management';
 	let { providers, close, completed, importFiles }: { providers: Provider[]; close: () => void; completed: () => void; importFiles: (files: FileList) => void } = $props();
 	let dialog: HTMLDialogElement;
 	let fileInput = $state<HTMLInputElement>();
@@ -23,6 +23,9 @@
 	let accountName = $state('');
 	let credential = $state('');
 	let endpoint = $state('');
+	let route = $state('');
+	let dialect = $state<Dialect | ''>('chat');
+	const custom = $derived(manual === 'openai_compatible');
 	let codeCopied = $state(false);
 	const copyFailureMessage = 'Copie refusée par le navigateur. Sélectionnez le code pour le copier.';
 	let mounted = false;
@@ -84,11 +87,11 @@
 	}
 	async function saveCredential(event: SubmitEvent) {
 		event.preventDefault(); pending = true; failure = '';
-		try { const result = await management.importCredential({ type:manual,name:accountName,access_token:credential,base_url:endpoint }); if (result.errors?.length || !result.imported) throw new Error(result.errors?.length ? importErrors(result.errors) : "Le compte n'a pas été ajouté."); if (mounted) connected(); }
+		try { const result = await management.importCredential({ type:manual,name:accountName,access_token:credential,base_url:endpoint,...(custom ? { route:route.trim().toLowerCase(),...(dialect ? { dialect } : {}) } : {}) }); if (result.errors?.length || !result.imported) throw new Error(result.errors?.length ? importErrors(result.errors) : "Le compte n'a pas été ajouté."); if (mounted) connected(); }
 		catch (error) { if (mounted) failure = (error as Error).message; }
 		finally { pending = false; }
 	}
-	function reset() { session = null; manual = ''; credential = ''; callback = ''; failure = ''; status = ''; terminal = false; }
+	function reset() { session = null; manual = ''; credential = ''; callback = ''; failure = ''; status = ''; terminal = false; route = ''; dialect = 'chat'; }
 	async function copyCode() { if (!session?.user_code) return; try { await copyText(session.user_code); codeCopied = true; if (failure === copyFailureMessage) failure = ''; } catch { codeCopied = false; failure = copyFailureMessage; } }
 </script>
 
@@ -114,16 +117,18 @@
 			</div>
 		{:else}
 		<div class="oauth-flow">
-			{#if session.user_code}<p>Ouvrez la page Grok et saisissez ce code pour autoriser la connexion.</p><div class="device-code"><span>{session.user_code}</span><button class="icon-button" onclick={copyCode} aria-label="Copier le code">{#if codeCopied}<Check size={16}/>{:else}<Copy size={16}/>{/if}</button></div>{:else}<p>Ouvrez la page du fournisseur et autorisez la connexion.</p>{/if}
+			{#if session.user_code}<p>Ouvrez la page {providerName(session.provider)} et saisissez ce code pour autoriser la connexion.</p><div class="device-code"><span>{session.user_code}</span><button class="icon-button" onclick={copyCode} aria-label="Copier le code">{#if codeCopied}<Check size={16}/>{:else}<Copy size={16}/>{/if}</button></div>{:else}<p>Ouvrez la page du fournisseur et autorisez la connexion.</p>{/if}
 			<a class="button primary" href={session.url} target="_blank" rel="noopener noreferrer external" data-sveltekit-reload>Ouvrir la connexion<ExternalLink size={14}/></a>
 			{#if !session.user_code}<p class="flow-hint">Si le retour vers localhost ne charge pas, copiez son URL complète. Claude peut aussi afficher un code à coller ici.</p><form onsubmit={finish}><label for="callback">URL de retour ou code de connexion</label><input id="callback" type="text" placeholder="URL de retour ou code#state" bind:value={callback} required maxlength="8192" autocomplete="off" spellcheck="false"/><button class="button primary" disabled={pending || terminal || !callback.trim()}>Terminer la connexion</button></form>{/if}
 			<div class="flow-controls"><button class="button" disabled={pending || terminal} onclick={() => check()}>Vérifier la connexion</button><button class="button subtle" disabled={pending} onclick={reset}>Choisir un autre fournisseur</button></div>{#if status}<p class="muted small" role="status">{status}</p>{/if}
 		</div>
 		{/if}
+	{:else if manual && custom}
+		<div class="oauth-flow"><p>Une clé d'API devient un préfixe de modèles : avec <code>deepseek</code>, ses modèles s'appellent <code>deepseek/nom-du-modèle</code>. Plusieurs clés sous le même préfixe tournent entre elles. La clé disparaît de ce formulaire après l'enregistrement.</p><form onsubmit={saveCredential}><label for="account-name">Nom</label><input id="account-name" bind:value={accountName} placeholder="DeepSeek" required/><label for="route">Préfixe des modèles</label><input id="route" bind:value={route} required pattern="[a-z0-9][a-z0-9_\-]{'{0,31}'}" placeholder="deepseek" autocomplete="off" spellcheck="false"/><label for="endpoint">Adresse de l'API</label><input id="endpoint" type="url" bind:value={endpoint} required placeholder="https://api.deepseek.com/v1"/><label for="dialect">Format de l'API</label><select id="dialect" bind:value={dialect}>{#each dialects as option (option.id)}<option value={option.id}>{option.label}</option>{/each}</select><label for="credential">Clé d'API</label><input id="credential" type="password" bind:value={credential} required autocomplete="off" spellcheck="false"/><button class="button primary" disabled={pending || !credential.trim() || !route.trim()}>Ajouter l'endpoint</button></form><button class="button subtle" style="margin-top:15px" disabled={pending} onclick={reset}>Choisir un autre fournisseur</button></div>
 	{:else if manual}
 		<div class="oauth-flow"><p>Ajoutez le jeton de connexion de votre abonnement. Il disparaît de ce formulaire après l'enregistrement.</p><form onsubmit={saveCredential}><label for="account-name">Nom du compte</label><input id="account-name" bind:value={accountName} placeholder="Mon abonnement" required/><label for="credential">Jeton de connexion</label><input id="credential" type="password" bind:value={credential} required autocomplete="off" spellcheck="false"/><label for="endpoint">Adresse du fournisseur</label><input id="endpoint" type="url" bind:value={endpoint} required placeholder="https://votre-fournisseur/v1"/><button class="button primary" disabled={pending || !credential.trim()}>Ajouter le compte</button></form><button class="button subtle" style="margin-top:15px" disabled={pending} onclick={reset}>Choisir un autre fournisseur</button></div>
 	{:else}
-		<div class="provider-options">{#each providers as provider (provider.id)}<button class="provider-option" disabled={pending} onclick={() => { if (provider.oauth) void start(provider.id); else { manual = provider.id; endpoint = provider.base_url ?? endpoints[provider.id] ?? ''; accountName = provider.name; } }}><span class="provider-logo"><ProviderMark provider={provider.id} size={28}/></span><span>{provider.name}<small>{provider.oauth ? 'Connecter mon abonnement' : "Ajouter un jeton"}</small></span><ChevronRight size={15}/></button>{/each}{#if !providers.length}<p class="muted small">Aucun fournisseur disponible. Importez un fichier d'authentification pour ajouter un compte.</p>{/if}</div>
+		<div class="provider-options">{#each providers as provider (provider.id)}<button class="provider-option" disabled={pending} onclick={() => { if (provider.oauth) void start(provider.id); else { manual = provider.id; endpoint = provider.base_url ?? endpoints[provider.id] ?? ''; accountName = provider.id === 'openai_compatible' ? '' : provider.name; } }}><span class="provider-logo"><ProviderMark provider={provider.id} size={28}/></span><span>{provider.name}<small>{provider.oauth ? 'Connecter mon abonnement' : provider.id === 'openai_compatible' ? "Ajouter une clé d'API" : "Ajouter un jeton"}</small></span><ChevronRight size={15}/></button>{/each}{#if !providers.length}<p class="muted small">Aucun fournisseur disponible. Importez un fichier d'authentification pour ajouter un compte.</p>{/if}</div>
 		<div class="dialog-import"><div><h3>Vous avez déjà un fichier ?</h3><p>Importez un ou plusieurs fichiers d'authentification JSON.</p></div><button class="button" disabled={pending} onclick={() => fileInput?.click()}><Upload size={14}/>Importer</button><input hidden type="file" accept=".json,application/json" multiple bind:this={fileInput} onchange={(event) => { if (event.currentTarget.files?.length) { importFiles(event.currentTarget.files); close(); } }}/></div>
 	{/if}
 	{#if pending}<p class="muted small" role="status">Connexion en cours...</p>{/if}
@@ -135,7 +140,7 @@
 	.dialog-heading { position: sticky; top: 0; z-index: 2; display: flex; gap: 20px; align-items: flex-start; justify-content: space-between; padding-bottom: 18px; margin-bottom: 8px; background: var(--surface); }.dialog-heading h2 { font-family: var(--font-display); font-size: 26px; font-weight: 650; letter-spacing: -.035em; margin: 0 0 8px; }.dialog-heading p,.dialog-import p { color: var(--muted); font-size: 15px; line-height: 1.5; margin: 0; }
 	.provider-options { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 11px; }.provider-option { display: flex; gap: 12px; align-items: center; min-height: 86px; padding: 15px 12px; border: 1px solid var(--border); border-radius: 12px; background: var(--background); text-align: left; }.provider-option:hover { background: var(--surface-raised); border-color: #5576ad; }.provider-option>span:not(.provider-logo) { flex: 1; font-size: 15px; font-weight: 550; }.provider-logo { display: flex; align-items: center; justify-content: center; width: 36px; flex-shrink: 0; }.provider-option small { display: block; color: var(--muted); font-size: 15px; font-weight: 400; line-height: 1.5; margin-top: 5px; }.provider-option :global(svg) { color: var(--faint); flex-shrink: 0; }
 	.dialog-import { margin-top: 24px; padding-top: 22px; border-top: 1px solid var(--border); display: flex; gap: 18px; align-items: center; }.dialog-import h3 { font-size: 15px; margin: 0 0 6px; }
-	.oauth-flow>p { font-size: 15px; color: var(--muted); line-height: 1.6; }.oauth-flow .flow-hint { margin-top: 24px; font-size: 15px; }.oauth-flow form { display: grid; gap: 10px; }.oauth-flow label { font-size: 15px; }.oauth-flow input { width: 100%; }.flow-controls { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
+	.oauth-flow>p { font-size: 15px; color: var(--muted); line-height: 1.6; }.oauth-flow .flow-hint { margin-top: 24px; font-size: 15px; }.oauth-flow form { display: grid; gap: 10px; }.oauth-flow label { font-size: 15px; }.oauth-flow input,.oauth-flow select { width: 100%; }.oauth-flow code { font-size: 14px; }.flow-controls { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
 	.device-code { display: flex; align-items: center; justify-content: space-between; border: 1px solid var(--border); background: var(--background); border-radius: 10px; padding: 14px 17px; margin: 20px 0; }.device-code>span { font-family: var(--font-display); font-size: 28px; letter-spacing: .08em; }
 	.connection-success { padding: 15px 0; text-align: center; }.connection-success>span { display: inline-grid; place-items: center; width: 50px; height: 50px; background: #10b98115; color: var(--green); border-radius: 50%; }.connection-success h3 { font-size: 18px; }.connection-success p { color: var(--muted); font-size: 15px; margin-bottom: 24px; }
 	@media(max-width:600px) { .connect-dialog { padding: 22px 18px; border-radius: 15px; }.dialog-heading h2 { font-size: 24px; }.provider-options { grid-template-columns: 1fr; gap: 9px; }.provider-option { min-height: 75px; padding: 13px 15px; gap: 15px; }.provider-option>span:not(.provider-logo) { font-size: 15px; }.provider-option small { font-size: 15px; }.dialog-import { align-items: flex-start; flex-direction: column; } }
