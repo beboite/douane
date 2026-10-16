@@ -51,6 +51,10 @@ cd douane-<version>-linux-x64 && ./douane --config douane.toml
 
 On Windows, unzip the archive and run `douane.exe --config douane.toml` from that folder. The executables are not signed: Windows SmartScreen asks for confirmation on first launch, and macOS needs `xattr -d com.apple.quarantine douane douanectl` after a browser download.
 
+### Douane in Boite
+
+[Boite](https://github.com/beboite/boite) installs Douane from **Settings > Plugins**: it downloads the executable for its platform from the release named in [`boite-plugin.json`](boite-plugin.json), checks its SHA-256 and runs it on `127.0.0.1`. Douane's accounts, database and configuration live outside the plugin folder, so uninstalling or updating the plugin keeps the accounts. Each release opens a pull request that moves `boite-plugin.json` to the new executables; Boite offers that version once it is merged.
+
 ### Docker
 
 Images for `linux/amd64` and `linux/arm64` are on GitHub Container Registry: `latest` is the last release, `edge` follows `main`.

@@ -2,7 +2,8 @@ name: Executables
 
 # Builds douane and douanectl for every platform, starts each native build
 # once, then assembles the release assets: one raw douane executable per
-# platform, one archive per platform, VERSION, manifest.json and SHA256SUMS.
+# platform, one archive per platform, VERSION, manifest.json and SHA256SUMS,
+# plus the boite-plugin.json that points Boite at those executables.
 # The release workflow publishes the `release-assets` artifact; a pull request
 # only builds it.
 on:
@@ -186,9 +187,23 @@ jobs:
           test "${#files[@]}" -eq 12
           sha256sum "${files[@]}" > SHA256SUMS
           cat VERSION manifest.json SHA256SUMS
+      # Boite's plugin manifest for these executables, checked against Boite's
+      # rules. The release opens a pull request with it; it is not an asset.
+      - name: Write boite-plugin.json
+        run: |
+          version=$(cat dist/VERSION)
+          mkdir -p plugin
+          python3 -I scripts/boite-plugin.py "$version" dist --output plugin/boite-plugin.json
+          cat plugin/boite-plugin.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-assets
           path: dist/
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: boite-plugin
+          path: plugin/
           if-no-files-found: error
           retention-days: 7
