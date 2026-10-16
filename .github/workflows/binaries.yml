@@ -1,0 +1,194 @@
+name: Executables
+
+# Builds douane and douanectl for every platform, starts each native build
+# once, then assembles the release assets: one raw douane executable per
+# platform, one archive per platform, VERSION, manifest.json and SHA256SUMS.
+# The release workflow publishes the `release-assets` artifact; a pull request
+# only builds it.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Executable (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux builds are static musl executables: no glibc version to match.
+          - platform: linux-x64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            run: true
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            run: true
+          - platform: macos-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            run: true
+          # Cross-built on Apple silicon; checked for its architecture only.
+          - platform: macos-x64
+            runner: macos-15
+            target: x86_64-apple-darwin
+            run: false
+          # MSVC with the C runtime linked in: no Visual C++ redistributable.
+          - platform: windows-x64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            run: true
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+      TARGET: ${{ matrix.target }}
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      # The embedded dashboard must be byte-identical on every platform.
+      - name: Keep line endings
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.90
+        run: |
+          rustup toolchain install 1.90.0 --profile minimal --target "$TARGET"
+          rustup default 1.90.0
+      - name: Install musl tools
+        if: startsWith(matrix.platform, 'linux-')
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build
+        env:
+          RUSTFLAGS: ${{ endsWith(matrix.target, '-msvc') && '-C target-feature=+crt-static' || '' }}
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --locked --target "$TARGET" -p douane -p douanectl
+      - name: Package
+        id: package
+        run: |
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          exe=''
+          [[ "$PLATFORM" == windows-* ]] && exe=.exe
+          built="target/$TARGET/release"
+          mkdir -p dist "stage/douane-$version-$PLATFORM"
+          cp "$built/douane$exe" "dist/douane-$PLATFORM$exe"
+          cp "$built/douane$exe" "$built/douanectl$exe" LICENSE README.md "stage/douane-$version-$PLATFORM/"
+          if [[ "$PLATFORM" == windows-* ]]; then
+            (cd stage && 7z a -tzip -bso0 "../dist/douane-$version-$PLATFORM.zip" "douane-$version-$PLATFORM")
+          else
+            tar -C stage -czf "dist/douane-$version-$PLATFORM.tar.gz" "douane-$version-$PLATFORM"
+          fi
+          echo "binary=dist/douane-$PLATFORM$exe" >> "$GITHUB_OUTPUT"
+          echo "ctl=$built/douanectl$exe" >> "$GITHUB_OUTPUT"
+          ls -l dist
+      - name: Check linkage
+        env:
+          BINARY: ${{ steps.package.outputs.binary }}
+        run: |
+          case "$PLATFORM" in
+            linux-*)
+              file "$BINARY"
+              file "$BINARY" | grep -Eq 'statically linked|static-pie linked'
+              ;;
+            macos-*)
+              lipo -info "$BINARY"
+              want=arm64
+              [[ "$PLATFORM" == macos-x64 ]] && want=x86_64
+              lipo -info "$BINARY" | grep -q "architecture: $want"
+              otool -l "$BINARY" | grep -A3 LC_BUILD_VERSION | grep -q 'minos 11.0'
+              ;;
+            windows-*)
+              # A static C runtime leaves no Visual C++ runtime import.
+              if grep -aqi 'vcruntime140' "$BINARY"; then
+                echo "douane.exe imports the Visual C++ runtime"
+                exit 1
+              fi
+              ;;
+          esac
+      - name: Start the executable
+        if: matrix.run
+        env:
+          BINARY: ${{ steps.package.outputs.binary }}
+          CTL: ${{ steps.package.outputs.ctl }}
+        run: |
+          "$BINARY" --version
+          "$CTL" --version
+          work=$(mktemp -d)
+          printf '[server]\nlisten = "127.0.0.1:18787"\nauth_dir = "auth"\ndatabase = "douane.sqlite"\n' > "$work/douane.toml"
+          "$BINARY" --config "$work/douane.toml" --check
+          "$BINARY" --config "$work/douane.toml" > "$work/log.txt" 2>&1 &
+          pid=$!
+          for _ in $(seq 1 30); do
+            if "$CTL" --url http://127.0.0.1:18787 health > "$work/health.json" 2>/dev/null; then break; fi
+            sleep 1
+          done
+          kill "$pid" || true
+          cat "$work/log.txt"
+          cat "$work/health.json"
+          grep -q '"status": "ok"' "$work/health.json"
+          # Relative paths resolve from the configuration's folder.
+          test -d "$work/auth"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: executable-${{ matrix.platform }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  assets:
+    name: Release assets
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: executable-*
+          path: dist
+          merge-multiple: true
+      - name: Write VERSION, manifest.json and SHA256SUMS
+        run: |
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          cd dist
+          printf '%s\n' "$version" > VERSION
+          VERSION="$version" python3 - <<'PY'
+          import hashlib, json, os
+          version = os.environ['VERSION']
+          platforms = {}
+          for platform in ('windows-x64', 'macos-arm64', 'macos-x64', 'linux-x64', 'linux-arm64'):
+              binary = f'douane-{platform}' + ('.exe' if platform.startswith('windows-') else '')
+              archive = f'douane-{version}-{platform}' + ('.zip' if platform.startswith('windows-') else '.tar.gz')
+              assert os.path.isfile(archive), archive
+              with open(binary, 'rb') as file:
+                  data = file.read()
+              platforms[platform] = {'binary': binary, 'checksum': hashlib.sha256(data).hexdigest(), 'size': len(data)}
+          with open('manifest.json', 'w') as file:
+              json.dump({'version': version, 'platforms': platforms}, file, indent=2)
+              file.write('\n')
+          PY
+          files=(douane-* VERSION manifest.json)
+          test "${#files[@]}" -eq 12
+          sha256sum "${files[@]}" > SHA256SUMS
+          cat VERSION manifest.json SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
