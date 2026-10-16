@@ -89,6 +89,7 @@ const resets = (id) => {
 };
 
 function api(method, path) {
+	if (method === 'POST' && path === '/restore') return { restored: 2, accounts: [], errors: [], settings: false };
 	if (method !== 'GET') return { ok: true };
 	const reset = path.match(/^\/accounts\/([^/]+)\/resets$/);
 	if (reset) return resets(decodeURIComponent(reset[1]));
@@ -100,6 +101,8 @@ function api(method, path) {
 		case '/models': return { models };
 		case '/calls': return { calls };
 		case '/settings': return settings;
+		// Sample records only: the shape of an export, with no real token.
+		case '/export': return { format: 'douane-export', version: 1, exported_at: new Date(now).toISOString(), settings, disabled_models: [], accounts: accounts.map(({ id, name, provider }) => ({ id, name, provider, access_token: 'sample' })) };
 		default: return null;
 	}
 }

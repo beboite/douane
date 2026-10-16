@@ -99,6 +99,16 @@
 			if (!result.imported) throw new Error(t('notice.nothingImported'));
 		},t('notice.imported'));
 	}
+	async function restoreBackup(bundle: unknown, applySettings: boolean) {
+		let restored = 0;
+		const done = await mutate('restore', async () => {
+			const result = await management.restore(bundle, applySettings);
+			restored = result.restored;
+			if (result.errors?.length) { await load(true); throw new Error(t('notice.partialRestore', { count: result.restored, errors: importErrors(result.errors) })); }
+		});
+		if (done) notice = t(restored === 1 ? 'notice.restored.one' : 'notice.restored.other', { count: restored });
+		return done;
+	}
 	onMount(() => { hashChange(); void load(); const timer = setInterval(() => { if (!document.hidden && !busy) void load(true); },15_000); return () => clearInterval(timer); });
 </script>
 
@@ -120,7 +130,7 @@
 			{#if loading && !summary}<div class="loading-state" role="status"><RefreshCw size={18} class="spinning"/><span>{t('page.loading')}</span></div>{/if}
 			{#if screen === 'quotas'}<QuotasView {accounts} {quotas} {providers} {busy} {refresh} {rename} {settings} {setQuotaDisplay} {setQuotaWindows} resetUpdated={() => load(true)} connect={() => connectOpen = true}/>
 			{:else if screen === 'accounts'}<AccountsView {accounts} {quotas} {busy} {rename} {setReserve} {updateEndpoint} connect={() => connectOpen = true} {importFiles} toggle={(account) => mutate('account',() => management.setAccountEnabled(account.id,!account.enabled),t(account.enabled ? 'notice.accountDisabled' : 'notice.accountEnabled'))} remove={(account) => mutate('account',() => management.deleteAccount(account.id),t('notice.accountDeleted'))}/>
-			{:else if screen === 'settings'}{#if settings}{#key JSON.stringify(settings)}<SettingsView {settings} {providers} {busy} save={(next) => mutate('settings',() => management.settingsSave(next),t('notice.settingsSaved'))}/>{/key}{:else}<div class="page-heading"><div><h1>{t('nav.settings')}</h1><p class="page-description">{t('page.settingsUnavailable')}</p></div></div><LanguageSetting/>{/if}
+			{:else if screen === 'settings'}{#if settings}{#key JSON.stringify(settings)}<SettingsView {settings} {providers} {busy} restore={restoreBackup} save={(next) => mutate('settings',() => management.settingsSave(next),t('notice.settingsSaved'))}/>{/key}{:else}<div class="page-heading"><div><h1>{t('nav.settings')}</h1><p class="page-description">{t('page.settingsUnavailable')}</p></div></div><LanguageSetting/>{/if}
 			{:else}{#key screen}<DataViews {screen} {summary} {calls} {models} {accounts} {busy} {navigate} toggleModel={(model) => mutate('model',() => management.setModelEnabled(model.id,model.enabled === false),t('notice.modelUpdated'))}/>{/key}{/if}
 		</main>
 	</div>
