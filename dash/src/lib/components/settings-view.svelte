@@ -3,15 +3,12 @@
 	import Save from '@lucide/svelte/icons/save';
 	import GitBranch from '@lucide/svelte/icons/git-branch';
 	import ProviderMark from './provider-mark.svelte';
-	import { type Settings, type Provider, type Strategy } from '$lib/management';
+	import LanguageSetting from './language-setting.svelte';
+	import { providerName, type Settings, type Provider, type Strategy } from '$lib/management';
+	import { t } from '$lib/i18n.svelte';
 	let { settings, providers, busy, save }: { settings: Settings; providers: Provider[]; busy: string; save: (settings: Settings) => Promise<boolean> } = $props();
 	let draft = $state<Settings>(untrack(() => ({ ...settings, provider_strategies: { ...settings.provider_strategies } })));
-	const strategies: { id: Strategy; label: string; desc: string }[] = [
-		{ id:'round-robin',label:'Rotation',desc:'Chaque compte actif reçoit les requêtes à tour de rôle.' },
-		{ id:'fill-first',label:'Épuiser un compte',desc:'Utilise le premier compte disponible avant de passer au suivant.' },
-		{ id:'reset-first',label:'Reset le plus proche',desc:'Utilise le compte dont le quota hebdomadaire se réinitialise en premier. Les autres servent seulement s’il est indisponible.' },
-		{ id:'smart',label:'Répartition intelligente',desc:'À moins de 48 h du reset, 90 % des nouvelles conversations utilisent ce compte jusqu’à épuisement.' }
-	];
+	const strategies: Strategy[] = ['round-robin', 'fill-first', 'reset-first', 'smart'];
 	// A routing choice saves on click with every visible edit; a refused save
 	// restores the routing in force, so a highlighted strategy is never a draft.
 	async function route(change: Partial<Settings>) {
@@ -22,14 +19,15 @@
 	function override(provider: string, strategy: string) { const next = { ...draft.provider_strategies }; if (strategy) next[provider] = strategy as Strategy; else delete next[provider]; route({ provider_strategies: next }); }
 </script>
 
-<div class="page-heading"><h1>Réglages</h1></div>
-<p class="session-note"><GitBranch size={18}/><span>Une conversation garde son compte tant qu'il reste disponible. Avec Reset le plus proche, elle revient au compte dont le reset est le plus proche dès qu'il est disponible.</span></p>
+<div class="page-heading"><h1>{t('nav.settings')}</h1></div>
+<p class="session-note"><GitBranch size={18}/><span>{t('settings.sessionNote')}</span></p>
 <form class="settings-form" onsubmit={(event) => { event.preventDefault(); save(draft); }}>
-	<section class="settings-section"><div><h2>Répartition des requêtes</h2><p>La règle par défaut s'applique aux fournisseurs sans choix particulier. Chaque choix est enregistré dès le clic.</p></div><div class="strategy-options">{#each strategies as strategy (strategy.id)}<label class="strategy-option" class:chosen={draft.strategy === strategy.id}><input type="radio" name="strategy" value={strategy.id} checked={draft.strategy === strategy.id} disabled={!!busy} onchange={() => route({ strategy: strategy.id })}/><span>{strategy.label}<small>{strategy.desc}</small></span></label>{/each}</div></section>
-	<section class="settings-section"><div><h2>Par fournisseur</h2><p>Adaptez la répartition à chacun de vos abonnements.</p></div><div class="settings-fields provider-fields">{#each providers as provider (provider.id)}<label><span class="provider-label"><ProviderMark provider={provider.id} size={22}/>{provider.name}</span><select value={draft.provider_strategies?.[provider.id] ?? ''} disabled={!!busy} onchange={(event) => override(provider.id,event.currentTarget.value)}><option value="">Règle par défaut</option>{#each strategies as strategy (strategy.id)}<option value={strategy.id}>{strategy.label}</option>{/each}</select></label>{/each}{#if !providers.length}<p class="muted small">Les fournisseurs apparaîtront lorsque le service sera connecté.</p>{/if}</div></section>
-	<section class="settings-section"><div><h2>Actualisation et délais</h2><p>Les quotas et la sélection des comptes sont recalculés après chaque actualisation.</p></div><div class="settings-fields"><label>Actualiser les quotas toutes les<span class="unit-field"><input type="number" min="30" max="86400" step="1" bind:value={draft.quota_refresh_seconds} required/><span>secondes</span></span></label><label>Délai maximal d'une requête<span class="unit-field"><input type="number" min="10" max="1800" step="1" bind:value={draft.request_timeout_seconds} required/><span>secondes</span></span></label><label>Fournisseur par défaut<select bind:value={draft.default_provider}><option value={null}>Sélection automatique</option>{#each providers as provider (provider.id)}<option value={provider.id}>{provider.name}</option>{/each}</select></label></div></section>
-	<div class="settings-footer"><button class="button primary" type="submit" disabled={!!busy}><Save size={14}/>{busy === 'settings' ? 'Enregistrement...' : 'Enregistrer les réglages'}</button></div>
+	<section class="settings-section"><div><h2>{t('settings.routing')}</h2><p>{t('settings.routingDescription')}</p></div><div class="strategy-options">{#each strategies as strategy (strategy)}<label class="strategy-option" class:chosen={draft.strategy === strategy}><input type="radio" name="strategy" value={strategy} checked={draft.strategy === strategy} disabled={!!busy} onchange={() => route({ strategy })}/><span>{t(`strategy.${strategy}.label`)}<small>{t(`strategy.${strategy}.desc`)}</small></span></label>{/each}</div></section>
+	<section class="settings-section"><div><h2>{t('settings.perProvider')}</h2><p>{t('settings.perProviderDescription')}</p></div><div class="settings-fields provider-fields">{#each providers as provider (provider.id)}<label><span class="provider-label"><ProviderMark provider={provider.id} size={22}/>{providerName(provider.id, provider.name)}</span><select value={draft.provider_strategies?.[provider.id] ?? ''} disabled={!!busy} onchange={(event) => override(provider.id,event.currentTarget.value)}><option value="">{t('settings.defaultRule')}</option>{#each strategies as strategy (strategy)}<option value={strategy}>{t(`strategy.${strategy}.label`)}</option>{/each}</select></label>{/each}{#if !providers.length}<p class="muted small">{t('settings.noProviders')}</p>{/if}</div></section>
+	<section class="settings-section"><div><h2>{t('settings.refresh')}</h2><p>{t('settings.refreshDescription')}</p></div><div class="settings-fields"><label>{t('settings.refreshEvery')}<span class="unit-field"><input type="number" min="30" max="86400" step="1" bind:value={draft.quota_refresh_seconds} required/><span>{t('settings.seconds')}</span></span></label><label>{t('settings.timeout')}<span class="unit-field"><input type="number" min="10" max="1800" step="1" bind:value={draft.request_timeout_seconds} required/><span>{t('settings.seconds')}</span></span></label><label>{t('settings.defaultProvider')}<select bind:value={draft.default_provider}><option value={null}>{t('settings.autoProvider')}</option>{#each providers as provider (provider.id)}<option value={provider.id}>{providerName(provider.id, provider.name)}</option>{/each}</select></label></div></section>
+	<div class="settings-footer"><button class="button primary" type="submit" disabled={!!busy}><Save size={14}/>{busy === 'settings' ? t('settings.saving') : t('settings.save')}</button></div>
 </form>
+<LanguageSetting/>
 
 <style>
 	.session-note { display: flex; align-items: flex-start; gap: 12px; font-size: 15px; color: var(--muted); line-height: 1.65; margin: 24px 0 0; padding: 16px 18px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); max-width: 1060px; }

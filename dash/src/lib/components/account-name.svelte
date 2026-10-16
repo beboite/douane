@@ -4,6 +4,7 @@
 	import Check from '@lucide/svelte/icons/check';
 	import X from '@lucide/svelte/icons/x';
 	import { privateLabel, type Account } from '$lib/management';
+	import { t } from '$lib/i18n.svelte';
 	let { account, rename, busy }: { account: Account; rename: (account: Account, name: string) => Promise<void>; busy: string } = $props();
 	let editing = $state(false);
 	let draft = $state('');
@@ -17,7 +18,7 @@
 	async function save() {
 		if (saving || busy) return;
 		const name = draft.trim();
-		if (!name || name.length > 120 || /[\x00-\x1f\x7f]/.test(name)) { failure = 'Saisissez un nom de 1 à 120 caractères.'; return; }
+		if (!name || name.length > 120 || /[\x00-\x1f\x7f]/.test(name)) { failure = t('name.invalid'); return; }
 		if (name === account.name) { editing = false; return; }
 		saving = true; failure = '';
 		try { await rename(account, name); editing = false; }
@@ -28,12 +29,12 @@
 
 {#if editing}
 	<form class="name-editor" onsubmit={(event) => { event.preventDefault(); void save(); }}>
-		<input bind:this={input} bind:value={draft} aria-label="Nouveau nom du compte" maxlength="120" required disabled={saving} onkeydown={(event) => { if (event.key === 'Escape' && !saving) editing = false; }}/>
-		<div class="name-actions"><button class="icon-button" type="submit" aria-label="Enregistrer le nom" title="Enregistrer" disabled={saving || !!busy}><Check size={20}/></button><button class="icon-button" type="button" aria-label="Annuler le renommage" title="Annuler" disabled={saving} onclick={() => editing = false}><X size={20}/></button></div>
+		<input bind:this={input} bind:value={draft} aria-label={t('name.input')} maxlength="120" required disabled={saving} onkeydown={(event) => { if (event.key === 'Escape' && !saving) editing = false; }}/>
+		<div class="name-actions"><button class="icon-button" type="submit" aria-label={t('name.save')} title={t('common.save')} disabled={saving || !!busy}><Check size={20}/></button><button class="icon-button" type="button" aria-label={t('name.cancel')} title={t('common.cancel')} disabled={saving} onclick={() => editing = false}><X size={20}/></button></div>
 		{#if failure}<p class="rename-error" role="alert">{failure}</p>{/if}
 	</form>
 {:else}
-	<button class="account-name" title="Renommer ce compte" disabled={!!busy} onclick={edit}><span>{privateLabel(account.name)}</span><Pencil size={15}/></button>
+	<button class="account-name" title={t('name.rename')} disabled={!!busy} onclick={edit}><span>{privateLabel(account.name)}</span><Pencil size={15}/></button>
 {/if}
 
 <style>

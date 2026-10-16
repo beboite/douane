@@ -1,11 +1,13 @@
 <script lang="ts">
-	let { value, label = 'Quota restant', compact = false }: { value: number | null; label?: string; compact?: boolean } = $props();
+	import { t } from '$lib/i18n.svelte';
+	let { value, label, compact = false }: { value: number | null; label?: string; compact?: boolean } = $props();
+	let text = $derived(label ?? t('meter.left'));
 	let percent = $derived(value == null ? null : Math.min(100, Math.max(0, value)));
 </script>
 
 <div class="quota-meter" class:compact>
-	<div class="meter-label"><span>{label}</span><span class="tabular">{percent == null ? 'Indisponible' : `${Math.round(percent)} %`}</span></div>
-	<div class="meter-track" role="meter" aria-label={label} aria-valuenow={percent ?? undefined} aria-valuemin="0" aria-valuemax="100" aria-valuetext={percent == null ? 'Indisponible' : `${Math.round(percent)} % restants`}>
+	<div class="meter-label"><span>{text}</span><span class="tabular">{percent == null ? t('meter.unavailable') : t('common.percent', { value: Math.round(percent) })}</span></div>
+	<div class="meter-track" role="meter" aria-label={text} aria-valuenow={percent ?? undefined} aria-valuemin="0" aria-valuemax="100" aria-valuetext={percent == null ? t('meter.unavailable') : t('meter.valueLeft', { value: Math.round(percent) })}>
 		{#if percent != null}<div class="meter-fill" class:low={percent < 25} class:medium={percent >= 25 && percent < 60} style:width="{percent}%"></div>{/if}
 	</div>
 </div>

@@ -3,7 +3,8 @@
 	import ShieldCheck from '@lucide/svelte/icons/shield-check';
 	import Check from '@lucide/svelte/icons/check';
 	import X from '@lucide/svelte/icons/x';
-	import { reserveWindow, reserveWindows, type Account, type Quota, type ReserveWindow } from '$lib/management';
+	import { formatDecimal, reserveWindow, reserveWindowLabel, reserveWindows, type Account, type Quota, type ReserveWindow } from '$lib/management';
+	import { t } from '$lib/i18n.svelte';
 	let { account, quota, busy, save }: { account: Account; quota?: Quota; busy: string; save: (account: Account, reserve: number | null, windows: ReserveWindow[]) => Promise<boolean> } = $props();
 	let editing = $state(false);
 	let draft = $state('');
@@ -14,9 +15,8 @@
 	let reserve = $derived(account.reserve_percent ?? null);
 	let watched = $derived(account.reserve_windows ?? []);
 	// Only the windows this account reports, plus any already watched.
-	let offered = $derived(reserveWindows.filter(({ id }) => watched.includes(id) || quota?.windows.some(window => window.remaining_percent != null && reserveWindow(window.id) === id)));
-	let watchedLabel = $derived(reserveWindows.filter(({ id }) => watched.includes(id)).map(({ label }) => label).join(' + '));
-	const percent = (value: number) => new Intl.NumberFormat('fr-FR', { maximumFractionDigits: 1 }).format(value);
+	let offered = $derived(reserveWindows.filter(id => watched.includes(id) || quota?.windows.some(window => window.remaining_percent != null && reserveWindow(window.id) === id)));
+	let watchedLabel = $derived(reserveWindows.filter(id => watched.includes(id)).map(reserveWindowLabel).join(' + '));
 	async function edit() {
 		draft = reserve == null ? '' : String(reserve); chosen = [...watched]; failure = ''; editing = true;
 		await tick(); input?.focus(); input?.select();
@@ -26,35 +26,35 @@
 		if (saving || busy) return;
 		if (next === reserve && windows.length === watched.length && windows.every(id => watched.includes(id))) { editing = false; return; }
 		saving = true; failure = '';
-		try { if (await save(account, next, windows)) editing = false; else failure = "La réserve n'a pas été enregistrée."; }
+		try { if (await save(account, next, windows)) editing = false; else failure = t('reserve.notSaved'); }
 		finally { saving = false; }
 	}
 	function confirm() {
 		const text = draft.trim().replace(',', '.');
 		if (!text) return submit(null, []);
 		const value = Number(text);
-		if (!/^\d+(\.\d+)?$/.test(text) || value >= 100) { failure = 'Saisissez un pourcentage entre 0 et 99.'; return; }
+		if (!/^\d+(\.\d+)?$/.test(text) || value >= 100) { failure = t('reserve.invalid'); return; }
 		return value === 0 ? submit(null, []) : submit(value, chosen);
 	}
 </script>
 
 {#if editing}
 	<form class="reserve-editor" onsubmit={(event) => { event.preventDefault(); void confirm(); }}>
-		<label><span>Garder au moins</span><input bind:this={input} bind:value={draft} type="text" inputmode="decimal" placeholder="5" aria-label="Réserve minimale en pourcentage" disabled={saving} onkeydown={(event) => { if (event.key === 'Escape' && !saving) editing = false; }}/><span>%</span></label>
-		<div class="reserve-actions"><button class="icon-button" type="submit" aria-label="Enregistrer la réserve" title="Enregistrer" disabled={saving || !!busy}><Check size={20}/></button><button class="icon-button" type="button" aria-label="Annuler" title="Annuler" disabled={saving} onclick={() => editing = false}><X size={20}/></button></div>
+		<label><span>{t('reserve.keepAtLeast')}</span><input bind:this={input} bind:value={draft} type="text" inputmode="decimal" placeholder="5" aria-label={t('reserve.input')} disabled={saving} onkeydown={(event) => { if (event.key === 'Escape' && !saving) editing = false; }}/><span>%</span></label>
+		<div class="reserve-actions"><button class="icon-button" type="submit" aria-label={t('reserve.save')} title={t('common.save')} disabled={saving || !!busy}><Check size={20}/></button><button class="icon-button" type="button" aria-label={t('common.cancel')} title={t('common.cancel')} disabled={saving} onclick={() => editing = false}><X size={20}/></button></div>
 		{#if offered.length > 1}
-			<div class="reserve-windows" role="group" aria-label="Limites surveillées">
-				<button type="button" class="chip" class:on={!chosen.length} aria-pressed={!chosen.length} title="La limite la plus longue du compte (mois ou semaine)" disabled={saving} onclick={() => chosen = []}>Plus longue</button>
-				{#each offered as option (option.id)}<button type="button" class="chip" class:on={chosen.includes(option.id)} aria-pressed={chosen.includes(option.id)} disabled={saving} onclick={() => toggle(option.id)}>{option.label}</button>{/each}
+			<div class="reserve-windows" role="group" aria-label={t('reserve.watched')}>
+				<button type="button" class="chip" class:on={!chosen.length} aria-pressed={!chosen.length} title={t('reserve.longestTitle')} disabled={saving} onclick={() => chosen = []}>{t('reserve.longest')}</button>
+				{#each offered as option (option)}<button type="button" class="chip" class:on={chosen.includes(option)} aria-pressed={chosen.includes(option)} disabled={saving} onclick={() => toggle(option)}>{reserveWindowLabel(option)}</button>{/each}
 			</div>
 		{/if}
-		{#if reserve != null}<button class="link-button" type="button" disabled={saving || !!busy} onclick={() => submit(null, [])}>Retirer la réserve</button>{/if}
+		{#if reserve != null}<button class="link-button" type="button" disabled={saving || !!busy} onclick={() => submit(null, [])}>{t('reserve.remove')}</button>{/if}
 		{#if failure}<p class="reserve-error" role="alert">{failure}</p>{/if}
 	</form>
 {:else}
-	<button class="reserve" class:set={reserve != null} disabled={!!busy} onclick={edit} title={watched.length ? `Douane cesse d'utiliser ce compte quand une de ces limites atteint ce seuil : ${watchedLabel}` : "Douane cesse d'utiliser ce compte quand son quota le plus long (mois ou semaine) atteint ce seuil"}><ShieldCheck size={16}/>{reserve == null ? 'Ajouter une réserve' : `Réserve ${percent(reserve)} %${watched.length ? ` · ${watchedLabel}` : ''}`}</button>
-	{#if reserve != null && account.enabled && account.reserve_reached}<p class="reserve-note reached">Réserve atteinte : douane n'utilise plus ce compte jusqu'à la réinitialisation.</p>
-	{:else if reserve != null && account.reserve_measured === false}<p class="reserve-note">{watched.length ? 'Inactive : ce compte ne communique pas ces limites.' : "Inactive : ce fournisseur ne communique pas de quota pour l'ensemble du compte."}</p>{/if}
+	<button class="reserve" class:set={reserve != null} disabled={!!busy} onclick={edit} title={watched.length ? t('reserve.titleWatched', { windows: watchedLabel }) : t('reserve.titleLongest')}><ShieldCheck size={16}/>{reserve == null ? t('reserve.add') : `${t('reserve.label', { percent: formatDecimal(reserve) })}${watched.length ? ` · ${watchedLabel}` : ''}`}</button>
+	{#if reserve != null && account.enabled && account.reserve_reached}<p class="reserve-note reached">{t('reserve.reached')}</p>
+	{:else if reserve != null && account.reserve_measured === false}<p class="reserve-note">{t(watched.length ? 'reserve.inactiveWindows' : 'reserve.inactiveAccount')}</p>{/if}
 {/if}
 
 <style>
