@@ -55,9 +55,15 @@ async fn main() -> Result<()> {
     let poller = state.clone();
     let task = tokio::spawn(async move {
         // Each account keeps its own schedule: the refresh interval when its
-        // reads succeed, a widening retry delay when they fail.
+        // reads succeed, a widening retry delay when they fail. Snapshots are
+        // saved every 5 minutes and at shutdown.
+        let mut pass = 0u64;
         loop {
+            pass += 1;
             poller.refresh_due_quotas().await;
+            if pass.is_multiple_of(20) {
+                poller.quotas.save().await;
+            }
             tokio::time::sleep(Duration::from_secs(15)).await;
         }
     });
@@ -69,6 +75,7 @@ async fn main() -> Result<()> {
         .with_graceful_shutdown(shutdown())
         .await?;
     task.abort();
+    state.quotas.save().await;
     state.ledger.flush().await;
     Ok(())
 }

@@ -446,6 +446,10 @@ impl AccountStore {
         self.directory.join(".quota-resets")
     }
 
+    pub(crate) fn quota_snapshot_path(&self) -> PathBuf {
+        self.directory.join(".quota-snapshots")
+    }
+
     pub async fn import(
         &self,
         value: Value,
