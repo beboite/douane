@@ -200,6 +200,8 @@ pub enum Trigger {
 
 /// Consecutive failed reads before a transient error reaches the snapshot.
 pub const FAILURES_SHOWN: u32 = 5;
+/// Age under which a 429 on a quota read stays quiet, by hand too.
+const RATE_LIMITED_FRESH: time::Duration = time::Duration::minutes(15);
 const RETRY_FIRST_SECONDS: i64 = 30;
 const RETRY_MAX_SECONDS: i64 = 30 * 60;
 
@@ -311,6 +313,55 @@ impl QuotaService {
         Some(self.refresh_with(id, Trigger::Background).await)
     }
 
+    /// Claude answers every inference call with its five-hour and weekly
+    /// usage. Those headers keep both windows current between usage reads,
+    /// and the poller waits a full interval after them, so an account in use
+    /// rarely needs the usage endpoint Anthropic can refuse with 429.
+    pub async fn observe_claude_headers(
+        &self,
+        account: &AccountCredential,
+        headers: &reqwest::header::HeaderMap,
+    ) {
+        if account.provider != SubscriptionProvider::Claude {
+            return;
+        }
+        let windows = claude_header_windows(headers);
+        if windows.is_empty() {
+            return;
+        }
+        {
+            let mut cache = self.cache.write().await;
+            let snapshot = cache
+                .entry(account.id.clone())
+                .or_insert_with(|| QuotaSnapshot {
+                    account_id: account.id.clone(),
+                    provider: account.provider,
+                    windows: Vec::new(),
+                    updated_at: now(),
+                    error: None,
+                    subscription: account.summary().subscription,
+                    credits: Vec::new(),
+                    verification_required: false,
+                    verification_available: false,
+                });
+            for (position, window) in windows.into_iter().enumerate() {
+                match snapshot.windows.iter_mut().find(|w| w.id == window.id) {
+                    Some(existing) => {
+                        existing.remaining_percent = window.remaining_percent;
+                        existing.used = window.used;
+                        existing.reset_at = window.reset_at;
+                    }
+                    None => snapshot
+                        .windows
+                        .insert(position.min(snapshot.windows.len()), window),
+                }
+            }
+            snapshot.updated_at = now();
+            snapshot.error = None;
+        }
+        self.failures.write().await.remove(&account.id);
+    }
+
     /// Accounts the poller should read now: a failing one once its retry
     /// delay has passed, a healthy one once its snapshot is `interval` old.
     /// Retry state of deleted accounts goes.
@@ -413,11 +464,20 @@ impl QuotaService {
                     entry.retry_at = observed + retry_delay(entry.count);
                     entry.count
                 };
+                // Anthropic can answer usage reads with 429 for days while the
+                // account serves traffic; numbers its inference headers keep
+                // fresh are no failure to show.
+                let fresh = previous
+                    .as_ref()
+                    .and_then(|v| parse_timestamp(&v.updated_at))
+                    .is_some_and(|at| observed - at <= RATE_LIMITED_FRESH);
+                let quiet = fresh && matches!(error, SubscriptionError::Upstream(429));
                 // A shown error stays until a read succeeds.
-                let shown = trigger == Trigger::Manual
-                    || !error.is_transient()
-                    || count >= FAILURES_SHOWN
-                    || previous.as_ref().is_some_and(|v| v.error.is_some());
+                let shown = previous.as_ref().is_some_and(|v| v.error.is_some())
+                    || (!quiet
+                        && (trigger == Trigger::Manual
+                            || !error.is_transient()
+                            || count >= FAILURES_SHOWN));
                 if !shown {
                     tracing::debug!(account = id, count, "quota read failed, retrying quietly");
                 }
@@ -1087,6 +1147,39 @@ fn parse_claude(value: &Value, observed: time::OffsetDateTime) -> Vec<QuotaWindo
     windows
 }
 
+/// The five-hour and weekly windows of Claude's unified rate-limit headers:
+/// utilization is a fraction, resets are Unix seconds.
+fn claude_header_windows(headers: &reqwest::header::HeaderMap) -> Vec<QuotaWindow> {
+    let number = |name: String| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+    };
+    [
+        ("5h", "five-hour", "5 hours"),
+        ("7d", "seven-day", "Weekly"),
+    ]
+    .into_iter()
+    .filter_map(|(key, id, label)| {
+        let fraction = number(format!("anthropic-ratelimit-unified-{key}-utilization"))?;
+        let used = (fraction * 10_000.0).round() / 100.0;
+        let reset_at = number(format!("anthropic-ratelimit-unified-{key}-reset"))
+            .and_then(|seconds| time::OffsetDateTime::from_unix_timestamp(seconds as i64).ok())
+            .map(timestamp);
+        Some(QuotaWindow {
+            id: id.into(),
+            label: label.into(),
+            remaining_percent: remaining(Some(used)),
+            reset_at,
+            used: Some(used),
+            limit: Some(100.0),
+        })
+    })
+    .collect()
+}
+
 fn parse_xai(value: &Value, observed: time::OffsetDateTime) -> Vec<QuotaWindow> {
     let Some(config) = value.get("config") else {
         return Vec::new();
@@ -1656,9 +1749,17 @@ mod tests {
             organization_id: None,
         };
         let limited = || Err(SubscriptionError::Upstream(429));
-        let message = "upstream authentication or quota request failed (HTTP 429)";
+        let message =
+            "provider is rate-limiting this account's quota reads (HTTP 429); retry later";
         let interval = time::Duration::minutes(5);
         let second = time::Duration::seconds(1);
+        // Numbers older than the quiet window for a rate-limited read.
+        let age = || async {
+            let mut stale = service.get(id).await.unwrap();
+            stale.updated_at =
+                timestamp(time::OffsetDateTime::now_utc() - time::Duration::minutes(20));
+            service.insert_for_test(stale).await;
+        };
 
         service
             .complete_refresh(id, &account, Ok(observation()), Trigger::Background)
@@ -1687,6 +1788,13 @@ mod tests {
             assert_eq!(service.due(interval, now + delay + second).await, [id]);
             assert!(service.refresh_background(id).await.is_none());
         }
+        // Fresh numbers keep even the fifth 429 quiet; stale ones do not.
+        let fresh = service
+            .complete_refresh(id, &account, limited(), Trigger::Background)
+            .await
+            .unwrap();
+        assert!(fresh.error.is_none());
+        age().await;
         let shown = service
             .complete_refresh(id, &account, limited(), Trigger::Background)
             .await
@@ -1708,7 +1816,28 @@ mod tests {
         let now = time::OffsetDateTime::now_utc();
         assert!(service.due(interval, now).await.is_empty());
 
-        // A read asked by hand reports its first failure.
+        // A read asked by hand reports its first failure, except a 429 while
+        // the numbers are fresh.
+        let quiet = service
+            .complete_refresh(id, &account, limited(), Trigger::Manual)
+            .await
+            .unwrap();
+        assert!(quiet.error.is_none());
+        let outage = service
+            .complete_refresh(
+                id,
+                &account,
+                Err(SubscriptionError::Upstream(503)),
+                Trigger::Manual,
+            )
+            .await
+            .unwrap();
+        assert!(outage.error.is_some());
+        service
+            .complete_refresh(id, &account, Ok(observation()), Trigger::Background)
+            .await
+            .unwrap();
+        age().await;
         let manual = service
             .complete_refresh(id, &account, limited(), Trigger::Manual)
             .await
@@ -1735,6 +1864,108 @@ mod tests {
         store.delete(id).await.unwrap();
         assert!(service.due(interval, now + interval).await.is_empty());
         assert!(service.failures.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn claude_inference_headers_refresh_windows_and_end_a_failure_streak() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(AccountStore::open(directory.path()).unwrap());
+        let summary = store
+            .import(json!({"type":"claude","access_token":"fixture"}), None)
+            .await
+            .unwrap();
+        let account = store.get(&summary.id).await.unwrap();
+        let service = QuotaService::new(reqwest::Client::new(), store.clone());
+        let id = summary.id.as_str();
+        let header = |pairs: &[(&'static str, &str)]| {
+            let mut map = reqwest::header::HeaderMap::new();
+            for (name, value) in pairs {
+                map.insert(*name, value.parse().unwrap());
+            }
+            map
+        };
+        // No unified headers, as on count_tokens: nothing is recorded.
+        service.observe_claude_headers(&account, &header(&[])).await;
+        assert!(service.get(id).await.is_none());
+
+        let usage = Observation {
+            windows: parse_claude(
+                &json!({
+                    "five_hour": {"utilization": 10, "resets_at": "2030-10-03T16:00:00Z"},
+                    "seven_day": {"utilization": 50, "resets_at": "2030-10-07T23:00:00Z"},
+                    "seven_day_opus": {"utilization": 20, "resets_at": "2030-10-07T23:00:00Z"}
+                }),
+                observed(),
+            ),
+            plan: None,
+            subscription: None,
+            credits: Vec::new(),
+            organization_id: None,
+        };
+        service
+            .complete_refresh(id, &account, Ok(usage), Trigger::Background)
+            .await
+            .unwrap();
+        let mut aged = service.get(id).await.unwrap();
+        aged.updated_at = timestamp(time::OffsetDateTime::now_utc() - time::Duration::hours(1));
+        aged.error = Some("old".into());
+        service.insert_for_test(aged).await;
+        service
+            .complete_refresh(
+                id,
+                &account,
+                Err(SubscriptionError::Upstream(429)),
+                Trigger::Background,
+            )
+            .await
+            .unwrap();
+        assert!(!service.failures.read().await.is_empty());
+
+        service
+            .observe_claude_headers(
+                &account,
+                &header(&[
+                    ("anthropic-ratelimit-unified-5h-utilization", "0.0"),
+                    ("anthropic-ratelimit-unified-5h-reset", "1792263000"),
+                    ("anthropic-ratelimit-unified-7d-utilization", "0.97"),
+                    ("anthropic-ratelimit-unified-7d-reset", "1792537200"),
+                ]),
+            )
+            .await;
+        let snapshot = service.get(id).await.unwrap();
+        assert!(snapshot.error.is_none());
+        let window = |id: &str| snapshot.windows.iter().find(|w| w.id == id).unwrap();
+        assert_eq!(window("five-hour").remaining_percent, Some(100.0));
+        assert_eq!(window("seven-day").used, Some(97.0));
+        assert_eq!(window("seven-day").remaining_percent, Some(3.0));
+        assert_eq!(
+            window("seven-day").reset_at.as_deref(),
+            Some("2026-10-20T23:00:00Z")
+        );
+        // Windows the headers do not carry keep the usage read's numbers.
+        assert_eq!(window("seven-day-opus").used, Some(20.0));
+        // The streak ends and the poller waits a full interval again.
+        assert!(service.failures.read().await.is_empty());
+        let now = time::OffsetDateTime::now_utc();
+        assert!(
+            service
+                .due(time::Duration::minutes(5), now)
+                .await
+                .is_empty()
+        );
+        // Other providers are left alone.
+        let codex = store
+            .import(json!({"type":"codex","access_token":"fixture"}), None)
+            .await
+            .unwrap();
+        let codex = store.get(&codex.id).await.unwrap();
+        service
+            .observe_claude_headers(
+                &codex,
+                &header(&[("anthropic-ratelimit-unified-7d-utilization", "0.5")]),
+            )
+            .await;
+        assert!(service.get(&codex.id).await.is_none());
     }
 
     #[test]
