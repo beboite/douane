@@ -631,6 +631,10 @@ pub async fn forward(
         };
         last_status = response.status();
         call.call.status = last_status.as_u16();
+        state
+            .quotas
+            .observe_claude_headers(&account, response.headers())
+            .await;
         let passed = if native {
             passthrough_headers(response.headers())
         } else {

@@ -42,7 +42,7 @@ pub enum SubscriptionError {
     Unsupported,
     #[error("authentication storage failed")]
     Storage,
-    #[error("upstream authentication or quota request failed (HTTP {0})")]
+    #[error("{}", upstream_message(.0))]
     Upstream(u16),
     #[error("Google account verification is required; complete verification and retry")]
     VerificationRequired(GoogleVerification),
@@ -74,6 +74,16 @@ pub enum SubscriptionError {
     InvalidReserveWindows,
     #[error("{0}")]
     InvalidEndpoint(&'static str),
+}
+
+/// A 429 is the provider throttling this account's reads, not a login fault.
+fn upstream_message(status: &u16) -> String {
+    match status {
+        429 => {
+            "provider is rate-limiting this account's quota reads (HTTP 429); retry later".into()
+        }
+        status => format!("upstream authentication or quota request failed (HTTP {status})"),
+    }
 }
 
 impl SubscriptionError {
