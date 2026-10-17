@@ -635,6 +635,9 @@ pub async fn forward(
             .quotas
             .observe_claude_headers(&account, response.headers())
             .await;
+        if last_status.is_success() {
+            state.accounts.clear_stale_error(&account.id).await;
+        }
         let passed = if native {
             passthrough_headers(response.headers())
         } else {
