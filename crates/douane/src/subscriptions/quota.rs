@@ -200,8 +200,6 @@ pub enum Trigger {
 
 /// Consecutive failed reads before a transient error reaches the snapshot.
 pub const FAILURES_SHOWN: u32 = 5;
-/// Age under which a 429 on a quota read stays quiet, by hand too.
-const RATE_LIMITED_FRESH: time::Duration = time::Duration::minutes(15);
 const RETRY_FIRST_SECONDS: i64 = 30;
 const RETRY_MAX_SECONDS: i64 = 30 * 60;
 
@@ -240,14 +238,30 @@ impl QuotaService {
         store: Arc<AccountStore>,
         oauth: Arc<OAuthManager>,
     ) -> Self {
+        let cache = load_snapshots(&store.quota_snapshot_path());
         Self {
             client,
             store,
             oauth,
-            cache: RwLock::new(BTreeMap::new()),
+            cache: RwLock::new(cache),
             verification_urls: RwLock::new(BTreeMap::new()),
             failures: RwLock::new(BTreeMap::new()),
             copilot_user_url: "https://api.github.com/copilot_internal/user".into(),
+        }
+    }
+
+    /// Writes the snapshots next to the accounts, so the last numbers outlive
+    /// a restart: a provider refusing quota reads still has something to show.
+    pub async fn save(&self) {
+        let path = self.store.quota_snapshot_path();
+        let Ok(bytes) = serde_json::to_vec(&*self.cache.read().await) else {
+            return;
+        };
+        if let Err(error) = tokio::task::spawn_blocking(move || write_private(&path, &bytes))
+            .await
+            .unwrap_or_else(|_| Err(std::io::Error::other("save task failed")))
+        {
+            tracing::warn!(%error, "quota snapshots were not saved");
         }
     }
 
@@ -464,14 +478,12 @@ impl QuotaService {
                     entry.retry_at = observed + retry_delay(entry.count);
                     entry.count
                 };
-                // Anthropic can answer usage reads with 429 for days while the
-                // account serves traffic; numbers its inference headers keep
-                // fresh are no failure to show.
-                let fresh = previous
-                    .as_ref()
-                    .and_then(|v| parse_timestamp(&v.updated_at))
-                    .is_some_and(|at| observed - at <= RATE_LIMITED_FRESH);
-                let quiet = fresh && matches!(error, SubscriptionError::Upstream(429));
+                // Anthropic can answer usage reads with 429 for days. The last
+                // numbers stand, dated by their observation: inference headers
+                // renew them while the account serves, and an idle account
+                // spends nothing. Only an account with no numbers shows it.
+                let quiet = matches!(error, SubscriptionError::Upstream(429))
+                    && previous.as_ref().is_some_and(|v| !v.windows.is_empty());
                 // A shown error stays until a read succeeds.
                 let shown = previous.as_ref().is_some_and(|v| v.error.is_some())
                     || (!quiet
@@ -1147,6 +1159,38 @@ fn parse_claude(value: &Value, observed: time::OffsetDateTime) -> Vec<QuotaWindo
     windows
 }
 
+/// Snapshots a previous run saved; none when the file is missing or unreadable.
+fn load_snapshots(path: &std::path::Path) -> BTreeMap<String, QuotaSnapshot> {
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return BTreeMap::new();
+    }
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Replaces `path` atomically with an owner-only file.
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(std::io::Error::other("refusing a symlinked snapshot file"));
+    }
+    let temporary = path.with_extension("tmp");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&temporary, path)
+}
+
 /// The five-hour and weekly windows of Claude's unified rate-limit headers:
 /// utilization is a fraction, resets are Unix seconds.
 fn claude_header_windows(headers: &reqwest::header::HeaderMap) -> Vec<QuotaWindow> {
@@ -1751,14 +1795,15 @@ mod tests {
         let limited = || Err(SubscriptionError::Upstream(429));
         let message =
             "provider is rate-limiting this account's quota reads (HTTP 429); retry later";
+        let outage = || Err(SubscriptionError::Upstream(503));
+        let shown_outage = "upstream authentication or quota request failed (HTTP 503)";
         let interval = time::Duration::minutes(5);
         let second = time::Duration::seconds(1);
-        // Numbers older than the quiet window for a rate-limited read.
-        let age = || async {
-            let mut stale = service.get(id).await.unwrap();
-            stale.updated_at =
-                timestamp(time::OffsetDateTime::now_utc() - time::Duration::minutes(20));
-            service.insert_for_test(stale).await;
+        // An account with no numbers at all.
+        let forget = || async {
+            let mut empty = service.get(id).await.unwrap();
+            empty.windows.clear();
+            service.insert_for_test(empty).await;
         };
 
         service
@@ -1771,7 +1816,7 @@ mod tests {
 
         for count in 1..FAILURES_SHOWN {
             let quiet = service
-                .complete_refresh(id, &account, limited(), Trigger::Background)
+                .complete_refresh(id, &account, outage(), Trigger::Background)
                 .await
                 .unwrap();
             assert!(quiet.error.is_none(), "failure {count}");
@@ -1788,23 +1833,16 @@ mod tests {
             assert_eq!(service.due(interval, now + delay + second).await, [id]);
             assert!(service.refresh_background(id).await.is_none());
         }
-        // Fresh numbers keep even the fifth 429 quiet; stale ones do not.
-        let fresh = service
-            .complete_refresh(id, &account, limited(), Trigger::Background)
-            .await
-            .unwrap();
-        assert!(fresh.error.is_none());
-        age().await;
         let shown = service
-            .complete_refresh(id, &account, limited(), Trigger::Background)
+            .complete_refresh(id, &account, outage(), Trigger::Background)
             .await
             .unwrap();
-        assert_eq!(shown.error.as_deref(), Some(message));
+        assert_eq!(shown.error.as_deref(), Some(shown_outage));
         let sticky = service
-            .complete_refresh(id, &account, limited(), Trigger::Background)
+            .complete_refresh(id, &account, outage(), Trigger::Background)
             .await
             .unwrap();
-        assert_eq!(sticky.error.as_deref(), Some(message));
+        assert_eq!(sticky.error.as_deref(), Some(shown_outage));
 
         // One good read removes the error and the retry schedule at once.
         let recovered = service
@@ -1816,28 +1854,32 @@ mod tests {
         let now = time::OffsetDateTime::now_utc();
         assert!(service.due(interval, now).await.is_empty());
 
-        // A read asked by hand reports its first failure, except a 429 while
-        // the numbers are fresh.
-        let quiet = service
-            .complete_refresh(id, &account, limited(), Trigger::Manual)
+        // A 429 never hides real numbers, by hand or past the fifth failure,
+        // yet it still backs off.
+        for trigger in [Trigger::Manual; 3]
+            .into_iter()
+            .chain([Trigger::Background; 4])
+        {
+            let quiet = service
+                .complete_refresh(id, &account, limited(), trigger)
+                .await
+                .unwrap();
+            assert!(quiet.error.is_none());
+            assert_eq!(quiet.windows[0].remaining_percent, Some(30.0));
+        }
+        assert!(service.refresh_background(id).await.is_none());
+        // A read asked by hand reports any other first failure.
+        let manual_outage = service
+            .complete_refresh(id, &account, outage(), Trigger::Manual)
             .await
             .unwrap();
-        assert!(quiet.error.is_none());
-        let outage = service
-            .complete_refresh(
-                id,
-                &account,
-                Err(SubscriptionError::Upstream(503)),
-                Trigger::Manual,
-            )
-            .await
-            .unwrap();
-        assert!(outage.error.is_some());
+        assert_eq!(manual_outage.error.as_deref(), Some(shown_outage));
         service
             .complete_refresh(id, &account, Ok(observation()), Trigger::Background)
             .await
             .unwrap();
-        age().await;
+        // With no numbers to show, the 429 is the answer.
+        forget().await;
         let manual = service
             .complete_refresh(id, &account, limited(), Trigger::Manual)
             .await
@@ -1864,6 +1906,43 @@ mod tests {
         store.delete(id).await.unwrap();
         assert!(service.due(interval, now + interval).await.is_empty());
         assert!(service.failures.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn snapshots_outlive_a_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(AccountStore::open(directory.path()).unwrap());
+        let summary = store
+            .import(json!({"type":"claude","access_token":"fixture"}), None)
+            .await
+            .unwrap();
+        let account = store.get(&summary.id).await.unwrap();
+        let service = QuotaService::new(reqwest::Client::new(), store.clone());
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-unified-7d-utilization",
+            "0.97".parse().unwrap(),
+        );
+        service.observe_claude_headers(&account, &headers).await;
+        service.save().await;
+        // The account file scan skips the snapshot file.
+        let reopened = Arc::new(AccountStore::open(directory.path()).unwrap());
+        assert_eq!(reopened.list().await.len(), 1);
+        let restarted = QuotaService::new(reqwest::Client::new(), reopened);
+        let snapshot = restarted.get(&summary.id).await.unwrap();
+        assert_eq!(snapshot.windows[0].used, Some(97.0));
+        // A 429 after the restart keeps those numbers and shows nothing.
+        let limited = restarted
+            .complete_refresh(
+                &summary.id,
+                &account,
+                Err(SubscriptionError::Upstream(429)),
+                Trigger::Manual,
+            )
+            .await
+            .unwrap();
+        assert!(limited.error.is_none());
+        assert_eq!(limited.windows[0].used, Some(97.0));
     }
 
     #[tokio::test]
