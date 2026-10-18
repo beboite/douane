@@ -768,6 +768,31 @@ impl AccountStore {
         self.mark_cooldown(id, seconds, reason).await
     }
 
+    /// A successful upstream response proves the account serves again: the
+    /// reason an expired cooldown or an earlier refusal left behind goes,
+    /// while an active cooldown keeps its own. Writes only when one clears.
+    pub async fn clear_stale_error(&self, id: &str) {
+        let mut accounts = self.accounts.write().await;
+        let Some(current) = accounts.get(id) else {
+            return;
+        };
+        let cooling = current
+            .cooldown_until
+            .as_deref()
+            .and_then(parse_timestamp)
+            .is_some_and(|until| until > time::OffsetDateTime::now_utc());
+        if current.last_error.is_none() || cooling {
+            return;
+        }
+        let mut account = current.clone();
+        account.last_error = None;
+        account.cooldown_until = None;
+        account.updated_at = now();
+        if self.persist(&account).is_ok() {
+            accounts.insert(id.into(), account);
+        }
+    }
+
     pub async fn mark_error(
         &self,
         id: &str,
@@ -1523,6 +1548,48 @@ mod tests {
                 .await
                 .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_success_clears_the_reason_an_expired_cooldown_left() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AccountStore::open(directory.path()).unwrap();
+        let account = store
+            .import(json!({"type":"codex","access_token":"fixture"}), None)
+            .await
+            .unwrap();
+        store
+            .cooldown(&account.id, 30, "upstream temporarily unavailable")
+            .await
+            .unwrap();
+        store.clear_stale_error(&account.id).await;
+        let cooling = store.get(&account.id).await.unwrap();
+        assert_eq!(cooling.summary().status, "cooldown");
+        assert!(cooling.last_error.is_some());
+
+        store
+            .modify(&account.id, |a| {
+                a.cooldown_until = Some("2020-01-01T00:00:00Z".into())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get(&account.id).await.unwrap().summary().status,
+            "error"
+        );
+        store.clear_stale_error(&account.id).await;
+        let cleared = store.get(&account.id).await.unwrap();
+        assert_eq!(cleared.summary().status, "ready");
+        assert!(cleared.last_error.is_none() && cleared.cooldown_until.is_none());
+        let reopened = AccountStore::open(directory.path()).unwrap();
+        assert!(
+            reopened
+                .get(&account.id)
+                .await
+                .unwrap()
+                .last_error
+                .is_none()
         );
     }
 }
