@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # cargo-chef builds the dependencies in their own layer, so a source change
 # reuses them from the build cache instead of compiling every crate again.
-FROM lukemathwalker/cargo-chef:0.1.78-rust-1.99.0-slim-trixie@sha256:bcda2cef02bedabfaf433379d82fecd02c0a428fb66fe28ab2d65c25c3db3b5e AS chef
+FROM lukemathwalker/cargo-chef:0.1.78-rust-1.99.1-slim-trixie@sha256:b22df2bf8abec048f46a6505c9303e2c8c0a8e22d21181f8b803b9ad5593ba99 AS chef
 WORKDIR /src
 
 FROM chef AS planner
