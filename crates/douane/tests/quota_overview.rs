@@ -87,7 +87,16 @@ async fn quotas_use_the_same_client_authentication_as_models() {
 async fn a_client_refresh_reads_every_account_and_reports_failures_at_once() {
     let directory = tempfile::tempdir().unwrap();
     let state = state(directory.path(), None);
-    // Qwen has no quota reader: its read fails without leaving the process.
+    // Without a Google project the read fails before leaving the process.
+    state
+        .accounts
+        .import(
+            json!({"type":"antigravity","access_token":"fixture-access","name":"Antigravity"}),
+            None,
+        )
+        .await
+        .unwrap();
+    // Qwen has no quota reader: it stays out of the overview, refresh or not.
     state
         .accounts
         .import(
@@ -98,12 +107,15 @@ async fn a_client_refresh_reads_every_account_and_reports_failures_at_once() {
         .unwrap();
     let app = douane::router(state);
     let (_, body) = send(&app, get("/v1/quotas", None)).await;
+    assert_eq!(body["providers"].as_array().unwrap().len(), 1);
     assert_eq!(body["providers"][0]["entries"][0]["error"], Value::Null);
     let (status, body) = send(&app, get("/v1/quotas?refresh=1", None)).await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["providers"].as_array().unwrap().len(), 1);
+    assert_eq!(body["providers"][0]["provider"], "antigravity");
     assert_eq!(
         body["providers"][0]["entries"][0]["error"],
-        "provider does not support this operation"
+        "invalid authentication file: missing Google project ID"
     );
 }
 

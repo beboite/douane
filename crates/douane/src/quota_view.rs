@@ -56,7 +56,7 @@ pub fn overview(
         .map(|snapshot| (snapshot.account_id.as_str(), snapshot))
         .collect();
     let mut groups: BTreeMap<SubscriptionProvider, Vec<Member>> = BTreeMap::new();
-    for account in &accounts {
+    for account in accounts.iter().filter(|a| a.provider.reports_quota()) {
         groups
             .entry(account.provider)
             .or_default()
@@ -426,6 +426,35 @@ mod tests {
             .quota_display
             .insert(provider.as_str().into(), QuotaDisplay::Average);
         settings
+    }
+
+    #[test]
+    fn providers_without_a_quota_reader_stay_out() {
+        let accounts = vec![
+            summary("claude", SubscriptionProvider::Claude, "ready"),
+            summary(
+                "openrouter",
+                SubscriptionProvider::OpenaiCompatible,
+                "ready",
+            ),
+            summary("qwen", SubscriptionProvider::Qwen, "ready"),
+        ];
+        let mut unsupported = snapshot("openrouter", vec![], vec![]);
+        unsupported.provider = SubscriptionProvider::OpenaiCompatible;
+        unsupported.error = Some("provider does not support this operation".into());
+        let value = overview(
+            accounts,
+            vec![unsupported],
+            &Settings::default(),
+            "2026-10-04T12:00:00Z".into(),
+        );
+        let providers: Vec<&str> = value["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["provider"].as_str().unwrap())
+            .collect();
+        assert_eq!(providers, ["claude"]);
     }
 
     #[test]
