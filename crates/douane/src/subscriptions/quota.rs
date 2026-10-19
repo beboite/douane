@@ -385,6 +385,7 @@ impl QuotaService {
             .list()
             .await
             .into_iter()
+            .filter(|account| account.provider.reports_quota())
             .map(|account| account.id)
             .collect();
         let mut failures = self.failures.write().await;
@@ -411,6 +412,10 @@ impl QuotaService {
             .get(id)
             .await
             .ok_or(SubscriptionError::NotFound)?;
+        // Nothing to read: no request, and no error snapshot to show.
+        if !account.provider.reports_quota() {
+            return Err(SubscriptionError::Unsupported);
+        }
         let result = match self.oauth.credential(id).await {
             Ok(credential) => self.fetch(&credential).await,
             Err(error) => Err(error),

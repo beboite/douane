@@ -41,6 +41,12 @@ impl SubscriptionProvider {
         }
     }
 
+    /// Whether douane can read this provider's quota. Custom endpoints and
+    /// Qwen expose none, so they never reach the quota poller or overview.
+    pub fn reports_quota(self) -> bool {
+        !matches!(self, Self::OpenaiCompatible | Self::Qwen)
+    }
+
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "codex" | "chatgpt" => Some(Self::Codex),
