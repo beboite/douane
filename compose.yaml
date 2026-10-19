@@ -1,6 +1,6 @@
 services:
   douane:
-    image: ghcr.io/beboite/douane:latest
+    image: ghcr.io/mtsu-dev/douane:latest
     restart: unless-stopped
     # Loopback only: the dashboard and its management API have no login of
     # their own. See "Security and data" in the README before exposing it.

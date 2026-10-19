@@ -27,7 +27,7 @@ COPY --from=build --chown=65532:65532 /out/data /data
 COPY LICENSE /usr/share/doc/douane/LICENSE
 LABEL org.opencontainers.image.title="douane" \
       org.opencontainers.image.description="One self-hosted endpoint for every AI subscription you pay for" \
-      org.opencontainers.image.source="https://github.com/beboite/douane" \
+      org.opencontainers.image.source="https://github.com/mtsu-dev/douane" \
       org.opencontainers.image.licenses="AGPL-3.0-or-later"
 WORKDIR /data
 EXPOSE 8787
