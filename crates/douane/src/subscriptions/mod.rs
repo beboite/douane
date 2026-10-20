@@ -13,6 +13,7 @@ pub use oauth::{OAuthAttempt, OAuthManager};
 pub use quota::{
     QuotaCredits, QuotaService, QuotaSnapshot, QuotaWindow, RESERVE_WINDOWS, reserve_kind,
 };
+pub(crate) use quota::{window_seconds, write_private};
 pub use reset::{ResetError, ResetManager, ResetOutcome, ResetRedemption, ResetStatus};
 pub use store::{
     AccountCredential, AccountStore, AccountSummary, EndpointPatch, SubscriptionProvider,

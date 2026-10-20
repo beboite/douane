@@ -291,8 +291,10 @@ async fn connect_replacement(
     attempted: &mut BTreeSet<String>,
 ) -> Option<(AccountCredential, NativeSocket)> {
     // Only failures replan. Added, re-enabled or reset accounts become visible here.
+    // A key revoked since the socket opened gets no replacement account.
+    let client = state.clients.authenticate(headers).ok()?;
     let (_, candidates) = state
-        .candidates(model, Some(provider.as_str()), session)
+        .candidates_for(model, Some(provider.as_str()), session, client.as_ref())
         .await
         .ok()?;
     connect_pool(
@@ -313,6 +315,9 @@ pub async fn upgrade(
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
+    if let Err(refusal) = state.clients.authenticate(&headers) {
+        return relay::error(axum::http::StatusCode::UNAUTHORIZED, refusal.message());
+    }
     upgrade
         .max_message_size(64 * 1024 * 1024)
         .max_frame_size(64 * 1024 * 1024)
@@ -368,17 +373,25 @@ async fn run(mut downstream: WebSocket, state: Arc<AppState>, headers: HeaderMap
         .await;
         return;
     }
-    let (model, candidates, session) = match relay::choose(&state, &initial, &headers).await {
-        Ok(v) => v,
-        Err(e) => {
-            if has_previous(&initial) {
-                previous_not_found(&mut downstream, &initial).await;
-            } else {
-                reject(&mut downstream, &e).await;
-            }
+    let mut client = match state.clients.authenticate(&headers) {
+        Ok(client) => client,
+        Err(refusal) => {
+            reject(&mut downstream, refusal.message()).await;
             return;
         }
     };
+    let (model, candidates, session) =
+        match relay::choose(&state, &initial, &headers, client.as_ref()).await {
+            Ok(v) => v,
+            Err(e) => {
+                if has_previous(&initial) {
+                    previous_not_found(&mut downstream, &initial).await;
+                } else {
+                    reject(&mut downstream, &e).await;
+                }
+                return;
+            }
+        };
     // Codex and a plain OpenAI endpoint keep a native socket; every other
     // pool, custom routes included, goes through the HTTP bridge.
     if let Some(account) = candidates.first().filter(|a| {
@@ -442,7 +455,7 @@ async fn run(mut downstream: WebSocket, state: Arc<AppState>, headers: HeaderMap
         return;
     }
     let mut calls: BTreeMap<String, VecDeque<Option<CallGuard>>> = BTreeMap::new();
-    track_call(&mut calls, &state, &account, &initial);
+    track_call(&mut calls, &state, &account, &initial, client.as_ref());
     // Retain at most one request, and release its payload on the first forwarded event.
     let mut retry_request = Some(initial);
     let mut heartbeat = tokio::time::interval(Duration::from_secs(25));
@@ -478,8 +491,18 @@ async fn run(mut downstream: WebSocket, state: Arc<AppState>, headers: HeaderMap
                                 break;
                             }
                             if pending == 0 { attempted.clear(); }
+                            // Each request reads the client again: a revoked key stops here,
+                            // and changed access or shares apply to the next request.
+                            client = match state.clients.authenticate(&headers) {
+                                Ok(client) => client,
+                                Err(refusal) => {
+                                    reject(&mut downstream, refusal.message()).await;
+                                    break;
+                                }
+                            };
                             let usable = match state.accounts.get(&account.id).await.filter(|a| account_eligible(a, &requested)) {
                                 Some(current) => !state.reserve_excludes(&current).await
+                                    && !state.client_excludes(client.as_ref(), &current).await
                                     && !state.credits_avoidable(&current, &requested).await,
                                 None => false,
                             };
@@ -515,7 +538,7 @@ async fn run(mut downstream: WebSocket, state: Arc<AppState>, headers: HeaderMap
                                 break;
                             }
                             retry_request = if pending == 0 { Some(body.clone()) } else { None };
-                            track_call(&mut calls, &state, &account, &body);
+                            track_call(&mut calls, &state, &account, &body, client.as_ref());
                         } else {
                             // A cancellation/steering message makes replaying the retained create unsafe.
                             retry_request = None;
@@ -586,7 +609,7 @@ async fn run(mut downstream: WebSocket, state: Arc<AppState>, headers: HeaderMap
                                             reject(&mut downstream, "replacement websocket send failed; reconnect with full input").await;
                                             break;
                                         }
-                                        track_call(&mut calls, &state, &account, &request);
+                                        track_call(&mut calls, &state, &account, &request, client.as_ref());
                                         retry_request = Some(request);
                                         last_upstream = tokio::time::Instant::now();
                                         // Retry never consumes a client's already forwarded event or previous response.
@@ -649,6 +672,7 @@ fn track_call(
     state: &AppState,
     account: &AccountCredential,
     value: &Value,
+    client: Option<&crate::clients::Client>,
 ) {
     // Warmup prepares upstream cache state and consumes no inference quota.
     let lane = value["stream_id"].as_str().unwrap_or("").to_owned();
@@ -658,6 +682,7 @@ fn track_call(
             account,
             value["model"].as_str().unwrap_or(""),
         )
+        .for_client(&state.clients, client)
     });
     calls.entry(lane).or_default().push_back(call);
 }

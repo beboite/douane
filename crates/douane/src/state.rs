@@ -88,6 +88,7 @@ pub struct AppState {
     pub quotas: Arc<QuotaService>,
     pub resets: Arc<ResetManager>,
     pub ledger: Arc<Ledger>,
+    pub clients: Arc<crate::clients::Clients>,
     pub client: reqwest::Client,
     pub models: RwLock<Vec<Model>>,
     pub scheduler: Mutex<Scheduler>,
@@ -132,6 +133,7 @@ impl AppState {
         ));
         let resets = Arc::new(ResetManager::new(accounts.clone(), oauth.clone())?);
         let ledger = Ledger::open(&config.server.database)?;
+        let clients = Arc::new(crate::clients::Clients::open(&config.server.auth_dir)?);
         Ok(Arc::new(Self {
             config: RwLock::new(config),
             config_path,
@@ -140,6 +142,7 @@ impl AppState {
             quotas,
             resets,
             ledger,
+            clients,
             client,
             models: RwLock::new(vec![]),
             scheduler: Mutex::new(Scheduler::default()),
@@ -354,6 +357,20 @@ impl AppState {
         provider_hint: Option<&str>,
         session: Option<&str>,
     ) -> Result<(String, Vec<AccountCredential>), String> {
+        self.candidates_for(requested, provider_hint, session, None)
+            .await
+    }
+
+    /// The accounts `client` may use for `requested`, best first. A client
+    /// sees only the accounts its access allows, and an account where the
+    /// other holders' shares leave it nothing drops out like a reserve.
+    pub async fn candidates_for(
+        &self,
+        requested: &str,
+        provider_hint: Option<&str>,
+        session: Option<&str>,
+        client: Option<&crate::clients::Client>,
+    ) -> Result<(String, Vec<AccountCredential>), String> {
         let config = self.config.read().await.clone();
         if config.disabled_models.contains(requested) {
             return Err("model is disabled".into());
@@ -409,6 +426,8 @@ impl AppState {
         };
         drop(all_models);
         let mut ordered = vec![];
+        // The earliest reset among accounts only shares held back.
+        let mut held_back: Option<(String, i64)> = None;
         for (provider, route) in pools {
             let pool = route.as_deref().unwrap_or(provider.as_str());
             if config.disabled_models.contains(&format!("{pool}/{model}")) {
@@ -422,8 +441,20 @@ impl AppState {
                 .eligible_in(provider, route.as_deref(), Some(model))
                 .await
             {
+                if client.is_some_and(|c| !c.access.allows(&a)) {
+                    continue;
+                }
                 let quota = self.quotas.get(&a.id).await;
                 if self.reserve_excludes_with(&a, quota.as_ref(), now) {
+                    continue;
+                }
+                if let Some(reset) =
+                    self.clients
+                        .share_blocks(client, &a, quota.as_ref(), now.unix_timestamp())
+                {
+                    if held_back.as_ref().is_none_or(|(_, r)| reset < *r) {
+                        held_back = Some((pool.to_owned(), reset));
+                    }
                     continue;
                 }
                 candidates.push(Candidate {
@@ -486,7 +517,19 @@ impl AppState {
                 break;
             }
         }
-        if ordered.is_empty() {
+        if let (true, Some((pool, reset))) = (ordered.is_empty(), held_back) {
+            let until = time::OffsetDateTime::from_unix_timestamp(reset)
+                .ok()
+                .and_then(|t| {
+                    t.format(&time::format_description::well_known::Rfc3339)
+                        .ok()
+                })
+                .unwrap_or_default();
+            Err(format!(
+                "{} {pool} is used up until {until}; other clients' shares are reserved for them",
+                crate::clients::SHARE_USED_UP
+            ))
+        } else if ordered.is_empty() {
             Err("no available subscription for this model; connect an account or wait for its quota reset".into())
         } else {
             Ok((model.into(), ordered))
@@ -541,6 +584,27 @@ impl AppState {
     /// Routing check for the reserve. Close to or at the reserve, a snapshot
     /// older than a minute also starts a background quota refresh, so the
     /// account leaves rotation in time and returns soon after its reset.
+    /// The client may not use this account: its access refuses it, or the
+    /// other holders' shares leave it nothing there.
+    pub async fn client_excludes(
+        &self,
+        client: Option<&crate::clients::Client>,
+        account: &AccountCredential,
+    ) -> bool {
+        if client.is_some_and(|c| !c.access.allows(account)) {
+            return true;
+        }
+        let snapshot = self.quotas.get(&account.id).await;
+        self.clients
+            .share_blocks(
+                client,
+                account,
+                snapshot.as_ref(),
+                time::OffsetDateTime::now_utc().unix_timestamp(),
+            )
+            .is_some()
+    }
+
     pub async fn reserve_excludes(&self, account: &AccountCredential) -> bool {
         let snapshot = self.quotas.get(&account.id).await;
         self.reserve_excludes_with(account, snapshot.as_ref(), time::OffsetDateTime::now_utc())
@@ -604,8 +668,17 @@ impl AppState {
         stream::iter(ids)
             .for_each_concurrent(4, |id| async move {
                 let _ = self.quotas.refresh(&id).await;
+                self.observe_usage(&id).await;
             })
             .await;
+    }
+
+    /// Attributes the latest rise of an account's windows to its clients.
+    pub async fn observe_usage(&self, id: &str) {
+        if let Some(snapshot) = self.quotas.get(id).await {
+            self.clients
+                .observe(&snapshot, time::OffsetDateTime::now_utc().unix_timestamp());
+        }
     }
 
     /// The poller's pass: reads only the accounts whose snapshot is
@@ -620,9 +693,24 @@ impl AppState {
             .await;
         stream::iter(ids)
             .for_each_concurrent(4, |id| async move {
-                let _ = self.quotas.refresh_background(&id).await;
+                if self.quotas.refresh_background(&id).await.is_some() {
+                    self.observe_usage(&id).await;
+                }
             })
             .await;
+        let existing = self
+            .accounts
+            .list()
+            .await
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+        let clients = self.clients.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            clients.forget_accounts(&existing);
+            clients.save_usage();
+        })
+        .await;
     }
 }
 
@@ -869,6 +957,79 @@ mod tests {
             credits: vec![],
             ..credits_only(id)
         }
+    }
+
+    #[tokio::test]
+    async fn a_client_past_what_other_shares_leave_it_is_held_back_with_429() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.server.auth_dir = directory.path().join("auth");
+        config.server.database = directory.path().join("requests.sqlite");
+        let state = AppState::new(config, None).unwrap();
+        let account = state
+            .accounts
+            .import(
+                json!({"type":"codex","access_token":"fixture","account_id":"a","name":"a"}),
+                None,
+            )
+            .await
+            .unwrap();
+        let patch = |name: &str, share: Option<f64>| crate::clients::ClientPatch {
+            name: Some(name.into()),
+            shares: share.map(|s| [("codex".to_owned(), s)].into()),
+            ..Default::default()
+        };
+        let (famille, _) = state.clients.create(patch("famille", Some(30.0))).unwrap();
+        let (perso, _) = state.clients.create(patch("perso", None)).unwrap();
+        let (outsider, _) = state
+            .clients
+            .create(crate::clients::ClientPatch {
+                access: Some(crate::clients::Access {
+                    all: false,
+                    pools: ["claude".to_owned()].into(),
+                    accounts: Default::default(),
+                }),
+                ..patch("claude only", None)
+            })
+            .unwrap();
+        let at = |used: f64| QuotaSnapshot {
+            windows: vec![QuotaWindow {
+                remaining_percent: Some(100.0 - used),
+                ..weekly(&account.id, "2099-01-08T00:00:00Z").windows[0].clone()
+            }],
+            ..weekly(&account.id, "2099-01-08T00:00:00Z")
+        };
+        state.quotas.insert_for_test(at(0.0)).await;
+        state.observe_usage(&account.id).await;
+        state.clients.call_ended(&account.id, Some(&perso.id), 10.0);
+        state.quotas.insert_for_test(at(70.0)).await;
+        state.observe_usage(&account.id).await;
+        let first = |client: &crate::clients::Client| {
+            let state = state.clone();
+            let client = client.clone();
+            async move {
+                state
+                    .candidates_for("gpt-5.5", Some("codex"), None, Some(&client))
+                    .await
+                    .map(|(_, accounts)| accounts[0].id.clone())
+            }
+        };
+        let refused = first(&perso).await.unwrap_err();
+        assert!(
+            refused.starts_with(crate::clients::SHARE_USED_UP),
+            "{refused}"
+        );
+        assert_eq!(
+            crate::relay::refusal_status(&refused),
+            axum::http::StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(first(&famille).await.unwrap(), account.id);
+        assert!(
+            first(&outsider)
+                .await
+                .unwrap_err()
+                .starts_with("no available subscription")
+        );
     }
 
     #[tokio::test]

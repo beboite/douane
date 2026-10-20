@@ -27,6 +27,9 @@ pub struct Call {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub error: Option<String>,
+    /// The douane client that made the call; `None` without client keys.
+    #[serde(default)]
+    pub client_id: Option<String>,
 }
 
 enum Command {
@@ -59,18 +62,26 @@ impl Ledger {
             "request database must be writable by the service user"
         );
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; CREATE TABLE IF NOT EXISTS subscription_calls(id TEXT PRIMARY KEY,started_at TEXT NOT NULL,provider TEXT NOT NULL,account_id TEXT NOT NULL,model TEXT NOT NULL,status INTEGER NOT NULL,latency_ms INTEGER NOT NULL,input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,error TEXT,cache_read_tokens INTEGER NOT NULL DEFAULT 0,cache_write_tokens INTEGER NOT NULL DEFAULT 0); CREATE INDEX IF NOT EXISTS subscription_calls_time ON subscription_calls(started_at DESC);")?;
+        let has_client: bool = db
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('subscription_calls') WHERE name='client_id'",
+            )?
+            .exists([])?;
+        if !has_client {
+            db.execute_batch("ALTER TABLE subscription_calls ADD COLUMN client_id TEXT")?;
+        }
         let (requests,errors,input,output,cache_read,cache_write): (u64,u64,u64,u64,u64,u64)=db.query_row("SELECT count(*),coalesce(sum(status>=400 OR error IS NOT NULL),0),coalesce(sum(input_tokens),0),coalesce(sum(output_tokens),0),coalesce(sum(cache_read_tokens),0),coalesce(sum(cache_write_tokens),0) FROM subscription_calls",[],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
         let (tx, mut rx) = mpsc::channel(1024);
         std::thread::Builder::new().name("douane-ledger".into()).spawn(move || {
             while let Some(command)=rx.blocking_recv() {
                 match command {
                     Command::Record(c) => {
-                        if let Err(e)=db.execute("INSERT INTO subscription_calls VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",params![c.id,c.started_at,c.provider,c.account_id,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.error,c.cache_read_tokens,c.cache_write_tokens]) { tracing::warn!(error=%e,"could not persist request metadata"); }
+                        if let Err(e)=db.execute("INSERT INTO subscription_calls(id,started_at,provider,account_id,model,status,latency_ms,input_tokens,output_tokens,error,cache_read_tokens,cache_write_tokens,client_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![c.id,c.started_at,c.provider,c.account_id,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.error,c.cache_read_tokens,c.cache_write_tokens,c.client_id]) { tracing::warn!(error=%e,"could not persist request metadata"); }
                     },
                     Command::List(limit,reply) => {
                         let rows=(|| -> rusqlite::Result<Vec<Call>> {
-                            let mut stmt=db.prepare("SELECT id,started_at,provider,account_id,model,status,latency_ms,input_tokens,output_tokens,error,cache_read_tokens,cache_write_tokens FROM subscription_calls ORDER BY started_at DESC LIMIT ?1")?;
-                            stmt.query_map([limit as u64],|r| Ok(Call{id:r.get(0)?,started_at:r.get(1)?,provider:r.get(2)?,account_id:r.get(3)?,model:r.get(4)?,status:r.get(5)?,latency_ms:r.get(6)?,input_tokens:r.get(7)?,output_tokens:r.get(8)?,error:r.get(9)?,cache_read_tokens:r.get(10)?,cache_write_tokens:r.get(11)?}))?.collect()
+                            let mut stmt=db.prepare("SELECT id,started_at,provider,account_id,model,status,latency_ms,input_tokens,output_tokens,error,cache_read_tokens,cache_write_tokens,client_id FROM subscription_calls ORDER BY started_at DESC LIMIT ?1")?;
+                            stmt.query_map([limit as u64],|r| Ok(Call{id:r.get(0)?,started_at:r.get(1)?,provider:r.get(2)?,account_id:r.get(3)?,model:r.get(4)?,status:r.get(5)?,latency_ms:r.get(6)?,input_tokens:r.get(7)?,output_tokens:r.get(8)?,error:r.get(9)?,cache_read_tokens:r.get(10)?,cache_write_tokens:r.get(11)?,client_id:r.get(12)?}))?.collect()
                         })().unwrap_or_default();
                         let _=reply.send(rows);
                     },

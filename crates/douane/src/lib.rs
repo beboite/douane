@@ -3,6 +3,7 @@ pub mod affinity;
 mod antigravity_replay;
 mod antigravity_system;
 mod antigravity_thinking;
+pub mod clients;
 pub mod ledger;
 pub mod management;
 pub mod quota_view;
@@ -51,6 +52,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/models/refresh", post(management::refresh_models))
         .route("/models/{*id}", patch(management::set_model))
         .route("/calls", get(management::calls))
+        .route(
+            "/clients",
+            get(management::clients).post(management::create_client),
+        )
+        .route(
+            "/clients/{id}",
+            patch(management::update_client).delete(management::delete_client),
+        )
         .route("/summary", get(management::summary))
         .route("/status", get(management::summary))
         .route(
@@ -83,7 +92,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/config", get(management::compatible_config))
         .route("/usage", get(management::summary))
         .route("/logs", get(management::calls))
-        .route("/models", get(management::public_models))
+        .route("/models", get(management::management_models))
         .route("/latest-version", get(management::version))
         .route("/version", get(management::version))
         .route_layer(middleware::from_fn_with_state(
