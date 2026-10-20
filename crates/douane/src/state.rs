@@ -584,6 +584,27 @@ impl AppState {
     /// Routing check for the reserve. Close to or at the reserve, a snapshot
     /// older than a minute also starts a background quota refresh, so the
     /// account leaves rotation in time and returns soon after its reset.
+    /// The client may not use this account: its access refuses it, or the
+    /// other holders' shares leave it nothing there.
+    pub async fn client_excludes(
+        &self,
+        client: Option<&crate::clients::Client>,
+        account: &AccountCredential,
+    ) -> bool {
+        if client.is_some_and(|c| !c.access.allows(account)) {
+            return true;
+        }
+        let snapshot = self.quotas.get(&account.id).await;
+        self.clients
+            .share_blocks(
+                client,
+                account,
+                snapshot.as_ref(),
+                time::OffsetDateTime::now_utc().unix_timestamp(),
+            )
+            .is_some()
+    }
+
     pub async fn reserve_excludes(&self, account: &AccountCredential) -> bool {
         let snapshot = self.quotas.get(&account.id).await;
         self.reserve_excludes_with(account, snapshot.as_ref(), time::OffsetDateTime::now_utc())

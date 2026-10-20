@@ -363,18 +363,27 @@ pub async fn restore(State(state): State<Arc<AppState>>, Json(body): Json<Value>
         }
         *state.config.write().await = config;
     }
-    let restored_clients = match clients {
-        Some(list) => match state.clients.restore(list) {
-            Ok(count) => count,
-            Err(e) => return error(StatusCode::BAD_REQUEST, &e),
-        },
-        None => 0,
-    };
+    // Clients are checked before anything changes, and stored after the
+    // accounts, whose ids may differ here.
+    if let Some(list) = &clients {
+        if let Err(e) = state
+            .clients
+            .restore(list.clone(), &Default::default(), true)
+        {
+            return error(StatusCode::BAD_REQUEST, &e);
+        }
+    }
     let mut accounts = vec![];
     let mut errors = vec![];
+    let mut renamed = std::collections::BTreeMap::new();
     for (index, record) in records.iter().enumerate() {
         match state.accounts.restore(record.clone()).await {
-            Ok(account) => accounts.push(account),
+            Ok(account) => {
+                if let Some(old) = record.get("id").and_then(Value::as_str) {
+                    renamed.insert(old.to_owned(), account.id.clone());
+                }
+                accounts.push(account)
+            }
             Err(e) => errors.push(json!({
                 "index": index,
                 "name": record.get("name").and_then(Value::as_str),
@@ -382,6 +391,13 @@ pub async fn restore(State(state): State<Arc<AppState>>, Json(body): Json<Value>
             })),
         }
     }
+    let restored_clients = match clients {
+        Some(list) => match state.clients.restore(list, &renamed, false) {
+            Ok(count) => count,
+            Err(e) => return error(StatusCode::BAD_REQUEST, &e),
+        },
+        None => 0,
+    };
     state.refresh_models().await;
     let ids: Vec<String> = accounts.iter().map(|a| a.id.clone()).collect();
     let worker = state.clone();
@@ -691,15 +707,29 @@ async fn list_models(
     query: &Params,
     client: Option<&crate::clients::Client>,
 ) -> Value {
-    // A pool is a provider, or one custom endpoint route.
-    let ready: BTreeSet<String> = state
+    // A pool is a provider, or one custom endpoint route. A model shows
+    // when an enabled account the client may use serves it.
+    let ready: Vec<(String, Vec<String>)> = state
         .accounts
         .list()
         .await
         .into_iter()
         .filter(|a| a.enabled && client.is_none_or(|c| c.access.allows_summary(a)))
-        .map(|a| a.route.unwrap_or_else(|| a.provider.as_str().to_owned()))
+        .map(|a| {
+            (
+                a.route.unwrap_or_else(|| a.provider.as_str().to_owned()),
+                a.models,
+            )
+        })
         .collect();
+    let serves = |pool: &str, model: &str| {
+        ready.iter().any(|(p, models)| {
+            // Without a client the catalog already honours each
+            // account's model list.
+            p == pool
+                && (client.is_none() || models.is_empty() || models.iter().any(|m| m == model))
+        })
+    };
     let upstream = query.ids.as_deref() == Some("upstream");
     let models = state.models.read().await;
     let mut listed: Vec<_> = models
@@ -707,7 +737,7 @@ async fn list_models(
         .filter(|m| {
             let pool = m.route.as_deref().unwrap_or(m.provider.as_str());
             m.enabled
-                && ready.contains(pool)
+                && serves(pool, &m.upstream_id)
                 && query
                     .provider
                     .as_ref()

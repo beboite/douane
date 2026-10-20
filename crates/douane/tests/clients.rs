@@ -235,3 +235,97 @@ async fn a_client_key_reaches_only_the_accounts_its_access_allows() {
     assert_eq!(status, 204);
     assert_eq!(target.models(None).await.0, 200);
 }
+
+#[tokio::test]
+async fn a_client_limited_to_one_account_lists_only_its_models() {
+    let api = serve(Router::new().route(
+        "/v1/models",
+        get(|| async { Json(json!({"data":[{"id":"a"},{"id":"b"}]})) }),
+    ))
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let gateway = instance(&directory).await;
+    let mut ids = vec![];
+    for model in ["a", "b"] {
+        let mut account = endpoint("loop", &api.url);
+        account["models"] = json!([model]);
+        ids.push(
+            gateway
+                .state
+                .accounts
+                .import(account, Some(model.into()))
+                .await
+                .unwrap()
+                .id,
+        );
+    }
+    gateway.state.refresh_models().await;
+    let (_, created) = gateway
+        .send(
+            reqwest::Method::POST,
+            "/admin/api/clients",
+            None,
+            Some(json!({"name":"A only","access":{"all":false,"accounts":[ids[0]]}})),
+        )
+        .await;
+    let key = created["key"].as_str().unwrap();
+    assert_eq!(
+        gateway.models(Some(key)).await,
+        (200, vec!["loop/a".to_owned()])
+    );
+}
+
+#[tokio::test]
+async fn a_restore_points_account_access_at_the_ids_accounts_get_there() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let source = instance(&source_dir).await;
+    let target_dir = tempfile::tempdir().unwrap();
+    let target = instance(&target_dir).await;
+    // The same Codex account, already known on the target under another id.
+    let codex =
+        || json!({"type":"codex","access_token":"fixture","account_id":"same","name":"Codex"});
+    let source_id = source
+        .state
+        .accounts
+        .import(codex(), None)
+        .await
+        .unwrap()
+        .id;
+    let target_id = target
+        .state
+        .accounts
+        .import(codex(), None)
+        .await
+        .unwrap()
+        .id;
+    assert_ne!(source_id, target_id);
+    let (_, created) = source
+        .send(
+            reqwest::Method::POST,
+            "/admin/api/clients",
+            None,
+            Some(json!({"name":"Scoped","access":{"all":false,"accounts":[source_id]}})),
+        )
+        .await;
+    let key = created["key"].as_str().unwrap().to_owned();
+    let (_, bundle) = source
+        .send(reqwest::Method::GET, "/admin/api/export", None, None)
+        .await;
+    let (status, restored) = target
+        .send(
+            reqwest::Method::POST,
+            "/admin/api/restore",
+            None,
+            Some(bundle),
+        )
+        .await;
+    assert_eq!(status, 200, "{restored}");
+    assert_eq!(target.state.accounts.list().await.len(), 1);
+    assert_eq!(
+        target.state.clients.list()[0].access.accounts,
+        [target_id].into()
+    );
+    let (status, models) = target.models(Some(&key)).await;
+    assert_eq!(status, 200);
+    assert!(models.iter().any(|m| m.starts_with("codex/")), "{models:?}");
+}

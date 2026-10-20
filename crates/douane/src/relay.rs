@@ -234,6 +234,7 @@ pub(crate) fn upstream_headers(account: &AccountCredential, incoming: &HeaderMap
             "host"
                 | "authorization"
                 | "x-api-key"
+                | "x-goog-api-key"
                 | "api-key"
                 | "x-douane-admin"
                 | "x-management-key"
@@ -1452,6 +1453,21 @@ impl Drop for CallGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_client_key_header_reaches_the_provider() {
+        let account: AccountCredential = serde_json::from_value(json!({
+            "id": "a", "name": "a", "provider": "antigravity", "access_token": "upstream",
+            "enabled": true, "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        let mut incoming = HeaderMap::new();
+        for name in ["authorization", "x-api-key", "x-goog-api-key", "api-key"] {
+            incoming.insert(name, "dk_client".parse().unwrap());
+        }
+        let sent = upstream_headers(&account, &incoming);
+        assert!(sent.values().all(|v| v != "dk_client"), "{sent:?}");
+    }
 
     #[test]
     fn an_exhausted_window_rests_until_the_provider_reset() {

@@ -291,7 +291,8 @@ async fn connect_replacement(
     attempted: &mut BTreeSet<String>,
 ) -> Option<(AccountCredential, NativeSocket)> {
     // Only failures replan. Added, re-enabled or reset accounts become visible here.
-    let client = state.clients.authenticate(headers).ok().flatten();
+    // A key revoked since the socket opened gets no replacement account.
+    let client = state.clients.authenticate(headers).ok()?;
     let (_, candidates) = state
         .candidates_for(model, Some(provider.as_str()), session, client.as_ref())
         .await
@@ -372,7 +373,13 @@ async fn run(mut downstream: WebSocket, state: Arc<AppState>, headers: HeaderMap
         .await;
         return;
     }
-    let client = state.clients.authenticate(&headers).ok().flatten();
+    let mut client = match state.clients.authenticate(&headers) {
+        Ok(client) => client,
+        Err(refusal) => {
+            reject(&mut downstream, refusal.message()).await;
+            return;
+        }
+    };
     let (model, candidates, session) =
         match relay::choose(&state, &initial, &headers, client.as_ref()).await {
             Ok(v) => v,
@@ -484,8 +491,18 @@ async fn run(mut downstream: WebSocket, state: Arc<AppState>, headers: HeaderMap
                                 break;
                             }
                             if pending == 0 { attempted.clear(); }
+                            // Each request reads the client again: a revoked key stops here,
+                            // and changed access or shares apply to the next request.
+                            client = match state.clients.authenticate(&headers) {
+                                Ok(client) => client,
+                                Err(refusal) => {
+                                    reject(&mut downstream, refusal.message()).await;
+                                    break;
+                                }
+                            };
                             let usable = match state.accounts.get(&account.id).await.filter(|a| account_eligible(a, &requested)) {
                                 Some(current) => !state.reserve_excludes(&current).await
+                                    && !state.client_excludes(client.as_ref(), &current).await
                                     && !state.credits_avoidable(&current, &requested).await,
                                 None => false,
                             };

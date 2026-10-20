@@ -449,16 +449,28 @@ impl Clients {
     }
 
     /// Replaces or adds clients from an export, keeping their key hashes.
-    pub fn restore(&self, restored: Vec<Client>) -> Result<usize, String> {
-        for client in &restored {
+    /// Replaces or adds clients from an export, keeping their key hashes.
+    /// `accounts` maps account ids of the export to the ids they got here.
+    /// With `dry_run`, only checks that the restore would be accepted.
+    pub fn restore(
+        &self,
+        mut restored: Vec<Client>,
+        accounts: &BTreeMap<String, String>,
+        dry_run: bool,
+    ) -> Result<usize, String> {
+        for client in &mut restored {
             check_name(&client.name)?;
             check_shares(&client.shares)?;
             if client.id.is_empty() || client.key_hash.len() != 64 {
                 return Err("a restored client lacks its id or key hash".into());
             }
+            client.access.accounts = std::mem::take(&mut client.access.accounts)
+                .into_iter()
+                .map(|id| accounts.get(&id).cloned().unwrap_or(id))
+                .collect();
         }
         let count = restored.len();
-        self.change(|list| {
+        let merge = move |list: &mut Vec<Client>| {
             for client in restored {
                 list.retain(|c| c.id != client.id && c.key_hash != client.key_hash);
                 list.push(client);
@@ -467,7 +479,14 @@ impl Clients {
                 return Err(format!("at most {MAX_CLIENTS} clients"));
             }
             Ok(count)
-        })
+        };
+        if dry_run {
+            let mut list = self.list();
+            merge(&mut list)?;
+            check_totals(&list)?;
+            return Ok(count);
+        }
+        self.change(merge)
     }
 
     pub fn call_started(&self, account: &str, client: Option<&str>) {
@@ -559,12 +578,9 @@ impl Clients {
                 usage.dirty = true;
             }
             let delta = reading.used - window.used;
+            // A slightly lower reading is the other source's rounding: the
+            // highest reading stays the base, so an oscillation counts once.
             if delta <= 1e-9 {
-                // A slightly lower reading becomes the base of the next rise.
-                if delta < 0.0 {
-                    window.used = reading.used;
-                    usage.dirty = true;
-                }
                 continue;
             }
             rose = true;
@@ -918,11 +934,12 @@ mod tests {
         clients.observe(&snapshot("a", 23.0, reset), NOW);
         clients.observe(&snapshot("a", 24.0, reset), NOW);
         assert!((clients.usage_report(NOW)[0].clients["perso"] - 7.0).abs() < 1e-9);
-        // Two sources rounding differently keep the attribution.
+        // Two sources rounding differently count each rise once.
         clients.observe(&snapshot("a", 22.0, reset), NOW);
         clients.call_ended("a", Some("perso"), 50.0);
         clients.observe(&snapshot("a", 24.0, reset), NOW);
-        assert!((clients.usage_report(NOW)[0].clients["perso"] - 9.0).abs() < 1e-9);
+        clients.observe(&snapshot("a", 25.0, reset), NOW);
+        assert!((clients.usage_report(NOW)[0].clients["perso"] - 8.0).abs() < 1e-9);
         // A new window starts from zero.
         clients.call_ended("a", Some("perso"), 10.0);
         clients.observe(&snapshot("a", 2.0, reset + 7 * 86_400), NOW);
