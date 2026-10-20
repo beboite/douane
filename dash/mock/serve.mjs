@@ -1,6 +1,6 @@
 // Serves the built dashboard with sample data, for README captures and UI work
 // without a running douane or any real account: `pnpm build && pnpm mock`.
-// Writes are accepted and ignored. Nothing here reaches a provider.
+// Writes are accepted and ignored, except client keys, kept in memory. Nothing here reaches a provider.
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
@@ -63,6 +63,53 @@ const traffic = [
 	['deepseek-v4-pro', 'deepseek', 'acc-deepseek', 1730], ['gpt-4.1', 'copilot', 'acc-copilot', 940], ['claude-haiku-5-5', 'claude', 'acc-claude-work', 612],
 	['gpt-6-luna', 'codex', 'acc-codex', 7210], ['claude-opus-5-5', 'claude', 'acc-claude-home', 6399], ['google/gemma-4-31b-it:free', 'openrouter', 'acc-openrouter', 2480]
 ];
+// Client keys: kept in memory, so edits show until the server stops.
+const client = (id, name, hint, access, shares) => ({ id, name, key_hint: `dk_\u2026${hint}`, created_at: ago(60 * 24 * 6), access: { pools: [], accounts: [], ...access }, shares });
+const clients = [
+	client('cl-desktop', 'Desktop', '9f3a', { all: true }, {}),
+	client('cl-family', 'Family', '41c7', { all: false, pools: ['claude'] }, { claude: 25 }),
+	client('cl-laptop', 'Laptop', 'b80e', { all: false, pools: ['codex', 'claude'] }, { codex: 40 })
+];
+const unix = (hours) => Math.floor((now + hours * 3600_000) / 1000);
+const used = (account_id, kind, hours, total, points, outside = 0) => ({ account_id, kind, reset: unix(hours), used: total, clients: points, outside });
+const usage = [
+	used('acc-claude-home', 'five-hour', 2.7, 36, { 'cl-desktop': 18, 'cl-family': 6, 'cl-laptop': 7 }, 2),
+	used('acc-claude-home', 'weekly', 61, 29, { 'cl-desktop': 14, 'cl-family': 9, 'cl-laptop': 4 }, 1),
+	used('acc-claude-work', 'five-hour', 1.4, 66, { 'cl-desktop': 40, 'cl-family': 12, 'cl-laptop': 10 }),
+	used('acc-claude-work', 'weekly', 110, 78, { 'cl-desktop': 41, 'cl-family': 21, 'cl-laptop': 9, '': 3 }, 2),
+	used('acc-codex', 'five-hour', 3.9, 8, { 'cl-desktop': 3, 'cl-laptop': 5 }),
+	used('acc-codex', 'weekly', 85, 23, { 'cl-desktop': 6, 'cl-laptop': 15 }, 1),
+	used('acc-go', 'weekly', 70, 12, { 'cl-desktop': 10 }, 2),
+	used('acc-go', 'monthly', 24 * 15, 39, { 'cl-desktop': 30 }, 6)
+];
+const fakeKey = () => `dk_${Array.from({ length: 48 }, () => '0123456789abcdef'[Math.floor(Math.random() * 16)]).join('')}`;
+// The server's own check: shares of one pool add up to 100 at most.
+function overbooked(list) {
+	const totals = {};
+	for (const c of list) for (const [pool, share] of Object.entries(c.shares)) totals[pool] = (totals[pool] ?? 0) + share;
+	const over = Object.entries(totals).find(([, total]) => total > 100);
+	return over ? `shares of ${over[0]} add up to ${Math.round(over[1])}%, more than 100%` : null;
+}
+function changeClient(method, id, body) {
+	if (method === 'POST') {
+		const key = fakeKey();
+		const created = client(`cl-${Date.now()}`, body.name ?? 'Client', key.slice(-4), body.access ?? { all: true }, body.shares ?? {});
+		const error = overbooked([...clients, created]);
+		if (error) return [400, { error: { message: error } }];
+		clients.push(created);
+		return [201, { client: created, key }];
+	}
+	const index = clients.findIndex((c) => c.id === id);
+	if (index < 0) return [404, { error: { message: 'client not found' } }];
+	if (method === 'DELETE') { clients.splice(index, 1); return [204, null]; }
+	const next = { ...clients[index], ...(body.name ? { name: body.name } : {}), ...(body.access ? { access: body.access } : {}), ...(body.shares ? { shares: body.shares } : {}) };
+	const error = overbooked(clients.map((c, i) => (i === index ? next : c)));
+	if (error) return [400, { error: { message: error } }];
+	let key = null;
+	if (body.rotate_key) { key = fakeKey(); next.key_hint = `dk_\u2026${key.slice(-4)}`; }
+	clients[index] = next;
+	return [200, { client: next, key }];
+}
 const calls = Array.from({ length: 60 }, (_, i) => {
 	const [m, provider, account_id, latency] = traffic[i % traffic.length];
 	const failed = i === 17 || i === 41;
@@ -70,7 +117,8 @@ const calls = Array.from({ length: 60 }, (_, i) => {
 		id: `call-${i}`, started_at: ago(2 + i * 3.5), model: m, provider, account_id, status: failed ? 429 : 200,
 		latency_ms: latency + ((i * 137) % 900), input_tokens: 18_000 + ((i * 7919) % 60_000), output_tokens: 300 + ((i * 271) % 4000),
 		cache_read_tokens: 120_000 + ((i * 3571) % 400_000), cache_write_tokens: (i * 613) % 9000,
-		error: failed ? 'upstream quota or rate limit reached' : null
+		error: failed ? 'upstream quota or rate limit reached' : null,
+		client_id: provider === 'codex' ? 'cl-laptop' : provider === 'claude' ? ['cl-desktop', 'cl-family', 'cl-laptop'][i % 3] : i % 4 === 3 ? null : 'cl-desktop'
 	};
 });
 const summary = {
@@ -88,13 +136,16 @@ const resets = (id) => {
 	return { account_id: id, provider: owner?.provider ?? '', status: ready ? 'ready' : 'unsupported', available_count: ready ? (id === 'acc-claude-home' ? 1 : 0) : null, next_expires_at: ready ? at(24 * 9) : null, error: null };
 };
 
-function api(method, path) {
+function api(method, path, body) {
+	const target = path.match(/^\/clients(?:\/([^/]+))?$/);
+	if (target && method !== 'GET') return changeClient(method, target[1] && decodeURIComponent(target[1]), body ?? {});
 	if (method === 'POST' && path === '/restore') return { restored: 2, accounts: [], errors: [], settings: false };
 	if (method !== 'GET') return { ok: true };
 	const reset = path.match(/^\/accounts\/([^/]+)\/resets$/);
 	if (reset) return resets(decodeURIComponent(reset[1]));
 	switch (path) {
-		case '/summary': case '/status': return summary;
+		case '/summary': case '/status': return { ...summary, clients: clients.length };
+		case '/clients': return { enforced: clients.length > 0, clients, usage: usage.filter((row) => row.reset * 1000 > Date.now()) };
 		case '/providers': return { providers };
 		case '/accounts': return { accounts };
 		case '/quotas': return { quotas };
@@ -112,9 +163,17 @@ const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/cs
 createServer(async (request, response) => {
 	const url = new URL(request.url ?? '/', 'http://localhost');
 	if (url.pathname.startsWith('/admin/api/')) {
-		const body = api(request.method ?? 'GET', url.pathname.slice('/admin/api'.length));
-		response.writeHead(body ? 200 : 404, { 'content-type': 'application/json' });
-		response.end(JSON.stringify(body ?? { error: { message: 'not in the sample data' } }));
+		let input = null;
+		if (request.method !== 'GET') {
+			const chunks = [];
+			for await (const chunk of request) chunks.push(chunk);
+			try { input = chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : null; } catch { input = null; }
+		}
+		const result = api(request.method ?? 'GET', url.pathname.slice('/admin/api'.length), input);
+		const [status, body] = Array.isArray(result) ? result : [result ? 200 : 404, result ?? { error: { message: 'not in the sample data' } }];
+		if (status === 204) { response.writeHead(204).end(); return; }
+		response.writeHead(status, { 'content-type': 'application/json' });
+		response.end(JSON.stringify(body));
 		return;
 	}
 	if (url.pathname === '/health') {

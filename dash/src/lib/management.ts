@@ -23,8 +23,16 @@ export type Quota = { account_id: string; windows: QuotaWindow[]; subscription?:
 export type ResetAvailability = { account_id: string; provider: string; status: 'ready' | 'unsupported' | 'unavailable' | 'ineligible' | 'disabled'; available_count: number | null; next_expires_at: string | null; pending_request_id?: string | null; error: string | null };
 export type ResetResult = { request_id: string; outcome: 'reset' | 'nothing_to_reset' | 'no_credit' | 'already_redeemed' };
 export type Model = { id: string; provider: string; name?: string; context_length?: number | null; enabled?: boolean };
-export type Call = { id: string | number; started_at: string; model: string; provider: string; account_id?: string | null; status: number; latency_ms?: number; input_tokens?: number; output_tokens?: number; cache_read_tokens?: number; cache_write_tokens?: number; error?: string | null };
-export type Status = { version: string; uptime_seconds: number; in_flight: number; requests: number; errors: number; accounts: number; enabled_accounts: number; providers: number; input_tokens: number; output_tokens: number; cache_read_tokens?: number; cache_write_tokens?: number; client_api_base_url?: string | null };
+export type Call = { id: string | number; started_at: string; model: string; provider: string; account_id?: string | null; status: number; latency_ms?: number; input_tokens?: number; output_tokens?: number; cache_read_tokens?: number; cache_write_tokens?: number; error?: string | null; client_id?: string | null };
+export type Status = { version: string; uptime_seconds: number; in_flight: number; requests: number; errors: number; accounts: number; enabled_accounts: number; providers: number; input_tokens: number; output_tokens: number; cache_read_tokens?: number; cache_write_tokens?: number; client_api_base_url?: string | null; clients?: number };
+/** The accounts a client key may use; `all` includes accounts connected later. */
+export type ClientAccess = { all: boolean; pools: string[]; accounts: string[] };
+export type Client = { id: string; name: string; key_hint: string; created_at: string; access: ClientAccess; shares: Record<string, number> };
+/** Percent points of one account-wide window attributed to each client id (`""` is a call without key). */
+export type ClientUsage = { account_id: string; kind: ReserveWindow; reset: number; used: number; clients: Record<string, number>; outside: number };
+export type ClientsReport = { enforced: boolean; clients: Client[]; usage: ClientUsage[] };
+export type ClientPatch = { name?: string; access?: ClientAccess; shares?: Record<string, number>; rotate_key?: boolean };
+export type ClientSaved = { client: Client; key: string | null };
 export type Strategy = 'round-robin' | 'fill-first' | 'reset-first' | 'smart';
 export type QuotaDisplay = 'accounts' | 'average';
 export type QuotaWindowChoice = { hidden?: string[]; primary?: string | null };
@@ -80,6 +88,10 @@ export const management = {
 	oauthCallback: (id: string, code: string, state: string) => request<{ account: Account }>('/oauth/callback', { method: 'POST', body: JSON.stringify({ id, code, state }) }),
 	setModelEnabled: (id: string, enabled: boolean) => request(`/models/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ enabled }) }),
 	settingsSave: (settings: Partial<Settings>) => request<Settings>('/settings', { method: 'PATCH', body: JSON.stringify(settings) }),
+	clients: () => request<ClientsReport>('/clients'),
+	createClient: (patch: ClientPatch) => request<ClientSaved>('/clients', { method: 'POST', body: JSON.stringify(patch) }),
+	updateClient: (id: string, patch: ClientPatch) => request<ClientSaved>(`/clients/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(patch) }),
+	deleteClient: (id: string) => request(`/clients/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 	exportConfig: () => request<ExportBundle>('/export'),
 	restore: (bundle: unknown, settings: boolean) => request<RestoreResult>('/restore', { method: 'POST', body: JSON.stringify({ bundle, settings }) })
 };
@@ -87,6 +99,20 @@ export const management = {
 export const providerNames: Record<string, string> = {
 	codex: 'Codex', claude: 'Claude', gemini: 'Gemini', antigravity: 'Antigravity', qwen: 'Qwen', kimi: 'Kimi', copilot: 'GitHub Copilot', iflow: 'iFlow', opencode_go: 'OpenCode Go', xai: 'Grok', grok: 'Grok', openai_compatible: 'OpenAI-compatible'
 };
+/** The pool an account serves: its route for a custom endpoint, else its provider. */
+export function accountPool(account: Account) { return account.route || account.provider; }
+export type Pool = { id: string; provider: string; name: string; accounts: Account[] };
+/** Pools with their accounts, in the order accounts arrive. */
+export function pools(accounts: Account[]): Pool[] {
+	const byId = new Map<string, Pool>();
+	for (const account of accounts) {
+		const id = accountPool(account);
+		const pool = byId.get(id) ?? { id, provider: account.provider, name: account.route ? account.name : providerName(account.provider), accounts: [] };
+		pool.accounts.push(account);
+		byId.set(id, pool);
+	}
+	return [...byId.values()];
+}
 export function privateLabel(value: string, showEmails = false) { return showEmails ? value : value.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, t('private.account')); }
 export function importErrors(errors: ImportError[]) { return errors.map(error => typeof error === 'string' ? error : error.name ? t('api.errorPrefix', { name: privateLabel(error.name), error: error.error }) : error.error).join(' '); }
 const statusKeys: Record<string, StringKey> = { ready: 'status.active', active: 'status.active', disabled: 'common.disabled', exhausted: 'status.exhausted', cooldown: 'status.cooldown', expired: 'status.expired', error: 'status.check' };
