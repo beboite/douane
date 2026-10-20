@@ -832,7 +832,7 @@ fn is_weekly(id: &str) -> bool {
 }
 /// Length of an account-wide window in seconds, used to find the longest
 /// one. A `window-` id without a parsable length ranks below every known one.
-fn window_seconds(id: &str) -> Option<f64> {
+pub(crate) fn window_seconds(id: &str) -> Option<f64> {
     match id {
         "five-hour" => Some(18_000.0),
         "daily" => Some(86_400.0),
@@ -1176,7 +1176,7 @@ fn load_snapshots(path: &std::path::Path) -> BTreeMap<String, QuotaSnapshot> {
 }
 
 /// Replaces `path` atomically with an owner-only file.
-fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(std::io::Error::other("refusing a symlinked snapshot file"));

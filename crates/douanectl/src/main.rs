@@ -65,6 +65,158 @@ enum Command {
     /// rotating. Keys come from a file or stdin, never from arguments.
     #[command(subcommand)]
     Endpoint(Endpoint),
+    /// Client keys: once one client exists, every call needs a key. Each
+    /// client reaches the accounts its access allows and holds its share of
+    /// each provider's quota windows.
+    #[command(subcommand)]
+    Client(ClientCommand),
+}
+#[derive(Subcommand)]
+enum ClientCommand {
+    /// List clients, their access, shares and attributed usage.
+    List,
+    /// Create a client: `douanectl client add Famille --pools claude
+    /// --share claude=25 --key-file famille.key`.
+    Add {
+        name: String,
+        #[command(flatten)]
+        rules: ClientRules,
+        /// Write the new key to this file instead of printing it.
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+    },
+    /// Change a client's name, access or shares, or replace its key.
+    Set {
+        id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[command(flatten)]
+        rules: ClientRules,
+        /// Replace the key; the old one stops working at once.
+        #[arg(long)]
+        rotate_key: bool,
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+    },
+    Remove {
+        id: String,
+    },
+}
+#[derive(clap::Args)]
+struct ClientRules {
+    /// Allow every account, accounts connected later included.
+    #[arg(long, conflicts_with_all = ["pools", "accounts"])]
+    all: bool,
+    /// Comma-separated providers or routes whose every account is allowed.
+    #[arg(long, value_delimiter = ',')]
+    pools: Option<Vec<String>>,
+    /// Comma-separated account ids allowed beyond the pools.
+    #[arg(long, value_delimiter = ',')]
+    accounts: Option<Vec<String>>,
+    /// Comma-separated `pool=percent` shares; an empty value removes them.
+    #[arg(long, value_delimiter = ',')]
+    share: Option<Vec<String>>,
+}
+
+impl ClientRules {
+    fn patch(self, patch: &mut Value) -> Result<()> {
+        if self.all {
+            patch["access"] = json!({"all": true});
+        } else if self.pools.is_some() || self.accounts.is_some() {
+            let list = |v: Option<Vec<String>>| {
+                v.unwrap_or_default()
+                    .into_iter()
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            };
+            patch["access"] =
+                json!({"all": false, "pools": list(self.pools), "accounts": list(self.accounts)});
+        }
+        if let Some(shares) = self.share {
+            let mut map = serde_json::Map::new();
+            for share in shares.iter().filter(|s| !s.is_empty()) {
+                let (pool, percent) = share
+                    .split_once('=')
+                    .with_context(|| format!("{share}: write a share as pool=percent"))?;
+                let percent: f64 = percent
+                    .trim_end_matches('%')
+                    .parse()
+                    .with_context(|| format!("{share}: the percent is not a number"))?;
+                map.insert(pool.to_owned(), json!(percent));
+            }
+            patch["shares"] = Value::Object(map);
+        }
+        Ok(())
+    }
+}
+
+/// Prints a new key, or writes it to a private file and says where.
+fn deliver_key(mut value: Value, key_file: Option<PathBuf>) -> Result<Value> {
+    if let (Some(path), Some(key)) = (key_file, value["key"].as_str().map(str::to_owned)) {
+        write_private(&path, key.as_bytes())?;
+        value["key"] = json!(format!("written to {}", path.display()));
+    }
+    Ok(value)
+}
+
+async fn client_command(
+    client: &reqwest::Client,
+    root: &str,
+    command: ClientCommand,
+) -> Result<Value> {
+    match command {
+        ClientCommand::List => send(client.get(format!("{root}/admin/api/clients"))).await,
+        ClientCommand::Add {
+            name,
+            rules,
+            key_file,
+        } => {
+            let mut body = json!({ "name": name });
+            rules.patch(&mut body)?;
+            let value = send(client.post(format!("{root}/admin/api/clients")).json(&body)).await?;
+            deliver_key(value, key_file)
+        }
+        ClientCommand::Set {
+            id,
+            name,
+            rules,
+            rotate_key,
+            key_file,
+        } => {
+            let mut body = json!({});
+            if let Some(name) = name {
+                body["name"] = json!(name);
+            }
+            if rotate_key {
+                body["rotate_key"] = json!(true);
+            }
+            rules.patch(&mut body)?;
+            if body.as_object().is_some_and(|p| p.is_empty()) {
+                bail!("give --name, --all, --pools, --accounts, --share or --rotate-key");
+            }
+            let value = send(
+                client
+                    .patch(format!("{root}/admin/api/clients/{id}"))
+                    .json(&body),
+            )
+            .await?;
+            deliver_key(value, key_file)
+        }
+        ClientCommand::Remove { id } => {
+            let response = client.delete(format!("{root}/admin/api/clients/{id}"));
+            let response = match std::env::var("DOUANE_MANAGEMENT_TOKEN") {
+                Ok(token) => response.bearer_auth(token),
+                Err(_) => response,
+            }
+            .send()
+            .await
+            .context("cannot reach douane")?;
+            if !response.status().is_success() {
+                bail!("douane returned {}", response.status());
+            }
+            Ok(json!({ "removed": id }))
+        }
+    }
 }
 #[derive(Subcommand)]
 enum Endpoint {
@@ -324,6 +476,11 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&value)?);
             return Ok(());
         }
+        Command::Client(command) => {
+            let value = client_command(&client, root, command).await?;
+            println!("{}", serde_json::to_string_pretty(&value)?);
+            return Ok(());
+        }
         Command::Export { output } => {
             let value = export(&client, root, &output).await?;
             println!("{}", serde_json::to_string_pretty(&value)?);
@@ -373,7 +530,9 @@ async fn main() -> Result<()> {
                 .post(format!("{root}/admin/api/restore"))
                 .json(&json!({"bundle":bundle,"settings":settings}))
         }
-        Command::Endpoint(_) | Command::Export { .. } => unreachable!("handled above"),
+        Command::Endpoint(_) | Command::Client(_) | Command::Export { .. } => {
+            unreachable!("handled above")
+        }
     };
     let value = send(request).await?;
     println!("{}", serde_json::to_string_pretty(&value)?);

@@ -20,6 +20,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// 429 when shares hold the client back, so it waits; 503 otherwise.
+pub(crate) fn refusal_status(message: &str) -> StatusCode {
+    if message.starts_with(crate::clients::SHARE_USED_UP) {
+        StatusCode::TOO_MANY_REQUESTS
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
 pub fn error(status: StatusCode, message: &str) -> Response {
     (
         status,
@@ -360,6 +369,7 @@ pub(crate) async fn choose(
     state: &AppState,
     body: &Value,
     headers: &HeaderMap,
+    client: Option<&crate::clients::Client>,
 ) -> Result<(String, Vec<AccountCredential>, Option<String>), String> {
     let model = body["model"]
         .as_str()
@@ -367,12 +377,13 @@ pub(crate) async fn choose(
         .ok_or("model is required")?;
     let session = crate::affinity::session_key(headers, body);
     let (upstream, accounts) = state
-        .candidates(
+        .candidates_for(
             model,
             headers
                 .get("x-douane-provider")
                 .and_then(|v| v.to_str().ok()),
             session.as_deref(),
+            client,
         )
         .await?;
     Ok((upstream, accounts, session))
@@ -384,6 +395,10 @@ pub async fn forward(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let client = match state.clients.authenticate(&headers) {
+        Ok(client) => client,
+        Err(refusal) => return error(StatusCode::UNAUTHORIZED, refusal.message()),
+    };
     let count_tokens = uri.path().ends_with("/messages/count_tokens");
     let from = if uri.path().ends_with("/messages") || count_tokens {
         Dialect::Messages
@@ -397,9 +412,10 @@ pub async fn forward(
         Err(_) => return error(StatusCode::BAD_REQUEST, "body must be valid JSON"),
     };
     let stream = value["stream"].as_bool().unwrap_or(false);
-    let (model, candidates, session) = match choose(&state, &value, &headers).await {
+    let (model, candidates, session) = match choose(&state, &value, &headers, client.as_ref()).await
+    {
         Ok(v) => v,
-        Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, &e),
+        Err(e) => return error(refusal_status(&e), &e),
     };
     value["model"] = json!(model);
     // The Grok CLI repeats its model in a header, which gets the provider's id
@@ -590,7 +606,8 @@ pub async fn forward(
             Ok(v) => Bytes::from(v),
             Err(_) => return error(StatusCode::BAD_REQUEST, "cannot serialize request"),
         };
-        let mut call = CallGuard::new(state.ledger.clone(), &account, &model);
+        let mut call = CallGuard::new(state.ledger.clone(), &account, &model)
+            .for_client(&state.clients, client.as_ref());
         let mut retry_auth = true;
         // The setting bounds each wait on the upstream, never the whole answer:
         // a long generation keeps streaming as long as its events keep coming.
@@ -635,6 +652,7 @@ pub async fn forward(
             .quotas
             .observe_claude_headers(&account, response.headers())
             .await;
+        state.observe_usage(&account.id).await;
         if last_status.is_success() {
             state.accounts.clear_stale_error(&account.id).await;
         }
@@ -1311,6 +1329,7 @@ pub(crate) struct CallGuard {
     start: Instant,
     ledger: Arc<Ledger>,
     uncached_input: Option<u64>,
+    clients: Option<Arc<crate::clients::Clients>>,
 }
 impl CallGuard {
     pub fn new(ledger: Arc<Ledger>, account: &AccountCredential, model: &str) -> Self {
@@ -1329,7 +1348,20 @@ impl CallGuard {
             start: Instant::now(),
             ledger,
             uncached_input: None,
+            clients: None,
         }
+    }
+    /// Records the call under its client and counts it in the client usage
+    /// of its account.
+    pub fn for_client(
+        mut self,
+        clients: &Arc<crate::clients::Clients>,
+        client: Option<&crate::clients::Client>,
+    ) -> Self {
+        self.call.client_id = client.map(|c| c.id.clone());
+        clients.call_started(&self.call.account_id, self.call.client_id.as_deref());
+        self.clients = Some(clients.clone());
+        self
     }
     pub fn fail(&mut self, error: &str) {
         self.call.error = Some(error.to_owned());
@@ -1406,6 +1438,13 @@ impl Drop for CallGuard {
                 Some("client disconnected or upstream response was interrupted".into());
         }
         self.call.latency_ms = self.start.elapsed().as_millis() as u64;
+        if let Some(clients) = &self.clients {
+            clients.call_ended(
+                &self.call.account_id,
+                self.call.client_id.as_deref(),
+                crate::clients::call_weight(&self.call),
+            );
+        }
         self.ledger.record(std::mem::take(&mut self.call));
     }
 }

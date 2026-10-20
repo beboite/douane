@@ -259,6 +259,7 @@ pub async fn export(State(state): State<Arc<AppState>>) -> Response {
         "settings": settings,
         "disabled_models": disabled_models,
         "accounts": state.accounts.export().await,
+        "clients": state.clients.list(),
     });
     let mut response = Json(body).into_response();
     let headers = response.headers_mut();
@@ -316,6 +317,13 @@ pub async fn restore(State(state): State<Arc<AppState>>, Json(body): Json<Value>
             &format!("restore at most {MAX_RESTORE_ACCOUNTS} accounts at once"),
         );
     }
+    let clients: Option<Vec<crate::clients::Client>> = match bundle.get("clients") {
+        None | Some(Value::Null) => None,
+        Some(list) => match serde_json::from_value(list.clone()) {
+            Ok(list) => Some(list),
+            Err(_) => return error(StatusCode::BAD_REQUEST, "invalid clients in the export"),
+        },
+    };
     let configuration = if apply_settings {
         let settings: crate::settings::Settings =
             match serde_json::from_value(bundle.get("settings").cloned().unwrap_or(json!({}))) {
@@ -355,6 +363,13 @@ pub async fn restore(State(state): State<Arc<AppState>>, Json(body): Json<Value>
         }
         *state.config.write().await = config;
     }
+    let restored_clients = match clients {
+        Some(list) => match state.clients.restore(list) {
+            Ok(count) => count,
+            Err(e) => return error(StatusCode::BAD_REQUEST, &e),
+        },
+        None => 0,
+    };
     let mut accounts = vec![];
     let mut errors = vec![];
     for (index, record) in records.iter().enumerate() {
@@ -386,6 +401,7 @@ pub async fn restore(State(state): State<Arc<AppState>>, Json(body): Json<Value>
             "accounts": accounts,
             "errors": errors,
             "settings": apply_settings,
+            "clients": restored_clients,
         })),
     )
         .into_response()
@@ -655,15 +671,33 @@ pub struct Params {
 }
 pub async fn public_models(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<Params>,
+) -> Response {
+    match state.clients.authenticate(&headers) {
+        Ok(client) => Json(list_models(&state, &query, client.as_ref()).await).into_response(),
+        Err(refusal) => error(StatusCode::UNAUTHORIZED, refusal.message()),
+    }
+}
+/// The management listing of client models: every model, as without keys.
+pub async fn management_models(
+    State(state): State<Arc<AppState>>,
     Query(query): Query<Params>,
 ) -> Json<Value> {
+    Json(list_models(&state, &query, None).await)
+}
+async fn list_models(
+    state: &AppState,
+    query: &Params,
+    client: Option<&crate::clients::Client>,
+) -> Value {
     // A pool is a provider, or one custom endpoint route.
     let ready: BTreeSet<String> = state
         .accounts
         .list()
         .await
         .into_iter()
-        .filter(|a| a.enabled)
+        .filter(|a| a.enabled && client.is_none_or(|c| c.access.allows_summary(a)))
         .map(|a| a.route.unwrap_or_else(|| a.provider.as_str().to_owned()))
         .collect();
     let upstream = query.ids.as_deref() == Some("upstream");
@@ -695,7 +729,7 @@ pub async fn public_models(
         .into_iter()
         .map(|m| public_model(m, upstream))
         .collect();
-    Json(json!({"object":"list","data":data}))
+    json!({"object":"list","data":data})
 }
 /// One row of the client model list. `context_window` and `reasoning_efforts`
 /// repeat `context_length` and `thinking.levels` under the names the Grok CLI
@@ -758,8 +792,13 @@ const CLIENT_REFRESH_WAIT: std::time::Duration = std::time::Duration::from_secs(
 
 pub async fn public_quotas(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Query(read): Query<QuotaRead>,
-) -> Json<Value> {
+) -> Response {
+    let client = match state.clients.authenticate(&headers) {
+        Ok(client) => client,
+        Err(refusal) => return error(StatusCode::UNAUTHORIZED, refusal.message()),
+    };
     if matches!(read.refresh.as_deref(), Some("1" | "true")) {
         // A read asked by hand: failures show at once, and a success clears
         // any shown error. The task outlives a timeout so no write is cut.
@@ -768,12 +807,76 @@ pub async fn public_quotas(
         let _ = tokio::time::timeout(CLIENT_REFRESH_WAIT, task).await;
     }
     let settings = state.config.read().await.settings.clone();
+    let mut accounts = state.accounts.list().await;
+    let mut snapshots = state.quotas.list().await;
+    // A client sees its accounts, each window as the part of what it may
+    // use that it has used.
+    if let Some(client) = &client {
+        accounts.retain(|a| client.access.allows_summary(a));
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        snapshots = snapshots
+            .into_iter()
+            .filter_map(|snapshot| {
+                let account = accounts.iter().find(|a| a.id == snapshot.account_id)?;
+                let pool = account
+                    .route
+                    .as_deref()
+                    .unwrap_or(account.provider.as_str());
+                Some(state.clients.client_view(client, snapshot, pool, now))
+            })
+            .collect();
+    }
     Json(crate::quota_view::overview(
-        state.accounts.list().await,
-        state.quotas.list().await,
+        accounts,
+        snapshots,
         &settings,
         crate::subscriptions::now(),
     ))
+    .into_response()
+}
+
+pub async fn clients(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let list: Vec<Value> = state.clients.list().iter().map(|c| c.public()).collect();
+    Json(json!({
+        "enforced": !list.is_empty(),
+        "clients": list,
+        "usage": state.clients.usage_report(now),
+    }))
+}
+
+pub async fn create_client(
+    State(state): State<Arc<AppState>>,
+    Json(patch): Json<crate::clients::ClientPatch>,
+) -> Response {
+    match state.clients.create(patch) {
+        Ok((client, key)) => (
+            StatusCode::CREATED,
+            Json(json!({"client": client.public(), "key": key})),
+        )
+            .into_response(),
+        Err(e) => error(StatusCode::BAD_REQUEST, &e),
+    }
+}
+
+pub async fn update_client(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(patch): Json<crate::clients::ClientPatch>,
+) -> Response {
+    match state.clients.update(&id, patch) {
+        Ok((client, key)) => Json(json!({"client": client.public(), "key": key})).into_response(),
+        Err(e) if e == "client not found" => error(StatusCode::NOT_FOUND, &e),
+        Err(e) => error(StatusCode::BAD_REQUEST, &e),
+    }
+}
+
+pub async fn delete_client(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    match state.clients.delete(&id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) if e == "client not found" => error(StatusCode::NOT_FOUND, &e),
+        Err(e) => error(StatusCode::BAD_REQUEST, &e),
+    }
 }
 pub async fn calls(State(state): State<Arc<AppState>>, Query(q): Query<Params>) -> Json<Value> {
     Json(json!({"calls":state.ledger.calls(q.limit.unwrap_or(100)).await}))
@@ -783,7 +886,7 @@ pub async fn summary(State(state): State<Arc<AppState>>) -> Json<Value> {
     let l = &state.ledger;
     let client_api_base_url = state.config.read().await.server.client_api_base_url.clone();
     Json(
-        json!({"accounts":accounts.len(),"enabled_accounts":accounts.iter().filter(|a|a.enabled).count(),"providers":accounts.iter().map(|a|a.provider).collect::<BTreeSet<_>>().len(),"requests":l.requests.load(Ordering::Relaxed),"errors":l.errors.load(Ordering::Relaxed),"input_tokens":l.input_tokens.load(Ordering::Relaxed),"output_tokens":l.output_tokens.load(Ordering::Relaxed),"cache_read_tokens":l.cache_read_tokens.load(Ordering::Relaxed),"cache_write_tokens":l.cache_write_tokens.load(Ordering::Relaxed),"in_flight":l.in_flight.load(Ordering::Relaxed),"dropped_logs":l.dropped_logs.load(Ordering::Relaxed),"uptime_seconds":l.started.elapsed().as_secs(),"version":env!("CARGO_PKG_VERSION"),"websocket":true,"client_api_base_url":client_api_base_url}),
+        json!({"accounts":accounts.len(),"enabled_accounts":accounts.iter().filter(|a|a.enabled).count(),"providers":accounts.iter().map(|a|a.provider).collect::<BTreeSet<_>>().len(),"requests":l.requests.load(Ordering::Relaxed),"errors":l.errors.load(Ordering::Relaxed),"input_tokens":l.input_tokens.load(Ordering::Relaxed),"output_tokens":l.output_tokens.load(Ordering::Relaxed),"cache_read_tokens":l.cache_read_tokens.load(Ordering::Relaxed),"cache_write_tokens":l.cache_write_tokens.load(Ordering::Relaxed),"in_flight":l.in_flight.load(Ordering::Relaxed),"dropped_logs":l.dropped_logs.load(Ordering::Relaxed),"uptime_seconds":l.started.elapsed().as_secs(),"version":env!("CARGO_PKG_VERSION"),"websocket":true,"client_api_base_url":client_api_base_url,"clients":state.clients.list().len()}),
     )
 }
 pub async fn settings(State(state): State<Arc<AppState>>) -> Json<Value> {
@@ -1195,7 +1298,7 @@ mod tests {
             };
             let state = state.clone();
             async move {
-                let Json(body) = public_models(State(state), Query(query)).await;
+                let Json(body) = management_models(State(state), Query(query)).await;
                 body["data"]
                     .as_array()
                     .unwrap()
