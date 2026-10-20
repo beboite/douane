@@ -17,6 +17,7 @@ douane connects your Claude, ChatGPT (Codex), Antigravity, Grok, GitHub Copilot 
 - Live quotas per account: five-hour, daily, weekly and monthly windows, reset times, plan tier, extra credits and banked resets, refreshed in the background.
 - Four routing strategies, per provider if you like, and failover to another account of the same provider when one runs out.
 - Conversation affinity: native session ids and `prompt_cache_key` pin a conversation to its account, so cache reads keep landing.
+- Client keys: give each tool or machine its own key, limit it to some accounts, and split each provider's quota windows between them by percentage.
 - Per-account reserve: stop spending an account at 5 % (or any share) of its longest quota window, or of the windows you pick (5 hours, weekly, both), so you keep some for yourself.
 - Request history with latency, token and cache counters; never conversation bodies or credentials.
 - OAuth and device sign-in from the dashboard, JSON import of existing CLI credentials, and `douanectl` for scripting.
@@ -102,7 +103,7 @@ curl http://127.0.0.1:8787/v1/chat/completions \
   -d '{"model":"<id from /v1/models>","messages":[{"role":"user","content":"Hello"}],"stream":true}'
 ```
 
-Model ids carry their provider prefix, for example `claude/...` or `codex/...`. The key `douane` is a placeholder: authentication upstream uses the connected subscription.
+Model ids carry their provider prefix, for example `claude/...` or `codex/...`. Until you create a [client key](#client-keys), the key `douane` is a placeholder: authentication upstream uses the connected subscription.
 
 ![Accounts page with plan, state and reserve per account](docs/images/accounts.png)
 
@@ -134,7 +135,7 @@ If clients reach the API at a different address than the dashboard (a reverse pr
 | `POST /v1/responses` | Responses, streaming included |
 | `POST /v1/responses/compact` | Native compaction on compatible upstreams |
 | `GET /v1/responses` (WebSocket) | Native Codex sessions, and a streaming bridge for the other subscriptions |
-| `/admin/api/*` | Accounts, quotas, models, request history, settings and OAuth |
+| `/admin/api/*` | Accounts, clients, quotas, models, request history, settings and OAuth |
 | `/v0/management`, `/v8/management` | A CLIProxyAPI-compatible subset of its management API |
 
 Translation between the three dialects covers text, tools and images; provider-specific extensions do not all have an equivalent. A failed request moves to another account only before its first byte reaches the client: started output is never replayed. A same-dialect request returns the provider's own rate-limit headers and request id, and client errors such as an oversized prompt come back as the provider wrote them.
@@ -221,17 +222,35 @@ Banked resets for Claude and Codex appear on each account card. Using one asks f
 
 ![Overview page: active accounts, requests, tokens, cache reads and recent activity](docs/images/activity.png)
 
+## Client keys
+
+With no client defined, anyone who reaches the client API can use every account. Create a client on the **Clients** page, with `POST /admin/api/clients` or `douanectl client add`, and from then on every `/v1` call needs a client key, sent as the tool's API key (`Authorization: Bearer dk_...` or `x-api-key`). Other keys get 401. The key is shown once; douane keeps only its hash. Deleting the last client opens the API again.
+
+- **Access.** A client reaches every account, accounts connected later included, or only the providers, custom routes and single accounts you pick. `/v1/models` and `/v1/quotas` list only what it may use.
+- **Shares.** A share is a percentage of each account-wide window (five hours, day, week, month) of every account of a provider. Shares of a provider add up to 100 % at most. What no share covers is common to every client. A client's unused share stays reserved for it until the last seventh of the window (the last day of a week), then any client may use it. A client with no share uses the common part, then freed shares. A client held back gets 429 until the window resets.
+- **Usage.** Providers report usage per account, not per caller, so douane attributes it: each rise of a window goes to the clients whose calls ended on that account since the previous reading, weighted by tokens, or to the calls still running. A rise that no call through douane explains counts as outside use. Calls of several clients interleaving on one account make the split an estimate; one client per account keeps it exact.
+- **Quota bars.** With a client key, `/v1/quotas` shows each window as the part the client has used of what it may use, so a full bar means it is held back.
+
+```sh
+douanectl client add Family --pools claude --share claude=25 --key-file family.key
+douanectl client set <client-id> --share claude=25,codex=40
+douanectl client set <client-id> --rotate-key --key-file family.key
+douanectl client list
+```
+
+In Boite, paste the key in the subscription proxy settings.
+
 ## Security and data
 
 - Credentials stay in `auth_dir` as local files. They never appear in the dashboard, logs or errors, and refresh-token rotation is serialised and written to disk. The management API returns them in one place only, a [configuration export](#export-and-restore).
 - On Linux and macOS, `auth_dir` is mode 0700 and each credential file 0600. On Windows, douane removes inherited permissions from `auth_dir` and grants full control to the current user alone; keep the configuration under that user's own profile, for example `%LOCALAPPDATA%\douane`.
-- SQLite stores request metadata only: time, model, account, status, latency and token or cache counts.
-- The default listener is loopback. To expose douane, put it behind a reverse proxy that authenticates the dashboard, and set `server.management_token_env` to require a bearer token on `/admin/api`. That token is separate from client access.
+- SQLite stores request metadata only: time, model, account, client, status, latency and token or cache counts.
+- The default listener is loopback. To expose douane, put it behind a reverse proxy that authenticates the dashboard, and set `server.management_token_env` to require a bearer token on `/admin/api`. That token is separate from client keys.
 - Google OAuth clients for Gemini and Antigravity are read from `oauth-clients.json` beside `auth_dir`, or from `DOUANE_GEMINI_*` and `DOUANE_ANTIGRAVITY_*` environment variables; douane ships none.
 
 ## Export and restore
 
-**Settings > Backup** in the dashboard, or `GET /admin/api/export`, downloads `douane-export-<date>.json`: settings, disabled models and every account with its tokens and keys. **Restore** reads that file into another douane. An account whose identity is already there is updated in place, the others are added; settings and disabled models are applied only when asked (`{"bundle": <file>, "settings": true}` on `POST /admin/api/restore`).
+**Settings > Backup** in the dashboard, or `GET /admin/api/export`, downloads `douane-export-<date>.json`: settings, disabled models, every account with its tokens and keys, and the clients with their key hashes, so their keys keep working after a restore. **Restore** reads that file into another douane. An account whose identity is already there is updated in place, the others are added; settings and disabled models are applied only when asked (`{"bundle": <file>, "settings": true}` on `POST /admin/api/restore`).
 
 The file holds live sign-ins. Refresh tokens rotate on use, so an account must live in one douane at a time: after restoring it elsewhere, remove it from the first one. Keep the file private and delete it once restored.
 
@@ -256,6 +275,10 @@ douanectl enable <account-id>
 douanectl remove <account-id>
 douanectl endpoint add <route> <base-url> --key-file <file|->
 douanectl endpoint set <route|account-id> [--base-url ...] [--dialect ...] [--models ...] [--key-file ...]
+douanectl client list
+douanectl client add <name> [--pools ...] [--accounts ...] [--share pool=percent,...] [--key-file <file>]
+douanectl client set <client-id> [--name ...] [--all|--pools ...] [--share ...] [--rotate-key]
+douanectl client remove <client-id>
 douanectl export --output <file>
 douanectl restore <file> [--settings]
 ```

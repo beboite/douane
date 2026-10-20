@@ -29,6 +29,8 @@ pub const KEY_PREFIX: &str = "dk_";
 pub const SHARE_USED_UP: &str = "this client's share of";
 /// A reset that moves by less than this is the same window read again.
 const RESET_TOLERANCE: i64 = 600;
+/// A fall of usage this large within one window means it was reset early.
+const NEW_WINDOW_DROP: f64 = 10.0;
 const MAX_CLIENTS: usize = 200;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -544,8 +546,12 @@ impl Clients {
                     continue;
                 }
             };
-            // A later reset, or usage going down, is a new window.
-            if reading.reset > window.reset + RESET_TOLERANCE || reading.used + 1.0 < window.used {
+            // A later reset, or usage falling by more than sources disagree
+            // (usage reads and inference headers round differently), is a
+            // new window.
+            if reading.reset > window.reset + RESET_TOLERANCE
+                || reading.used + NEW_WINDOW_DROP < window.used
+            {
                 window.reset = reading.reset;
                 window.used = 0.0;
                 window.clients.clear();
@@ -554,6 +560,11 @@ impl Clients {
             }
             let delta = reading.used - window.used;
             if delta <= 1e-9 {
+                // A slightly lower reading becomes the base of the next rise.
+                if delta < 0.0 {
+                    window.used = reading.used;
+                    usage.dirty = true;
+                }
                 continue;
             }
             rose = true;
@@ -907,6 +918,11 @@ mod tests {
         clients.observe(&snapshot("a", 23.0, reset), NOW);
         clients.observe(&snapshot("a", 24.0, reset), NOW);
         assert!((clients.usage_report(NOW)[0].clients["perso"] - 7.0).abs() < 1e-9);
+        // Two sources rounding differently keep the attribution.
+        clients.observe(&snapshot("a", 22.0, reset), NOW);
+        clients.call_ended("a", Some("perso"), 50.0);
+        clients.observe(&snapshot("a", 24.0, reset), NOW);
+        assert!((clients.usage_report(NOW)[0].clients["perso"] - 9.0).abs() < 1e-9);
         // A new window starts from zero.
         clients.call_ended("a", Some("perso"), 10.0);
         clients.observe(&snapshot("a", 2.0, reset + 7 * 86_400), NOW);
