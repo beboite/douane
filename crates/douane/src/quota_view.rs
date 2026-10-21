@@ -764,11 +764,21 @@ mod tests {
                 vec![quota_credit("extra", Some(2.0), Some(25.0))],
             ))
             .await;
+        let (_, key) = state
+            .clients
+            .create(crate::clients::ClientPatch {
+                name: Some("tests".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        // Copied into each request the closure below builds.
+        let bearer: &'static str = Box::leak(format!("Bearer {key}").into_boxed_str());
         let get = |state: std::sync::Arc<AppState>| async move {
             let response = crate::router(state)
                 .oneshot(
                     Request::builder()
                         .uri("/v1/quotas")
+                        .header("authorization", bearer)
                         .body(Body::empty())
                         .unwrap(),
                 )

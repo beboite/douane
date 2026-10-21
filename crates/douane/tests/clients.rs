@@ -1,6 +1,6 @@
-//! Client keys over HTTP: the open API closes once a client exists, each key
-//! reaches only the accounts its access allows, and keys outlive a restart
-//! and an export.
+//! Client keys over HTTP: no call passes without one, even before the first
+//! client exists; each key reaches only the accounts its access allows, keys
+//! outlive a restart and an export, and each client's spending is reported.
 use std::{sync::Arc, time::Duration};
 
 use axum::{
@@ -139,14 +139,18 @@ async fn a_client_key_reaches_only_the_accounts_its_access_allows() {
             .unwrap();
     }
     gateway.state.refresh_models().await;
-    // No client yet: the API is open, placeholder keys included.
-    assert_eq!(gateway.models(None).await.1.len(), 2);
+    // No client yet: every call is refused, and told how to get a key.
+    assert_eq!(gateway.models(None).await.0, 401);
     assert_eq!(
         gateway
             .chat(Some("boite-subscription-proxy"), "spare/chat-model")
             .await,
-        200
+        401
     );
+    let (_, refusal) = gateway
+        .send(reqwest::Method::GET, "/v1/quotas", None, None)
+        .await;
+    assert!(refusal.to_string().contains("no client yet"), "{refusal}");
 
     let (status, created) = gateway
         .send(
@@ -177,7 +181,7 @@ async fn a_client_key_reaches_only_the_accounts_its_access_allows() {
         .await;
     assert_eq!(status, 401, "{quotas}");
 
-    // The ledger names the client of each call.
+    // The ledger names the client of each call, and the statistics sum them.
     gateway.state.ledger.flush().await;
     let calls = gateway.state.ledger.calls(10).await;
     let id = created["client"]["id"].as_str().unwrap();
@@ -185,6 +189,30 @@ async fn a_client_key_reaches_only_the_accounts_its_access_allows() {
         calls
             .iter()
             .any(|c| c.client_id.as_deref() == Some(id) && c.status == 200)
+    );
+    let (status, stats) = gateway
+        .send(
+            reqwest::Method::GET,
+            "/admin/api/clients/stats?hours=24",
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{stats}");
+    let totals = stats["totals"].as_array().unwrap();
+    let loop_model = totals
+        .iter()
+        .find(|t| t["client_id"] == id && t["provider"] == "loop" && t["model"] == "chat-model")
+        .unwrap_or_else(|| panic!("{stats}"));
+    assert_eq!(loop_model["calls"], 1);
+    assert_eq!(loop_model["input_tokens"], 3);
+    assert_eq!(loop_model["output_tokens"], 1);
+    assert!(
+        stats["hours"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["client_id"] == id && h["calls"].as_u64() >= Some(1))
     );
 
     // The account folder still opens: client files are not accounts.
@@ -223,7 +251,7 @@ async fn a_client_key_reaches_only_the_accounts_its_access_allows() {
         (200, vec!["loop/chat-model".to_owned()])
     );
 
-    // Deleting the last client opens the API again.
+    // Deleting the last client closes the API to everyone.
     let (status, _) = target
         .send(
             reqwest::Method::DELETE,
@@ -233,7 +261,8 @@ async fn a_client_key_reaches_only_the_accounts_its_access_allows() {
         )
         .await;
     assert_eq!(status, 204);
-    assert_eq!(target.models(None).await.0, 200);
+    assert_eq!(target.models(None).await.0, 401);
+    assert_eq!(target.models(Some(&key)).await.0, 401);
 }
 
 #[tokio::test]

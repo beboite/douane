@@ -30,7 +30,12 @@ export type ClientAccess = { all: boolean; pools: string[]; accounts: string[] }
 export type Client = { id: string; name: string; key_hint: string; created_at: string; access: ClientAccess; shares: Record<string, number> };
 /** Percent points of one account-wide window attributed to each client id (`""` is a call without key). */
 export type ClientUsage = { account_id: string; kind: ReserveWindow; reset: number; used: number; clients: Record<string, number>; outside: number };
-export type ClientsReport = { enforced: boolean; clients: Client[]; usage: ClientUsage[] };
+export type ClientsReport = { clients: Client[]; usage: ClientUsage[] };
+/** What one client spent on one model; `client_id` is empty for calls made before keys were required. */
+export type ClientTotals = { client_id: string; provider: string; model: string; calls: number; errors: number; input_tokens: number; output_tokens: number; cache_read_tokens: number; cache_write_tokens: number; latency_ms: number; last_at: string };
+/** One client's calls and tokens in one UTC hour, `hour` as `YYYY-MM-DDTHH`. */
+export type ClientHour = { client_id: string; hour: string; calls: number; tokens: number };
+export type ClientStats = { since: string; totals: ClientTotals[]; hours: ClientHour[] };
 export type ClientPatch = { name?: string; access?: ClientAccess; shares?: Record<string, number>; rotate_key?: boolean };
 export type ClientSaved = { client: Client; key: string | null };
 export type Strategy = 'round-robin' | 'fill-first' | 'reset-first' | 'smart';
@@ -89,6 +94,7 @@ export const management = {
 	setModelEnabled: (id: string, enabled: boolean) => request(`/models/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ enabled }) }),
 	settingsSave: (settings: Partial<Settings>) => request<Settings>('/settings', { method: 'PATCH', body: JSON.stringify(settings) }),
 	clients: () => request<ClientsReport>('/clients'),
+	clientStats: (hours: number) => request<ClientStats>(`/clients/stats?hours=${hours}`),
 	createClient: (patch: ClientPatch) => request<ClientSaved>('/clients', { method: 'POST', body: JSON.stringify(patch) }),
 	updateClient: (id: string, patch: ClientPatch) => request<ClientSaved>(`/clients/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(patch) }),
 	deleteClient: (id: string) => request(`/clients/${encodeURIComponent(id)}`, { method: 'DELETE' }),

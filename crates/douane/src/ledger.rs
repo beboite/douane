@@ -27,14 +27,48 @@ pub struct Call {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub error: Option<String>,
-    /// The douane client that made the call; `None` without client keys.
+    /// The douane client that made the call; `None` for calls made before
+    /// client keys were required.
     #[serde(default)]
     pub client_id: Option<String>,
+}
+
+/// What one client spent on one model of one provider over a period.
+/// `client_id` is empty for calls made before keys were required.
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+pub struct ClientTotals {
+    pub client_id: String,
+    pub provider: String,
+    pub model: String,
+    pub calls: u64,
+    pub errors: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub latency_ms: u64,
+    pub last_at: String,
+}
+
+/// One client's calls and tokens in one UTC hour, `hour` as `YYYY-MM-DDTHH`.
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+pub struct ClientHour {
+    pub client_id: String,
+    pub hour: String,
+    pub calls: u64,
+    pub tokens: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+pub struct ClientStats {
+    pub totals: Vec<ClientTotals>,
+    pub hours: Vec<ClientHour>,
 }
 
 enum Command {
     Record(Call),
     List(usize, oneshot::Sender<Vec<Call>>),
+    Stats(String, oneshot::Sender<ClientStats>),
     Flush(oneshot::Sender<()>),
 }
 
@@ -85,6 +119,9 @@ impl Ledger {
                         })().unwrap_or_default();
                         let _=reply.send(rows);
                     },
+                    Command::Stats(since,reply) => {
+                        let _=reply.send(client_stats(&db,&since).unwrap_or_default());
+                    },
                     Command::Flush(reply) => { let _=db.execute_batch("PRAGMA wal_checkpoint(PASSIVE)"); let _=reply.send(()); },
                 }
             }
@@ -132,10 +169,115 @@ impl Ledger {
         }
         rx.await.unwrap_or_default()
     }
+    /// Totals by client, provider and model, and by client and hour, of the
+    /// calls recorded since `since` (RFC 3339, UTC).
+    pub async fn client_stats(&self, since: String) -> ClientStats {
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(Command::Stats(since, tx)).await.is_err() {
+            return ClientStats::default();
+        }
+        rx.await.unwrap_or_default()
+    }
     pub async fn flush(&self) {
         let (tx, rx) = oneshot::channel();
         if self.tx.send(Command::Flush(tx)).await.is_ok() {
             let _ = rx.await;
         }
+    }
+}
+
+fn client_stats(db: &Connection, since: &str) -> rusqlite::Result<ClientStats> {
+    let mut totals = db.prepare(
+        "SELECT coalesce(client_id,''),provider,model,count(*),coalesce(sum(status>=400 OR error IS NOT NULL),0),         coalesce(sum(input_tokens),0),coalesce(sum(output_tokens),0),coalesce(sum(cache_read_tokens),0),         coalesce(sum(cache_write_tokens),0),coalesce(sum(latency_ms),0),max(started_at)          FROM subscription_calls WHERE started_at>=?1 GROUP BY 1,2,3 ORDER BY 1,2,3",
+    )?;
+    let totals = totals
+        .query_map([since], |r| {
+            Ok(ClientTotals {
+                client_id: r.get(0)?,
+                provider: r.get(1)?,
+                model: r.get(2)?,
+                calls: r.get(3)?,
+                errors: r.get(4)?,
+                input_tokens: r.get(5)?,
+                output_tokens: r.get(6)?,
+                cache_read_tokens: r.get(7)?,
+                cache_write_tokens: r.get(8)?,
+                latency_ms: r.get(9)?,
+                last_at: r.get(10)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut hours = db.prepare(
+        "SELECT coalesce(client_id,''),substr(started_at,1,13),count(*),         coalesce(sum(input_tokens+output_tokens),0)          FROM subscription_calls WHERE started_at>=?1 GROUP BY 1,2 ORDER BY 2,1",
+    )?;
+    let hours = hours
+        .query_map([since], |r| {
+            Ok(ClientHour {
+                client_id: r.get(0)?,
+                hour: r.get(1)?,
+                calls: r.get(2)?,
+                tokens: r.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(ClientStats { totals, hours })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn call(id: &str, at: &str, client: Option<&str>, model: &str, status: u16) -> Call {
+        Call {
+            id: id.into(),
+            started_at: at.into(),
+            provider: "claude".into(),
+            account_id: "a".into(),
+            model: model.into(),
+            status,
+            latency_ms: 100,
+            input_tokens: 1000,
+            output_tokens: 50,
+            cache_read_tokens: 800,
+            client_id: client.map(Into::into),
+            ..Call::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn client_stats_sum_each_client_by_model_and_by_hour_since_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Ledger::open(&dir.path().join("calls.sqlite")).unwrap();
+        ledger.record(call("1", "2026-10-20T08:00:00Z", Some("nuno"), "opus", 200));
+        ledger.record(call("2", "2026-10-21T08:10:00Z", Some("nuno"), "opus", 200));
+        ledger.record(call("3", "2026-10-21T08:50:00Z", Some("nuno"), "opus", 429));
+        ledger.record(call("4", "2026-10-21T09:05:00Z", Some("nuno"), "sonnet", 200));
+        ledger.record(call("5", "2026-10-21T09:06:00Z", Some("famille"), "opus", 200));
+        ledger.record(call("6", "2026-10-21T09:07:00Z", None, "opus", 200));
+        ledger.flush().await;
+        let stats = ledger.client_stats("2026-10-21T00:00:00Z".into()).await;
+        let opus = stats
+            .totals
+            .iter()
+            .find(|t| t.client_id == "nuno" && t.model == "opus")
+            .unwrap();
+        assert_eq!(
+            (opus.calls, opus.errors, opus.input_tokens, opus.output_tokens),
+            (2, 1, 2000, 100)
+        );
+        assert_eq!(opus.cache_read_tokens, 1600);
+        assert_eq!(opus.last_at, "2026-10-21T08:50:00Z");
+        assert_eq!(stats.totals.len(), 4);
+        assert!(stats.totals.iter().any(|t| t.client_id.is_empty()));
+        let nuno: Vec<_> = stats
+            .hours
+            .iter()
+            .filter(|h| h.client_id == "nuno")
+            .map(|h| (h.hour.as_str(), h.calls, h.tokens))
+            .collect();
+        assert_eq!(
+            nuno,
+            [("2026-10-21T08", 2, 2100), ("2026-10-21T09", 1, 1050)]
+        );
     }
 }

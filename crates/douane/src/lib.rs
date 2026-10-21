@@ -56,6 +56,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/clients",
             get(management::clients).post(management::create_client),
         )
+        .route("/clients/stats", get(management::client_stats))
         .route(
             "/clients/{id}",
             patch(management::update_client).delete(management::delete_client),

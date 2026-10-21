@@ -70,7 +70,13 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
         .with_context(|| format!("binding {listen}"))?;
-    tracing::info!(listen=%listen,accounts=state.accounts.list().await.len(),"subscription proxy ready");
+    let clients = state.clients.list().len();
+    tracing::info!(listen=%listen,accounts=state.accounts.list().await.len(),clients,"subscription proxy ready");
+    if clients == 0 {
+        tracing::warn!(
+            "no client yet: every API call is refused until one is created on the Clients page or with `douanectl client add`"
+        );
+    }
     axum::serve(listener, douane::router(state.clone()))
         .with_graceful_shutdown(shutdown())
         .await?;

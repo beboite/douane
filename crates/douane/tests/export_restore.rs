@@ -106,6 +106,28 @@ impl Instance {
     async fn post(&self, path: &str, body: Value) -> (u16, Value) {
         self.send(reqwest::Method::POST, path, Some(body)).await
     }
+
+    /// A client API call with the key of a client created for it.
+    async fn call(&self, path: &str, body: Value) -> (u16, Value) {
+        let (_, key) = self
+            .state
+            .clients
+            .create(douane::clients::ClientPatch {
+                name: Some(format!("tests {}", self.state.clients.list().len())),
+                ..Default::default()
+            })
+            .unwrap();
+        let response = self
+            .client
+            .post(format!("{}{path}", self.server.url))
+            .bearer_auth(key)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        (status, response.json().await.unwrap_or(Value::Null))
+    }
 }
 
 fn endpoint(route: &str, base: &str, key: &str) -> Value {
@@ -201,7 +223,7 @@ async fn an_export_restored_into_a_fresh_instance_serves_its_endpoints() {
     assert_eq!(routes, ["loop", "spare"]);
 
     let (status, answer) = target
-        .post(
+        .call(
             "/v1/chat/completions",
             json!({"model":"loop/chat-model","messages":[{"role":"user","content":"hi"}]}),
         )
@@ -211,7 +233,7 @@ async fn an_export_restored_into_a_fresh_instance_serves_its_endpoints() {
     assert_eq!(*keys.lock().unwrap(), ["Bearer key-loop"]);
     // The disabled model stays disabled on the new instance.
     let (status, _) = target
-        .post(
+        .call(
             "/v1/chat/completions",
             json!({"model":"spare/chat-model","messages":[{"role":"user","content":"hi"}]}),
         )

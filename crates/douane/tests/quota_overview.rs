@@ -21,6 +21,19 @@ fn state(directory: &std::path::Path, path: Option<std::path::PathBuf>) -> Arc<A
     state
 }
 
+/// The key of a new client of `state`; every client API call needs one.
+fn client_key(state: &AppState) -> String {
+    let name = format!("tests {}", state.clients.list().len());
+    state
+        .clients
+        .create(douane::clients::ClientPatch {
+            name: Some(name),
+            ..Default::default()
+        })
+        .unwrap()
+        .1
+}
+
 async fn send(app: &axum::Router, request: Request<Body>) -> (StatusCode, Value) {
     let response = app.clone().oneshot(request).await.unwrap();
     let status = response.status();
@@ -60,10 +73,17 @@ async fn quotas_use_the_same_client_authentication_as_models() {
         )
         .await
         .unwrap();
+    let key = client_key(&state);
     let app = douane::router(state);
     for bearer in [None, Some("douane"), Some("subscription-proxy-key")] {
         let (models, _) = send(&app, get("/v1/models", bearer)).await;
-        let (status, body) = send(&app, get("/v1/quotas", bearer)).await;
+        let (status, _) = send(&app, get("/v1/quotas", bearer)).await;
+        assert_eq!(status, models);
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    {
+        let (models, _) = send(&app, get("/v1/models", Some(&key))).await;
+        let (status, body) = send(&app, get("/v1/quotas", Some(&key))).await;
         assert_eq!(status, models);
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["object"], "quotas");
@@ -105,11 +125,12 @@ async fn a_client_refresh_reads_every_account_and_reports_failures_at_once() {
         )
         .await
         .unwrap();
+    let key = client_key(&state);
     let app = douane::router(state);
-    let (_, body) = send(&app, get("/v1/quotas", None)).await;
+    let (_, body) = send(&app, get("/v1/quotas", Some(&key))).await;
     assert_eq!(body["providers"].as_array().unwrap().len(), 1);
     assert_eq!(body["providers"][0]["entries"][0]["error"], Value::Null);
-    let (status, body) = send(&app, get("/v1/quotas?refresh=1", None)).await;
+    let (status, body) = send(&app, get("/v1/quotas?refresh=1", Some(&key))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["providers"].as_array().unwrap().len(), 1);
     assert_eq!(body["providers"][0]["provider"], "antigravity");
@@ -133,6 +154,7 @@ async fn quota_display_defaults_to_accounts_for_every_provider() {
             .await
             .unwrap();
     }
+    let key = client_key(&state);
     let app = douane::router(state.clone());
     let (_, settings) = send(&app, get("/admin/api/settings", Some("fixture-management"))).await;
     assert_eq!(settings["quota_display"], json!({}));
@@ -145,7 +167,7 @@ async fn quota_display_defaults_to_accounts_for_every_provider() {
             .quota_display(SubscriptionProvider::Codex),
         QuotaDisplay::Accounts
     );
-    let (_, body) = send(&app, get("/v1/quotas", None)).await;
+    let (_, body) = send(&app, get("/v1/quotas", Some(&key))).await;
     assert_eq!(body["providers"].as_array().unwrap().len(), 1);
     assert_eq!(body["providers"][0]["provider"], "codex");
     assert_eq!(body["providers"][0]["name"], "Codex");
@@ -174,6 +196,7 @@ async fn quota_display_persists_through_the_settings_api() {
             .await
             .unwrap();
     }
+    let key = client_key(&state);
     let app = douane::router(state);
 
     let (status, settings) = send(
@@ -197,7 +220,7 @@ async fn quota_display_persists_through_the_settings_api() {
         QuotaDisplay::Accounts
     );
 
-    let (_, body) = send(&app, get("/v1/quotas", None)).await;
+    let (_, body) = send(&app, get("/v1/quotas", Some(&key))).await;
     let provider = &body["providers"][0];
     assert_eq!(provider["display"], "average");
     assert_eq!(provider["entries"].as_array().unwrap().len(), 1);
@@ -219,7 +242,7 @@ async fn quota_display_persists_through_the_settings_api() {
     let (status, settings) = send(&app, patch_settings(json!({"quota_display":{}}))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(settings["quota_display"], json!({}));
-    let (_, body) = send(&app, get("/v1/quotas", None)).await;
+    let (_, body) = send(&app, get("/v1/quotas", Some(&key))).await;
     assert_eq!(body["providers"][0]["display"], "accounts");
     assert_eq!(body["providers"][0]["entries"].as_array().unwrap().len(), 2);
 }

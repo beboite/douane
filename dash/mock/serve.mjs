@@ -70,6 +70,35 @@ const clients = [
 	client('cl-family', 'Family', '41c7', { all: false, pools: ['claude'] }, { claude: 25 }),
 	client('cl-laptop', 'Laptop', 'b80e', { all: false, pools: ['codex', 'claude'] }, { codex: 40 })
 ];
+// A month of hourly traffic per client, quieter at night; '' predates the keys.
+const hourly = [];
+for (let back = 24 * 30 - 1; back >= 0; back--) {
+	const start = new Date(now - back * 3600_000);
+	const hour = start.toISOString().slice(0, 13);
+	const day = ((start.getUTCHours() + 2) % 24) >= 9;
+	for (const [id, scale, phase] of [['cl-desktop', 900_000, 0], ['cl-family', 260_000, 2], ['cl-laptop', 420_000, 5], ['', 120_000, 1]]) {
+		if (id === '' && back < 24 * 12) continue;
+		const wave = (Math.sin((back + phase) / 5) + 1.2) * (day ? 1 : 0.15);
+		if (wave < 0.25) continue;
+		hourly.push({ client_id: id, hour, calls: Math.round(wave * 9), tokens: Math.round(wave * scale) });
+	}
+}
+const clientModels = { 'cl-desktop': [['claude', 'claude-opus-5-5', .62], ['codex', 'gpt-6.1-sol', .3], ['claude', 'claude-haiku-5-5', .08]], 'cl-family': [['claude', 'claude-sonnet-5-5', 1]], 'cl-laptop': [['codex', 'gpt-6-luna', .7], ['claude', 'claude-opus-5-5', .3]], '': [['claude', 'claude-opus-5-5', 1]] };
+function clientStats(hours) {
+	const since = new Date(now - hours * 3600_000).toISOString();
+	const rows = hourly.filter((row) => row.hour >= since.slice(0, 13));
+	const totals = [];
+	for (const [id, list] of Object.entries(clientModels)) {
+		const mine = rows.filter((row) => row.client_id === id);
+		if (!mine.length) continue;
+		const calls = mine.reduce((sum, row) => sum + row.calls, 0), tokens = mine.reduce((sum, row) => sum + row.tokens, 0);
+		for (const [provider, model, part] of list) {
+			const input = Math.round(tokens * part * 0.96);
+			totals.push({ client_id: id, provider, model, calls: Math.max(1, Math.round(calls * part)), errors: id === 'cl-laptop' && model === 'gpt-6-luna' ? 3 : 0, input_tokens: input, output_tokens: Math.round(tokens * part * 0.04), cache_read_tokens: Math.round(input * 0.81), cache_write_tokens: Math.round(input * 0.05), latency_ms: Math.round(calls * part * 7400), last_at: `${mine.at(-1).hour}:41:07Z` });
+		}
+	}
+	return { since, totals, hours: rows };
+}
 const unix = (hours) => Math.floor((now + hours * 3600_000) / 1000);
 const used = (account_id, kind, hours, total, points, outside = 0) => ({ account_id, kind, reset: unix(hours), used: total, clients: points, outside });
 const usage = [
@@ -136,16 +165,17 @@ const resets = (id) => {
 	return { account_id: id, provider: owner?.provider ?? '', status: ready ? 'ready' : 'unsupported', available_count: ready ? (id === 'acc-claude-home' ? 1 : 0) : null, next_expires_at: ready ? at(24 * 9) : null, error: null };
 };
 
-function api(method, path, body) {
+function api(method, path, body, query = new URLSearchParams()) {
 	const target = path.match(/^\/clients(?:\/([^/]+))?$/);
 	if (target && method !== 'GET') return changeClient(method, target[1] && decodeURIComponent(target[1]), body ?? {});
 	if (method === 'POST' && path === '/restore') return { restored: 2, accounts: [], errors: [], settings: false };
 	if (method !== 'GET') return { ok: true };
 	const reset = path.match(/^\/accounts\/([^/]+)\/resets$/);
 	if (reset) return resets(decodeURIComponent(reset[1]));
+	if (path === '/clients/stats') return clientStats(Number(query.get('hours') ?? 24));
 	switch (path) {
 		case '/summary': case '/status': return { ...summary, clients: clients.length };
-		case '/clients': return { enforced: clients.length > 0, clients, usage: usage.filter((row) => row.reset * 1000 > Date.now()) };
+		case '/clients': return { clients, usage: usage.filter((row) => row.reset * 1000 > Date.now()) };
 		case '/providers': return { providers };
 		case '/accounts': return { accounts };
 		case '/quotas': return { quotas };
@@ -169,7 +199,7 @@ createServer(async (request, response) => {
 			for await (const chunk of request) chunks.push(chunk);
 			try { input = chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : null; } catch { input = null; }
 		}
-		const result = api(request.method ?? 'GET', url.pathname.slice('/admin/api'.length), input);
+		const result = api(request.method ?? 'GET', url.pathname.slice('/admin/api'.length), input, url.searchParams);
 		const [status, body] = Array.isArray(result) ? result : [result ? 200 : 404, result ?? { error: { message: 'not in the sample data' } }];
 		if (status === 204) { response.writeHead(204).end(); return; }
 		response.writeHead(status, { 'content-type': 'application/json' });

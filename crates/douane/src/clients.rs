@@ -1,8 +1,8 @@
 //! Client keys: which subscriptions each caller may use, and the share of a
 //! provider's quota windows it holds.
 //!
-//! With no client stored, the client API stays open as before. Once one
-//! exists, every call needs a client key. A share is a percentage of each
+//! Every call to the client API needs a client key: with no client stored,
+//! douane refuses every call until one is created. A share is a percentage of each
 //! account-wide window (five hours, day, week, month) of every account in a
 //! pool. Unused shares stay reserved for their holders until the last seventh
 //! of the window, when anyone may use them; what no share covers is common.
@@ -213,6 +213,8 @@ fn presented_key(headers: &HeaderMap) -> Option<&str> {
 
 #[derive(Debug, PartialEq)]
 pub enum Refusal {
+    /// No client exists yet, so no key can be right.
+    NoClient,
     Missing,
     Unknown,
 }
@@ -220,6 +222,9 @@ pub enum Refusal {
 impl Refusal {
     pub fn message(&self) -> &'static str {
         match self {
+            Refusal::NoClient => {
+                "douane has no client yet: create one on the Clients page or with `douanectl client add`, then send its key as the API key"
+            }
             Refusal::Missing => {
                 "a douane client key is required: create one on the Clients page and send it as the API key"
             }
@@ -335,23 +340,17 @@ impl Clients {
         self.read().clone()
     }
 
-    /// Keys are required as soon as one client exists.
-    pub fn enforced(&self) -> bool {
-        !self.read().is_empty()
-    }
-
-    /// `None` while no client exists: the API is open.
-    pub fn authenticate(&self, headers: &HeaderMap) -> Result<Option<Client>, Refusal> {
+    /// The client whose key the caller presents. There is no keyless access.
+    pub fn authenticate(&self, headers: &HeaderMap) -> Result<Client, Refusal> {
         let list = self.read();
         if list.is_empty() {
-            return Ok(None);
+            return Err(Refusal::NoClient);
         }
         let key = presented_key(headers).ok_or(Refusal::Missing)?;
         let hash = key_hash(key);
         list.iter()
             .find(|c| c.key_hash == hash)
             .cloned()
-            .map(Some)
             .ok_or(Refusal::Unknown)
     }
 
@@ -825,9 +824,16 @@ mod tests {
     }
 
     #[test]
-    fn the_api_stays_open_until_a_client_exists_then_needs_its_key() {
+    fn every_call_needs_a_client_key_even_before_the_first_client() {
         let (_dir, clients) = clients();
-        assert_eq!(clients.authenticate(&HeaderMap::new()), Ok(None));
+        assert_eq!(
+            clients.authenticate(&HeaderMap::new()),
+            Err(Refusal::NoClient)
+        );
+        assert_eq!(
+            clients.authenticate(&bearer("boite-subscription-proxy")),
+            Err(Refusal::NoClient)
+        );
         let (client, key) = clients.create(named("famille")).unwrap();
         assert!(key.starts_with(KEY_PREFIX));
         assert!(
@@ -843,17 +849,11 @@ mod tests {
             clients.authenticate(&bearer("boite-subscription-proxy")),
             Err(Refusal::Unknown)
         );
-        assert_eq!(
-            clients.authenticate(&bearer(&key)).unwrap().unwrap().id,
-            client.id
-        );
+        assert_eq!(clients.authenticate(&bearer(&key)).unwrap().id, client.id);
         let mut anthropic = HeaderMap::new();
         anthropic.insert("authorization", "Bearer ".parse().unwrap());
         anthropic.insert("x-api-key", key.parse().unwrap());
-        assert_eq!(
-            clients.authenticate(&anthropic).unwrap().unwrap().id,
-            client.id
-        );
+        assert_eq!(clients.authenticate(&anthropic).unwrap().id, client.id);
         // A rotated key replaces the old one.
         let (_, rotated) = clients
             .update(
@@ -865,12 +865,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(clients.authenticate(&bearer(&key)), Err(Refusal::Unknown));
-        assert!(
-            clients
-                .authenticate(&bearer(&rotated.unwrap()))
-                .unwrap()
-                .is_some()
-        );
+        assert!(clients.authenticate(&bearer(&rotated.unwrap())).is_ok());
     }
 
     #[test]
@@ -880,7 +875,7 @@ mod tests {
         drop(clients);
         let reopened = Clients::open(dir.path()).unwrap();
         assert_eq!(reopened.list(), vec![client]);
-        assert!(reopened.authenticate(&bearer(&key)).unwrap().is_some());
+        assert!(reopened.authenticate(&bearer(&key)).is_ok());
     }
 
     #[test]

@@ -294,7 +294,7 @@ async fn connect_replacement(
     // A key revoked since the socket opened gets no replacement account.
     let client = state.clients.authenticate(headers).ok()?;
     let (_, candidates) = state
-        .candidates_for(model, Some(provider.as_str()), session, client.as_ref())
+        .candidates_for(model, Some(provider.as_str()), session, Some(&client))
         .await
         .ok()?;
     connect_pool(
@@ -374,7 +374,7 @@ async fn run(mut downstream: WebSocket, state: Arc<AppState>, headers: HeaderMap
         return;
     }
     let mut client = match state.clients.authenticate(&headers) {
-        Ok(client) => client,
+        Ok(client) => Some(client),
         Err(refusal) => {
             reject(&mut downstream, refusal.message()).await;
             return;
@@ -494,7 +494,7 @@ async fn run(mut downstream: WebSocket, state: Arc<AppState>, headers: HeaderMap
                             // Each request reads the client again: a revoked key stops here,
                             // and changed access or shares apply to the next request.
                             client = match state.clients.authenticate(&headers) {
-                                Ok(client) => client,
+                                Ok(client) => Some(client),
                                 Err(refusal) => {
                                     reject(&mut downstream, refusal.message()).await;
                                     break;

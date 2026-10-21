@@ -161,6 +161,13 @@ impl Gateway {
         config.server.auth_dir = directory.path().join("accounts");
         config.server.database = directory.path().join("calls.sqlite");
         let state = AppState::new(config, None).unwrap();
+        let (_, key) = state
+            .clients
+            .create(douane::clients::ClientPatch {
+                name: Some("tests".into()),
+                ..Default::default()
+            })
+            .unwrap();
         for account in accounts {
             state.accounts.import(account.clone(), None).await.unwrap();
         }
@@ -171,6 +178,14 @@ impl Gateway {
             server,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(5))
+                .default_headers(
+                    [(
+                        reqwest::header::AUTHORIZATION,
+                        format!("Bearer {key}").parse().unwrap(),
+                    )]
+                    .into_iter()
+                    .collect(),
+                )
                 .build()
                 .unwrap(),
             _directory: directory,
@@ -181,7 +196,6 @@ impl Gateway {
         let response = self
             .client
             .post(format!("{}{path}", self.server.url))
-            .header("authorization", "Bearer caller-key")
             .json(&body)
             .send()
             .await

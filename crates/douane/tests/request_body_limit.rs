@@ -12,12 +12,20 @@ async fn post_messages(size: usize) -> StatusCode {
     config.server.auth_dir = directory.path().join("auth");
     config.server.database = directory.path().join("requests.sqlite");
     let state = AppState::new(config, None).unwrap();
+    let (_, key) = state
+        .clients
+        .create(douane::clients::ClientPatch {
+            name: Some("tests".into()),
+            ..Default::default()
+        })
+        .unwrap();
     douane::router(state)
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/v1/messages")
                 .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {key}"))
                 .header("content-length", size)
                 .body(Body::from(vec![b'a'; size]))
                 .unwrap(),
