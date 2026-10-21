@@ -434,6 +434,7 @@ impl AppState {
                 continue;
             }
             let now = time::OffsetDateTime::now_utc();
+            let free_before = config.settings.free_before_reset_seconds();
             let mut eligible = vec![];
             let mut candidates = vec![];
             for a in self
@@ -445,13 +446,16 @@ impl AppState {
                     continue;
                 }
                 let quota = self.quotas.get(&a.id).await;
-                if self.reserve_excludes_with(&a, quota.as_ref(), now) {
+                if self.reserve_excludes_with(&a, quota.as_ref(), now, free_before) {
                     continue;
                 }
-                if let Some(reset) =
-                    self.clients
-                        .share_blocks(client, &a, quota.as_ref(), now.unix_timestamp())
-                {
+                if let Some(reset) = self.clients.share_blocks(
+                    client,
+                    &a,
+                    quota.as_ref(),
+                    now.unix_timestamp(),
+                    free_before,
+                ) {
                     if held_back.as_ref().is_none_or(|(_, r)| reset < *r) {
                         held_back = Some((pool.to_owned(), reset));
                     }
@@ -572,12 +576,14 @@ impl AppState {
     /// window resets. Unknown quotas never trigger it. This check only reads;
     /// request routing uses [`Self::reserve_excludes`].
     pub async fn reserve_reached(&self, account: &AccountCredential) -> bool {
+        let free_before = self.free_before_reset_seconds().await;
         let snapshot = self.quotas.get(&account.id).await;
         reserve_reached_in(
             account.reserve(),
             &account.reserve_windows(),
             snapshot.as_ref(),
             time::OffsetDateTime::now_utc(),
+            free_before,
         )
     }
 
@@ -594,6 +600,7 @@ impl AppState {
         if client.is_some_and(|c| !c.access.allows(account)) {
             return true;
         }
+        let free_before = self.free_before_reset_seconds().await;
         let snapshot = self.quotas.get(&account.id).await;
         self.clients
             .share_blocks(
@@ -601,13 +608,30 @@ impl AppState {
                 account,
                 snapshot.as_ref(),
                 time::OffsetDateTime::now_utc().unix_timestamp(),
+                free_before,
             )
             .is_some()
     }
 
     pub async fn reserve_excludes(&self, account: &AccountCredential) -> bool {
+        let free_before = self.free_before_reset_seconds().await;
         let snapshot = self.quotas.get(&account.id).await;
-        self.reserve_excludes_with(account, snapshot.as_ref(), time::OffsetDateTime::now_utc())
+        self.reserve_excludes_with(
+            account,
+            snapshot.as_ref(),
+            time::OffsetDateTime::now_utc(),
+            free_before,
+        )
+    }
+
+    /// Seconds before an account's weekly reset when its reserve and client
+    /// shares stop applying.
+    pub async fn free_before_reset_seconds(&self) -> i64 {
+        self.config
+            .read()
+            .await
+            .settings
+            .free_before_reset_seconds()
     }
 
     fn reserve_excludes_with(
@@ -615,10 +639,14 @@ impl AppState {
         account: &AccountCredential,
         snapshot: Option<&crate::subscriptions::QuotaSnapshot>,
         now: time::OffsetDateTime,
+        free_before: i64,
     ) -> bool {
         let (Some(reserve), Some(snapshot)) = (account.reserve(), snapshot) else {
             return false;
         };
+        if snapshot.longest_window_ends_within(free_before, now.unix_timestamp()) {
+            return false;
+        }
         let windows = account.reserve_windows();
         let near = snapshot
             .reserve_window_remaining(&windows, now)
@@ -628,7 +656,7 @@ impl AppState {
         if near && stale {
             self.refresh_soon(&account.id);
         }
-        reserve_reached_in(Some(reserve), &windows, Some(snapshot), now)
+        reserve_reached_in(Some(reserve), &windows, Some(snapshot), now, 0)
     }
 
     fn refresh_soon(&self, id: &str) {
@@ -715,16 +743,21 @@ impl AppState {
 }
 
 /// A valid reserve and a snapshot whose account-wide window sits at or below
-/// it. Shared by routing and the management listing.
+/// it, unless the weekly reset is within `free_before` seconds. Shared by
+/// routing and the management listing.
 pub fn reserve_reached_in(
     reserve: Option<f64>,
     windows: &[String],
     snapshot: Option<&crate::subscriptions::QuotaSnapshot>,
     now: time::OffsetDateTime,
+    free_before: i64,
 ) -> bool {
     reserve
         .filter(|percent| crate::subscriptions::valid_reserve(*percent))
         .zip(snapshot)
+        .filter(|(_, snapshot)| {
+            !snapshot.longest_window_ends_within(free_before, now.unix_timestamp())
+        })
         .is_some_and(|(reserve, snapshot)| snapshot.reserve_reached(reserve, windows, now))
 }
 
@@ -1208,6 +1241,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(order(&state).await.unwrap(), vec![kept]);
+    }
+
+    #[tokio::test]
+    async fn a_reserve_stops_applying_hours_before_the_weekly_reset() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.server.auth_dir = directory.path().join("auth");
+        config.server.database = directory.path().join("requests.sqlite");
+        let state = AppState::new(config, None).unwrap();
+        let account = state
+            .accounts
+            .import(
+                json!({"type":"codex","access_token":"fixture","account_id":"kept","name":"kept"}),
+                None,
+            )
+            .await
+            .unwrap();
+        state
+            .accounts
+            .update(&account.id, None, None, Some(Some(5.0)), None)
+            .await
+            .unwrap();
+        let reset_in = |hours: i64| {
+            (time::OffsetDateTime::now_utc() + time::Duration::hours(hours))
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        };
+        let low = |reset: String| {
+            let mut low = weekly(&account.id, &reset);
+            low.windows[0].remaining_percent = Some(5.0);
+            low
+        };
+        async fn serves(state: &AppState) -> bool {
+            state
+                .candidates("gpt-5.5", Some("codex"), None)
+                .await
+                .is_ok()
+        }
+        let credential = state.accounts.get(&account.id).await.unwrap();
+        // Seven hours before the reset, the reserve still holds.
+        state.quotas.insert_for_test(low(reset_in(7))).await;
+        assert!(!serves(&state).await);
+        assert!(state.reserve_reached(&credential).await);
+        // Within the default six hours, the rest of the week gets used.
+        state.quotas.insert_for_test(low(reset_in(5))).await;
+        assert!(serves(&state).await);
+        assert!(!state.reserve_reached(&credential).await);
+        assert!(!state.reserve_excludes(&credential).await);
+        // At 0 the reserve holds to the end.
+        state.config.write().await.settings.free_before_reset_hours = 0;
+        assert!(!serves(&state).await);
     }
 
     #[tokio::test]

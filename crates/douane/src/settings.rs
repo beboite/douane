@@ -39,6 +39,10 @@ pub struct Settings {
     pub quota_display: BTreeMap<String, QuotaDisplay>,
     /// Which windows `/v1/quotas` shows for each provider, and the one shown first.
     pub quota_windows: BTreeMap<String, QuotaWindows>,
+    /// Hours before an account's weekly reset (monthly when its longest
+    /// window is a month) when its reserve and client shares stop applying,
+    /// so what is left gets used. 0 keeps them to the end.
+    pub free_before_reset_hours: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +93,7 @@ impl Default for Settings {
             default_provider: None,
             quota_display: BTreeMap::new(),
             quota_windows: BTreeMap::new(),
+            free_before_reset_hours: 6,
         }
     }
 }
@@ -151,6 +156,9 @@ impl Settings {
         if !(10..=1800).contains(&self.request_timeout_seconds) {
             bail!("request_timeout_seconds must be between 10 and 1800");
         }
+        if self.free_before_reset_hours > 168 {
+            bail!("free_before_reset_hours must be between 0 and 168");
+        }
         if let Some(p) = &self.default_provider {
             if crate::subscriptions::SubscriptionProvider::parse(p).is_none() {
                 bail!("unknown default provider");
@@ -176,6 +184,10 @@ impl Settings {
             );
         }
         Ok(())
+    }
+
+    pub fn free_before_reset_seconds(&self) -> i64 {
+        i64::from(self.free_before_reset_hours) * 3600
     }
 
     pub fn quota_windows(
