@@ -54,17 +54,20 @@
 	let sum = $derived(rows.reduce((all, row) => ({ calls: all.calls + row.calls, errors: all.errors + row.errors, tokens: all.tokens + row.input + row.output }), { calls: 0, errors: 0, tokens: 0 }));
 	let active = $derived(rows.filter(row => row.calls > 0).length);
 
-	// Hours for a day, local days beyond: a bucket per column, oldest first.
+	// UTC hours for a day, local days beyond: a bucket per column, oldest first,
+	// from the one holding the period's start, which the totals count, to now.
 	let buckets = $derived.by(() => {
 		const hourly = period.hours <= 24;
 		const now = new Date();
+		const since = stats ? new Date(stats.since) : new Date(now.getTime() - period.hours * 3_600_000);
 		const slots: { start: Date; label: string; values: Map<string, number>; total: number }[] = [];
+		const slot = (start: Date) => slots.push({ start, label: '', values: new Map(), total: 0 });
 		if (hourly) {
-			const top = new Date(now); top.setMinutes(0, 0, 0);
-			for (let i = period.hours - 1; i >= 0; i--) slots.push({ start: new Date(top.getTime() - i * 3_600_000), label: '', values: new Map(), total: 0 });
+			const first = Math.floor(since.getTime() / 3_600_000) * 3_600_000;
+			for (let start = first; start <= now.getTime(); start += 3_600_000) slot(new Date(start));
 		} else {
-			const days = period.hours / 24;
-			for (let i = days - 1; i >= 0; i--) { const day = new Date(now.getFullYear(), now.getMonth(), now.getDate() - i); slots.push({ start: day, label: '', values: new Map(), total: 0 }); }
+			const last = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+			for (let day = new Date(since.getFullYear(), since.getMonth(), since.getDate()); day <= last; day = new Date(day.getFullYear(), day.getMonth(), day.getDate() + 1)) slot(day);
 		}
 		const time = new Intl.DateTimeFormat(locale(), hourly ? { hour: language() === 'en' ? 'numeric' : '2-digit', minute: '2-digit' } : { weekday: period.hours <= 168 ? 'short' : undefined, day: 'numeric', month: 'short' });
 		for (const slot of slots) slot.label = time.format(slot.start);
