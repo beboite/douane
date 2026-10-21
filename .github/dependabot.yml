@@ -1,10 +1,10 @@
 version: 2
-# Actions and base images are pinned by digest; one weekly pull request moves
-# them all, so a week of updates costs one CI run.
+# Actions and base images are pinned by digest; one monthly pull request moves
+# them all, so a month of updates costs one CI run.
 multi-ecosystem-groups:
   pins:
     schedule:
-      interval: weekly
+      interval: monthly
     commit-message:
       prefix: chore
       include: scope
