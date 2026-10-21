@@ -268,7 +268,10 @@ fn window(window: &QuotaWindow) -> Value {
     )
 }
 
+/// Percents go out whole: averages and client views would otherwise show
+/// decimals that readings never had.
 fn window_value(id: &str, label: &str, remaining: Option<f64>, reset_at: Option<&str>) -> Value {
+    let remaining = remaining.map(f64::round);
     json!({"id":id,"label":label,"used_percent":remaining.map(|r| 100.0 - r),"remaining_percent":remaining,"reset_at":timestamp(reset_at)})
 }
 
@@ -426,6 +429,17 @@ mod tests {
             .quota_display
             .insert(provider.as_str().into(), QuotaDisplay::Average);
         settings
+    }
+
+    #[test]
+    fn percents_go_out_whole() {
+        let value = window_value("weekly", "Weekly", Some(70.4), None);
+        assert_eq!(value["remaining_percent"], 70.0);
+        assert_eq!(value["used_percent"], 30.0);
+        assert_eq!(
+            window_value("weekly", "Weekly", Some(99.6), None)["remaining_percent"],
+            100.0
+        );
     }
 
     #[test]

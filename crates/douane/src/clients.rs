@@ -706,10 +706,12 @@ impl Clients {
             .map(|r| r.reset)
     }
 
-    /// The snapshot as `client` sees it: each account-wide window shows the
-    /// part of what it may use that it has used, so a bar at 100% means it
-    /// is held back. Windows of pools without shares, or of an account whose
-    /// shares are freed before its weekly reset, stay as they are.
+    /// The snapshot as `client` sees it: with a share of the pool, each
+    /// account-wide window shows the part of what it may use that it has
+    /// used, so a bar at 100% means it is held back. A client without a share
+    /// of the pool sees the account's whole quota, other shares included.
+    /// Windows of an account whose shares are freed before its weekly reset
+    /// stay as they are.
     pub fn client_view(
         &self,
         client: &Client,
@@ -718,10 +720,12 @@ impl Clients {
         now: i64,
         free_before: i64,
     ) -> QuotaSnapshot {
-        let holders = self.holders(pool);
-        if holders.is_empty() || snapshot.longest_window_ends_within(free_before, now) {
+        if !client.shares.contains_key(pool)
+            || snapshot.longest_window_ends_within(free_before, now)
+        {
             return snapshot;
         }
+        let holders = self.holders(pool);
         let account = snapshot.account_id.clone();
         let readings = readings(&snapshot);
         for window in &mut snapshot.windows {
@@ -983,14 +987,15 @@ mod tests {
             clients.share_blocks(Some(&famille), &a, Some(&full), NOW, 0),
             None
         );
-        // Perso's bar is full; famille's shows nothing used of its 25.
+        // Famille's bar shows nothing used of its 25; perso, without a
+        // share, sees the account's whole quota, famille's share included.
         let view = |c: &Client| {
             clients
                 .client_view(c, full.clone(), "claude", NOW, 0)
                 .windows[0]
                 .remaining_percent
         };
-        assert_eq!(view(&perso), Some(0.0));
+        assert_eq!(view(&perso), Some(25.0));
         assert_eq!(view(&famille), Some(100.0));
         // In the last day of the week, famille's unused share opens to all.
         let late = NOW + 3 * 86_400 - 20 * 3600;
@@ -1010,7 +1015,7 @@ mod tests {
     #[test]
     fn shares_stop_holding_back_hours_before_the_weekly_reset() {
         let (_dir, clients) = clients();
-        let (_famille, _) = clients
+        let (famille, _) = clients
             .create(ClientPatch {
                 name: Some("famille".into()),
                 shares: Some([("claude".to_owned(), 25.0)].into()),
@@ -1056,11 +1061,11 @@ mod tests {
         );
         let view = |free_before: i64| {
             clients
-                .client_view(&perso, full.clone(), "claude", NOW, free_before)
+                .client_view(&famille, full.clone(), "claude", NOW, free_before)
                 .windows[1]
                 .remaining_percent
         };
-        assert_eq!(view(0), Some(0.0));
+        assert_eq!(view(0), Some(100.0));
         assert_eq!(view(6 * 3600), Some(25.0));
     }
 
