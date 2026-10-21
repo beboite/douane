@@ -127,7 +127,7 @@ const summary = {
 	cache_read_tokens: 1_510_000_000, cache_write_tokens: 21_000_000, client_api_base_url: 'http://127.0.0.1:8787/v1'
 };
 const settings = {
-	strategy: 'smart', quota_refresh_seconds: 300, request_timeout_seconds: 180, default_provider: null,
+	strategy: 'smart', quota_refresh_seconds: 300, free_before_reset_hours: 6, request_timeout_seconds: 180, default_provider: null,
 	provider_strategies: { claude: 'reset-first' }, quota_display: {}, quota_windows: {}
 };
 const resets = (id) => {

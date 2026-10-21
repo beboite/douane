@@ -67,6 +67,29 @@ impl QuotaSnapshot {
             .min_by_key(|reset| parse_timestamp(reset))
     }
 
+    /// The longest account-wide window, when it lasts a week or more, resets
+    /// within `seconds` after `now`: what is left of it is lost unless spent.
+    pub fn longest_window_ends_within(&self, seconds: i64, now: i64) -> bool {
+        if seconds <= 0 {
+            return false;
+        }
+        let windows = || {
+            self.windows
+                .iter()
+                .filter(|window| reserve_kind(&window.id).is_some())
+                .filter_map(|window| Some((window, window_seconds(&window.id)?)))
+        };
+        let Some(longest) = windows().map(|(_, length)| length).reduce(f64::max) else {
+            return false;
+        };
+        longest >= 604_800.0
+            && windows()
+                .filter(|(_, length)| *length == longest)
+                .filter_map(|(window, _)| window.reset_at.as_deref().and_then(parse_timestamp))
+                .map(|reset| reset.unix_timestamp())
+                .any(|reset| reset > now && reset - now <= seconds)
+    }
+
     pub fn remaining_percent(&self) -> Option<f64> {
         self.windows
             .iter()

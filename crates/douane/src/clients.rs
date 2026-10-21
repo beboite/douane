@@ -6,6 +6,8 @@
 //! account-wide window (five hours, day, week, month) of every account in a
 //! pool. Unused shares stay reserved for their holders until the last seventh
 //! of the window, when anyone may use them; what no share covers is common.
+//! In the hours before an account's weekly reset (`free_before_reset_hours`),
+//! shares hold no one back.
 //!
 //! Usage is attributed, not read: each rise of a window's utilization goes to
 //! the clients whose calls ended on that account since the previous reading,
@@ -679,16 +681,19 @@ impl Clients {
 
     /// The reset of the window where `client` has reached what the other
     /// holders' shares leave it on this account; `None` when it may use it.
+    /// Within `free_before` seconds of the account's weekly reset, shares
+    /// no longer hold anyone back.
     pub fn share_blocks(
         &self,
         client: Option<&Client>,
         account: &AccountCredential,
         snapshot: Option<&QuotaSnapshot>,
         now: i64,
+        free_before: i64,
     ) -> Option<i64> {
         let snapshot = snapshot?;
         let holders = self.holders(account.pool());
-        if holders.is_empty() {
+        if holders.is_empty() || snapshot.longest_window_ends_within(free_before, now) {
             return None;
         }
         let me = client.map(|c| c.id.as_str()).unwrap_or("");
@@ -704,16 +709,18 @@ impl Clients {
 
     /// The snapshot as `client` sees it: each account-wide window shows the
     /// part of what it may use that it has used, so a bar at 100% means it
-    /// is held back. Windows of pools without shares stay as they are.
+    /// is held back. Windows of pools without shares, or of an account whose
+    /// shares are freed before its weekly reset, stay as they are.
     pub fn client_view(
         &self,
         client: &Client,
         mut snapshot: QuotaSnapshot,
         pool: &str,
         now: i64,
+        free_before: i64,
     ) -> QuotaSnapshot {
         let holders = self.holders(pool);
-        if holders.is_empty() {
+        if holders.is_empty() || snapshot.longest_window_ends_within(free_before, now) {
             return snapshot;
         }
         let account = snapshot.account_id.clone();
@@ -966,40 +973,100 @@ mod tests {
         clients.observe(&snapshot("a", 70.0, reset), NOW);
         // Perso may still use 5 points before touching famille's 25.
         assert_eq!(
-            clients.share_blocks(Some(&perso), &a, Some(&snapshot("a", 70.0, reset)), NOW),
+            clients.share_blocks(Some(&perso), &a, Some(&snapshot("a", 70.0, reset)), NOW, 0),
             None
         );
         clients.call_ended("a", Some(&perso.id), 1.0);
         clients.observe(&snapshot("a", 75.0, reset), NOW);
         let full = snapshot("a", 75.0, reset);
         assert_eq!(
-            clients.share_blocks(Some(&perso), &a, Some(&full), NOW),
+            clients.share_blocks(Some(&perso), &a, Some(&full), NOW, 0),
             Some(reset)
         );
         // Famille keeps its share.
         assert_eq!(
-            clients.share_blocks(Some(&famille), &a, Some(&full), NOW),
+            clients.share_blocks(Some(&famille), &a, Some(&full), NOW, 0),
             None
         );
         // Perso's bar is full; famille's shows nothing used of its 25.
         let view = |c: &Client| {
-            clients.client_view(c, full.clone(), "claude", NOW).windows[0].remaining_percent
+            clients
+                .client_view(c, full.clone(), "claude", NOW, 0)
+                .windows[0]
+                .remaining_percent
         };
         assert_eq!(view(&perso), Some(0.0));
         assert_eq!(view(&famille), Some(100.0));
         // In the last day of the week, famille's unused share opens to all.
         let late = NOW + 3 * 86_400 - 20 * 3600;
         assert_eq!(
-            clients.share_blocks(Some(&perso), &a, Some(&full), late),
+            clients.share_blocks(Some(&perso), &a, Some(&full), late, 0),
             None
         );
         // Accounts of a pool without shares never hold anyone back.
         let mut codex = account("c");
         codex.provider = SubscriptionProvider::Codex;
         assert_eq!(
-            clients.share_blocks(Some(&perso), &codex, Some(&full), NOW),
+            clients.share_blocks(Some(&perso), &codex, Some(&full), NOW, 0),
             None
         );
+    }
+
+    #[test]
+    fn shares_stop_holding_back_hours_before_the_weekly_reset() {
+        let (_dir, clients) = clients();
+        let (_famille, _) = clients
+            .create(ClientPatch {
+                name: Some("famille".into()),
+                shares: Some([("claude".to_owned(), 25.0)].into()),
+                ..ClientPatch::default()
+            })
+            .unwrap();
+        let (perso, _) = clients.create(named("perso")).unwrap();
+        let a = account("a");
+        // The week ends in five hours; a five-hour window started an hour ago.
+        let weekly = NOW + 5 * 3600;
+        let five = NOW + 4 * 3600;
+        let with = |used: f64| {
+            let mut snapshot = snapshot("a", 10.0, weekly);
+            let mut window = snapshot.windows[0].clone();
+            window.id = "five-hour".into();
+            window.remaining_percent = Some(100.0 - used);
+            window.reset_at = Some(
+                time::OffsetDateTime::from_unix_timestamp(five)
+                    .unwrap()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap(),
+            );
+            snapshot.windows.push(window);
+            snapshot
+        };
+        clients.observe(&with(0.0), NOW);
+        clients.call_ended("a", Some(&perso.id), 1.0);
+        clients.observe(&with(75.0), NOW);
+        let full = with(75.0);
+        // Kept to the end, famille's five-hour share holds perso back.
+        assert_eq!(
+            clients.share_blocks(Some(&perso), &a, Some(&full), NOW, 0),
+            Some(five)
+        );
+        assert_eq!(
+            clients.share_blocks(Some(&perso), &a, Some(&full), NOW, 4 * 3600),
+            Some(five)
+        );
+        // Six hours before the weekly reset, nothing is held back any more.
+        assert_eq!(
+            clients.share_blocks(Some(&perso), &a, Some(&full), NOW, 6 * 3600),
+            None
+        );
+        let view = |free_before: i64| {
+            clients
+                .client_view(&perso, full.clone(), "claude", NOW, free_before)
+                .windows[1]
+                .remaining_percent
+        };
+        assert_eq!(view(0), Some(0.0));
+        assert_eq!(view(6 * 3600), Some(25.0));
     }
 
     #[test]

@@ -145,6 +145,7 @@ async fn account_value(
         &summary.reserve_windows,
         snapshot.as_ref(),
         now,
+        state.free_before_reset_seconds().await,
     );
     let mut value = json!(summary);
     value["reserve_measured"] = json!(measured);
@@ -852,7 +853,13 @@ pub async fn public_quotas(
                     .route
                     .as_deref()
                     .unwrap_or(account.provider.as_str());
-                Some(state.clients.client_view(client, snapshot, pool, now))
+                Some(state.clients.client_view(
+                    client,
+                    snapshot,
+                    pool,
+                    now,
+                    settings.free_before_reset_seconds(),
+                ))
             })
             .collect();
     }

@@ -12,6 +12,9 @@ quota_refresh_seconds = 300
 # A long answer keeps streaming as long as the upstream stays active.
 request_timeout_seconds = 180
 # default_provider = "codex"
+# Hours before an account's weekly reset when its reserve and client shares stop
+# applying, so what is left gets used. 0 keeps them to the end.
+free_before_reset_hours = 6
 
 [settings.provider_strategies]
 # claude = "reset-first"
