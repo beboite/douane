@@ -12,12 +12,12 @@ douane connects your Claude, ChatGPT (Codex), Antigravity, Grok, GitHub Copilot 
 
 ## Features
 
-- One base URL and one placeholder key for Claude Code, the Grok CLI, Boite and any OpenAI-compatible client.
+- One base URL and a client key for each of Claude Code, the Grok CLI, Boite and any OpenAI-compatible client.
 - Chat Completions, Anthropic Messages and Responses, streaming included, with translation between them; native Codex WebSocket sessions.
 - Live quotas per account: five-hour, daily, weekly and monthly windows, reset times, plan tier, extra credits and banked resets, refreshed in the background.
 - Four routing strategies, per provider if you like, and failover to another account of the same provider when one runs out.
 - Conversation affinity: native session ids and `prompt_cache_key` pin a conversation to its account, so cache reads keep landing.
-- Client keys: give each tool or machine its own key, limit it to some accounts, and split each provider's quota windows between them by percentage.
+- Client keys: every call carries a client key, so you see which tool or machine spends what. Limit a client to some accounts, and split each provider's quota windows between clients by percentage.
 - Per-account reserve: stop spending an account at 5 % (or any share) of its longest quota window, or of the windows you pick (5 hours, weekly, both), so you keep some for yourself.
 - Request history with latency, token and cache counters; never conversation bodies or credentials.
 - OAuth and device sign-in from the dashboard, JSON import of existing CLI credentials, and `douanectl` for scripting.
@@ -92,18 +92,18 @@ douane --config douane.toml
 
 Open `http://127.0.0.1:8787/admin`, choose **Connect an account** and sign in to a provider. When douane runs on another machine, paste the callback URL or code shown by the provider back into the dialog: the provider's localhost redirect does not need to reach the server.
 
-Then point a client at it:
+Then create a client on the **Clients** page (or `douanectl client add Desktop --key-file desktop.key`) and point a tool at douane with its key:
 
 ```sh
-curl http://127.0.0.1:8787/v1/models
+curl http://127.0.0.1:8787/v1/models -H 'Authorization: Bearer dk_...'
 
 curl http://127.0.0.1:8787/v1/chat/completions \
-  -H 'Authorization: Bearer douane' \
+  -H 'Authorization: Bearer dk_...' \
   -H 'Content-Type: application/json' \
   -d '{"model":"<id from /v1/models>","messages":[{"role":"user","content":"Hello"}],"stream":true}'
 ```
 
-Model ids carry their provider prefix, for example `claude/...` or `codex/...`. Until you create a [client key](#client-keys), the key `douane` is a placeholder: authentication upstream uses the connected subscription.
+Model ids carry their provider prefix, for example `claude/...` or `codex/...`. The [client key](#client-keys) only identifies the caller to douane: authentication upstream uses the connected subscription.
 
 ![Accounts page with plan, state and reserve per account](docs/images/accounts.png)
 
@@ -113,10 +113,10 @@ The dashboard's **Set up a tool** page writes these settings for you, with your 
 
 | Client | Settings |
 | --- | --- |
-| OpenAI-compatible tools | Base URL `http://127.0.0.1:8787/v1`, API key `douane`, a model id from `/v1/models` |
-| Claude Code | `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` (no `/v1`), `ANTHROPIC_AUTH_TOKEN=douane` |
-| Grok CLI | `XAI_API_KEY=douane`, `GROK_MODELS_BASE_URL` and `GROK_XAI_API_BASE_URL` set to `http://127.0.0.1:8787/v1`, `GROK_MODELS_LIST_URL=http://127.0.0.1:8787/v1/models?provider=xai&ids=upstream` |
-| [Boite](https://github.com/beboite/boite) | Subscription proxy set to the dashboard URL: Boite lists the models and draws each account's quota bars from `/v1/quotas` |
+| OpenAI-compatible tools | Base URL `http://127.0.0.1:8787/v1`, API key: a client key `dk_...`, a model id from `/v1/models` |
+| Claude Code | `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` (no `/v1`), `ANTHROPIC_AUTH_TOKEN=dk_...` |
+| Grok CLI | `XAI_API_KEY=dk_...`, `GROK_MODELS_BASE_URL` and `GROK_XAI_API_BASE_URL` set to `http://127.0.0.1:8787/v1`, `GROK_MODELS_LIST_URL=http://127.0.0.1:8787/v1/models?provider=xai&ids=upstream` |
+| [Boite](https://github.com/beboite/boite) | Subscription proxy set to the dashboard URL, and its key field to a client key: Boite lists the models and draws each account's quota bars from `/v1/quotas` |
 
 For the Grok CLI, a session saved by `grok login` takes precedence over the key; set `GROK_AUTH_PATH` to a missing file to keep it out.
 
@@ -226,11 +226,12 @@ Banked resets for Claude and Codex appear on each account card. Using one asks f
 
 ## Client keys
 
-With no client defined, anyone who reaches the client API can use every account. Create a client on the **Clients** page, with `POST /admin/api/clients` or `douanectl client add`, and from then on every `/v1` call needs a client key, sent as the tool's API key (`Authorization: Bearer dk_...` or `x-api-key`). Other keys get 401. The key is shown once; douane keeps only its hash. Deleting the last client opens the API again.
+Every `/v1` call needs a client key, sent as the tool's API key (`Authorization: Bearer dk_...` or `x-api-key`); other keys, and every call while no client exists, get 401. Create clients on the **Clients** page, with `POST /admin/api/clients` or `douanectl client add`. The key is shown once; douane keeps only its hash.
 
 - **Access.** A client reaches every account, accounts connected later included, or only the providers, custom routes and single accounts you pick. `/v1/models` and `/v1/quotas` list only what it may use.
 - **Shares.** A share is a percentage of each account-wide window (five hours, day, week, month) of every account of a provider. Shares of a provider add up to 100 % at most. What no share covers is common to every client. A client's unused share stays reserved for it until the last seventh of the window (the last day of a week), then any client may use it. A client with no share uses the common part, then freed shares. A client held back gets 429 until the window resets. In the hours before the weekly reset (`free_before_reset_hours`, see above), shares hold no one back.
 - **Usage.** Providers report usage per account, not per caller, so douane attributes it: each rise of a window goes to the clients whose calls ended on that account since the previous reading, weighted by tokens, or to the calls still running. A rise that no call through douane explains counts as outside use. Calls of several clients interleaving on one account make the split an estimate; one client per account keeps it exact.
+- **Consumption.** The **Clients** page shows, over 24 hours, 7 or 30 days, each client's tokens, calls, cache reads and errors, its part of the total, its tokens over time and its models, limits or not. `GET /admin/api/clients/stats?hours=168` returns the same totals by client, provider and model, and by client and hour.
 - **Quota bars.** With a client key, `/v1/quotas` shows each window as the part the client has used of what it may use, so a full bar means it is held back.
 
 ```sh

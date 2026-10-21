@@ -91,6 +91,8 @@ struct Fixture {
     gateway: Server,
     upstream: Server,
     client: reqwest::Client,
+    /// The douane client key every call presents.
+    key: String,
     accounts: Vec<(String, String, String)>,
     _directory: TempDir,
 }
@@ -120,6 +122,13 @@ impl Fixture {
         config.server.database = directory.path().join("calls.sqlite");
         config.settings.strategy = strategy;
         let state = AppState::new(config, None).unwrap();
+        let (_, key) = state
+            .clients
+            .create(douane::clients::ClientPatch {
+                name: Some("tests".into()),
+                ..Default::default()
+            })
+            .unwrap();
         let mut accounts = vec![];
         for (provider, name) in providers {
             let summary = state
@@ -136,7 +145,19 @@ impl Fixture {
             mock,
             gateway,
             upstream,
-            client: reqwest::Client::builder().timeout(WAIT).build().unwrap(),
+            client: reqwest::Client::builder()
+                .timeout(WAIT)
+                .default_headers(
+                    [(
+                        reqwest::header::AUTHORIZATION,
+                        format!("Bearer {key}").parse().unwrap(),
+                    )]
+                    .into_iter()
+                    .collect(),
+                )
+                .build()
+                .unwrap(),
+            key,
             accounts,
             _directory: directory,
         }
@@ -148,11 +169,12 @@ impl Fixture {
             self.gateway.url.replace("http://", "ws://")
         );
         let mut request = url.into_client_request().unwrap();
+        let bearer = format!("Bearer {}", self.key);
         for (name, value) in [
             ("session_id", session),
             ("thread-id", session),
-            ("authorization", "Bearer worthless-caller-key"),
-            ("x-api-key", "worthless-caller-key"),
+            ("authorization", bearer.as_str()),
+            ("x-api-key", self.key.as_str()),
             ("x-douane-admin", "worthless-admin-key"),
             ("x-management-key", "worthless-management-key"),
             ("chatgpt-account-id", "worthless-caller-account"),
@@ -175,8 +197,8 @@ impl Fixture {
             .header("session-id", session)
             .header("x-opencode-session", session)
             .header("thread-id", session)
-            .header("authorization", "Bearer worthless-caller-key")
-            .header("x-api-key", "worthless-caller-key")
+            .header("authorization", format!("Bearer {}", self.key))
+            .header("x-api-key", &self.key)
             .header("x-douane-admin", "worthless-admin-key")
             .header("x-management-key", "worthless-management-key")
             .header("chatgpt-account-id", "worthless-caller-account")
@@ -485,10 +507,6 @@ async fn next(socket: &mut ClientSocket) -> Value {
 fn assert_private_headers(headers: &HeaderMap, session: &str) {
     assert_eq!(headers.get("session_id").unwrap(), session);
     assert_eq!(headers.get("thread-id").unwrap(), session);
-    assert_ne!(
-        headers.get("authorization").unwrap(),
-        "Bearer worthless-caller-key"
-    );
     for name in ["x-api-key", "x-douane-admin", "x-management-key", "cookie"] {
         assert!(
             headers.get(name).is_none(),

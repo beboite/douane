@@ -4,7 +4,6 @@
 	import Trash2 from '@lucide/svelte/icons/trash-2';
 	import RotateCcwKey from '@lucide/svelte/icons/rotate-ccw-key';
 	import Lock from '@lucide/svelte/icons/lock';
-	import LockOpen from '@lucide/svelte/icons/lock-open';
 	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
 	import Info from '@lucide/svelte/icons/info';
 	import ChartPie from '@lucide/svelte/icons/chart-pie';
@@ -13,6 +12,7 @@
 	import Modal from './modal.svelte';
 	import ClientEditor from './client-editor.svelte';
 	import ClientKey from './client-key.svelte';
+	import ClientStats from './client-stats.svelte';
 	import { management, pools as poolsOf, privateLabel, providerName, formatDecimal, resetLabel, formatDate, reserveWindows, reserveWindowLabel, type Account, type Client, type ClientSaved, type ClientsReport, type ClientUsage, type Pool, type ReserveWindow } from '$lib/management';
 	import { t } from '$lib/i18n.svelte';
 	let { report, accounts, busy, updated }: { report: ClientsReport | null; accounts: Account[]; busy: string; updated: (message: string) => Promise<void> } = $props();
@@ -113,14 +113,17 @@
 
 <div class="page-heading">
 	<div><h1>{t('clients.title')}</h1>
-		{#if report}<p class="page-description">{#if report.enforced}<span class="state-badge"><Lock size={14}/>{t('clients.enforced')}</span>{:else}<span class="open-state"><LockOpen size={16}/>{t('clients.open')}</span>{/if}</p>{/if}
+		{#if report}<p class="page-description"><span class="state-badge" title={t('clients.enforcedInfo')}><Lock size={14}/>{t('clients.enforced')}</span></p>{/if}
 	</div>
 	<div class="heading-actions"><button class="button primary" disabled={!report || !!busy} onclick={() => editor = { client: null }}><Plus size={20}/>{t('clients.new')}</button></div>
 </div>
 
+{#if report}<ClientStats {clients} {colors} {noKeyColor} {formerColor} version={report}/>{/if}
+
 {#if report && !clients.length}
 	<section class="ledger"><EmptyState title={t('clients.emptyTitle')} description={t('clients.emptyDescription')} action={t('clients.new')} onclick={() => editor = { client: null }}/></section>
 {:else if clients.length}
+	<div class="section-toolbar"><h2 class="section-title">{t('clients.keys')}</h2></div>
 	<div class="client-grid">
 		{#each clients as client (client.id)}
 			{@const access = accessSummary(client)}
@@ -214,8 +217,6 @@
 {/if}
 
 <style>
-	.open-state { display: inline-flex; align-items: center; gap: 8px; color: var(--yellow); }
-	.open-state :global(svg) { flex-shrink: 0; }
 	.page-description .state-badge { gap: 7px; }
 	.client-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; }
 	.client-card { display: flex; flex-direction: column; gap: 14px; padding: 20px 20px 22px; border: 1px solid var(--border); border-top: 3px solid var(--client); border-radius: 14px; background: var(--surface); }

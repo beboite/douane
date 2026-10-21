@@ -397,7 +397,7 @@ pub async fn forward(
     body: Bytes,
 ) -> Response {
     let client = match state.clients.authenticate(&headers) {
-        Ok(client) => client,
+        Ok(client) => Some(client),
         Err(refusal) => return error(StatusCode::UNAUTHORIZED, refusal.message()),
     };
     let count_tokens = uri.path().ends_with("/messages/count_tokens");

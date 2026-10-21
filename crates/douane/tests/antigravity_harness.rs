@@ -176,6 +176,13 @@ impl Fixture {
         config.server.auth_dir = dir.path().join("auth");
         config.server.database = dir.path().join("calls.sqlite");
         let state = AppState::new(config, None).unwrap();
+        let (_, key) = state
+            .clients
+            .create(douane::clients::ClientPatch {
+                name: Some("tests".into()),
+                ..Default::default()
+            })
+            .unwrap();
         state.accounts.import(json!({"type":provider,"access_token":"synthetic-access","base_url":upstream,"models":["synthetic-thinking","claude-synthetic"]}), None).await.unwrap();
         state.refresh_models().await;
         let (url, gate_task) = serve(douane::router(state.clone())).await;
@@ -185,6 +192,14 @@ impl Fixture {
             url,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(5))
+                .default_headers(
+                    [(
+                        reqwest::header::AUTHORIZATION,
+                        format!("Bearer {key}").parse().unwrap(),
+                    )]
+                    .into_iter()
+                    .collect(),
+                )
                 .build()
                 .unwrap(),
             tasks: vec![up_task, gate_task],

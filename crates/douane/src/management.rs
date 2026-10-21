@@ -692,7 +692,7 @@ pub async fn public_models(
     Query(query): Query<Params>,
 ) -> Response {
     match state.clients.authenticate(&headers) {
-        Ok(client) => Json(list_models(&state, &query, client.as_ref()).await).into_response(),
+        Ok(client) => Json(list_models(&state, &query, Some(&client)).await).into_response(),
         Err(refusal) => error(StatusCode::UNAUTHORIZED, refusal.message()),
     }
 }
@@ -827,7 +827,7 @@ pub async fn public_quotas(
     Query(read): Query<QuotaRead>,
 ) -> Response {
     let client = match state.clients.authenticate(&headers) {
-        Ok(client) => client,
+        Ok(client) => Some(client),
         Err(refusal) => return error(StatusCode::UNAUTHORIZED, refusal.message()),
     };
     if matches!(read.refresh.as_deref(), Some("1" | "true")) {
@@ -876,10 +876,31 @@ pub async fn clients(State(state): State<Arc<AppState>>) -> Json<Value> {
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
     let list: Vec<Value> = state.clients.list().iter().map(|c| c.public()).collect();
     Json(json!({
-        "enforced": !list.is_empty(),
         "clients": list,
         "usage": state.clients.usage_report(now),
     }))
+}
+
+#[derive(Deserialize)]
+pub struct StatsPeriod {
+    hours: Option<u32>,
+}
+
+/// Longest period the client statistics cover: 90 days.
+const MAX_STATS_HOURS: u32 = 90 * 24;
+
+/// What each client spent over the last `hours` (24 by default): totals by
+/// provider and model, and calls and tokens by UTC hour.
+pub async fn client_stats(
+    State(state): State<Arc<AppState>>,
+    Query(period): Query<StatsPeriod>,
+) -> Json<Value> {
+    let hours = period.hours.unwrap_or(24).clamp(1, MAX_STATS_HOURS);
+    let since = crate::subscriptions::timestamp(
+        time::OffsetDateTime::now_utc() - time::Duration::hours(hours.into()),
+    );
+    let stats = state.ledger.client_stats(since.clone()).await;
+    Json(json!({"since": since, "totals": stats.totals, "hours": stats.hours}))
 }
 
 pub async fn create_client(

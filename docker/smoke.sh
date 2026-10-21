@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Run a built image the way compose.yaml does and check what a user relies on:
-# health, dashboard, client API, a settings change saved to the volume, the
-# non-root user, a clean stop on SIGTERM, and the state surviving a restart.
+# health, dashboard, the client API refusing calls without a client key and
+# serving one, a settings change saved to the volume, the non-root user, a
+# clean stop on SIGTERM, and the state, client included, surviving a restart.
 set -euo pipefail
 image=${1:?usage: bash docker/smoke.sh IMAGE}
 name="douane-smoke-${RANDOM}-$$"
@@ -36,7 +37,10 @@ ready() {
 ready
 curl -fsS "$base/health" | grep -q '"service":"douane"'
 curl -fsS "$base/admin" | grep -qi '<html'
-curl -fsS "$base/v1/models" | grep -q '"data"'
+test "$(curl -sS -o /dev/null -w '%{http_code}' "$base/v1/models")" = 401
+key=$(curl -fsS -X POST "$base/admin/api/clients" -H 'Content-Type: application/json'   -d '{"name":"smoke"}' | grep -o '"key":"dk_[0-9a-f]*"' | cut -d'"' -f4)
+[[ -n "$key" ]] || { echo "no client key"; exit 1; }
+curl -fsS "$base/v1/models" -H "Authorization: Bearer $key" | grep -q '"data"'
 curl -fsS -X PATCH "$base/admin/api/settings" -H 'Content-Type: application/json' \
   -d '{"quota_refresh_seconds":901}' | grep -q '"quota_refresh_seconds":901'
 
@@ -49,4 +53,5 @@ grep -q 'quota_refresh_seconds = 901' "$scratch/douane.toml"
 docker start "$name" >/dev/null
 ready
 curl -fsS "$base/admin/api/settings" | grep -q '"quota_refresh_seconds":901'
-echo 'Docker smoke passed: health, dashboard, client API, settings saved to /data, non-root user, clean stop, restart'
+curl -fsS "$base/v1/models" -H "Authorization: Bearer $key" | grep -q '"data"'
+echo 'Docker smoke passed: health, dashboard, client API behind a client key, settings saved to /data, non-root user, clean stop, restart'
