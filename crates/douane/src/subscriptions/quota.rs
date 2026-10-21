@@ -69,6 +69,7 @@ impl QuotaSnapshot {
 
     /// The longest account-wide window, when it lasts a week or more, resets
     /// within `seconds` after `now`: what is left of it is lost unless spent.
+    /// Windows count as the default reserve counts them, `window-<n>s` included.
     pub fn longest_window_ends_within(&self, seconds: i64, now: i64) -> bool {
         if seconds <= 0 {
             return false;
@@ -76,7 +77,6 @@ impl QuotaSnapshot {
         let windows = || {
             self.windows
                 .iter()
-                .filter(|window| reserve_kind(&window.id).is_some())
                 .filter_map(|window| Some((window, window_seconds(&window.id)?)))
         };
         let Some(longest) = windows().map(|(_, length)| length).reduce(f64::max) else {
@@ -1605,6 +1605,24 @@ mod tests {
             window("monthly", Some(60.0), later),
         ]);
         assert!(!go_weekly_low.reserve_reached(5.0, &[], observed()));
+        // Limits lift only near the reset of the longest window, a week or
+        // more, whatever its id.
+        let at = observed().unix_timestamp();
+        let in_hours = |hours: i64| {
+            (observed() + time::Duration::hours(hours))
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        };
+        let fortnight = snapshot(vec![window("window-1209600s", Some(3.0), &in_hours(5))]);
+        assert!(fortnight.longest_window_ends_within(6 * 3600, at));
+        assert!(!fortnight.longest_window_ends_within(4 * 3600, at));
+        let fortnight_later = snapshot(vec![
+            window("weekly", Some(3.0), &in_hours(5)),
+            window("window-1209600s", Some(50.0), &in_hours(72)),
+        ]);
+        assert!(!fortnight_later.longest_window_ends_within(6 * 3600, at));
+        let short = snapshot(vec![window("daily", Some(3.0), &in_hours(5))]);
+        assert!(!short.longest_window_ends_within(6 * 3600, at));
         // The longest window past its reset no longer holds the account
         // back, and a shorter one does not take over.
         let reset = snapshot(vec![
