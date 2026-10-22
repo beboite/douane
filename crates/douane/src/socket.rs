@@ -458,7 +458,13 @@ async fn run(mut downstream: WebSocket, state: Arc<AppState>, headers: HeaderMap
     track_call(&mut calls, &state, &account, &initial, client.as_ref());
     // Retain at most one request, and release its payload on the first forwarded event.
     let mut retry_request = Some(initial);
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(25));
+    let beat = Duration::from_millis(
+        state
+            .socket_heartbeat_ms
+            .load(std::sync::atomic::Ordering::Relaxed),
+    );
+    let silence = beat * 18 / 5;
+    let mut heartbeat = tokio::time::interval(beat);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await;
     let mut last_upstream = tokio::time::Instant::now();
@@ -648,11 +654,11 @@ async fn run(mut downstream: WebSocket, state: Arc<AppState>, headers: HeaderMap
                 }
             }
             _ = heartbeat.tick() => {
-                if last_downstream.elapsed() > Duration::from_secs(90) {
+                if last_downstream.elapsed() > silence {
                     close_for_recovery(&mut downstream).await;
                     break;
                 }
-                if last_upstream.elapsed() > Duration::from_secs(90) {
+                if last_upstream.elapsed() > silence {
                     reject(&mut downstream, "upstream websocket heartbeat timed out").await;
                     break;
                 }

@@ -16,10 +16,11 @@
 	import AccountsView from '$lib/components/accounts-view.svelte';
 	import ClientsView from '$lib/components/clients-view.svelte';
 	import DataViews from '$lib/components/data-views.svelte';
+	import ModelsView from '$lib/components/models-view.svelte';
 	import SettingsView from '$lib/components/settings-view.svelte';
 	import ConnectDialog from '$lib/components/connect-dialog.svelte';
 	import DouaneMark from '$lib/components/douane-mark.svelte';
-	import { management, importErrors, type Account, type Quota, type Provider, type Model, type Call, type Status, type Settings, type QuotaDisplay, type QuotaWindowChoice, type ReserveWindow, type EndpointPatch, type ClientsReport } from '$lib/management';
+	import { management, importErrors, type Account, type Quota, type Provider, type Model, type ModelListing, type Call, type Status, type Settings, type QuotaDisplay, type QuotaWindowChoice, type ReserveWindow, type EndpointPatch, type ClientsReport } from '$lib/management';
 	import LanguageSetting from '$lib/components/language-setting.svelte';
 	import { t, type StringKey } from '$lib/i18n.svelte';
 	const groups: { label: StringKey; items: { id: string; label: StringKey; icon: typeof Gauge }[] }[] = [
@@ -34,6 +35,7 @@
 	let quotas = $state.raw<Quota[]>([]);
 	let providers = $state.raw<Provider[]>([]);
 	let models = $state.raw<Model[]>([]);
+	let modelListings = $state.raw<Record<string, ModelListing>>({});
 	let calls = $state.raw<Call[]>([]);
 	let summary = $state.raw<Status | null>(null);
 	let settings = $state.raw<Settings | null>(null);
@@ -53,7 +55,7 @@
 			if (responses[0].status === 'fulfilled') accounts = responses[0].value.accounts; else errors.push(responses[0].reason.message);
 			if (responses[1].status === 'fulfilled') quotas = responses[1].value.quotas; else errors.push(responses[1].reason.message);
 			if (responses[2].status === 'fulfilled') providers = responses[2].value.providers; else errors.push(responses[2].reason.message);
-			if (responses[3].status === 'fulfilled') models = responses[3].value.models; else errors.push(responses[3].reason.message);
+			if (responses[3].status === 'fulfilled') { models = responses[3].value.models; modelListings = responses[3].value.listings ?? {}; } else errors.push(responses[3].reason.message);
 			if (responses[4].status === 'fulfilled') calls = responses[4].value.calls; else errors.push(responses[4].reason.message);
 			if (responses[5].status === 'fulfilled') summary = responses[5].value; else { summary = null; errors.push(responses[5].reason.message); }
 			if (responses[6].status === 'fulfilled') settings = responses[6].value; else errors.push(responses[6].reason.message);
@@ -136,7 +138,8 @@
 			{:else if screen === 'accounts'}<AccountsView {accounts} {quotas} {busy} {rename} {setReserve} {updateEndpoint} connect={() => connectOpen = true} {importFiles} toggle={(account) => mutate('account',() => management.setAccountEnabled(account.id,!account.enabled),t(account.enabled ? 'notice.accountDisabled' : 'notice.accountEnabled'))} remove={(account) => mutate('account',() => management.deleteAccount(account.id),t('notice.accountDeleted'))}/>
 			{:else if screen === 'clients'}<ClientsView report={clients} {accounts} {busy} updated={async (message) => { await load(true); notice = message; }}/>
 			{:else if screen === 'settings'}{#if settings}{#key JSON.stringify(settings)}<SettingsView {settings} {providers} {busy} restore={restoreBackup} save={(next) => mutate('settings',() => management.settingsSave(next),t('notice.settingsSaved'))}/>{/key}{:else}<div class="page-heading"><div><h1>{t('nav.settings')}</h1><p class="page-description">{t('page.settingsUnavailable')}</p></div></div><LanguageSetting/>{/if}
-			{:else}{#key screen}<DataViews {screen} {summary} {calls} {models} {accounts} clients={clients?.clients ?? []} {busy} {navigate} toggleModel={(model) => mutate('model',() => management.setModelEnabled(model.id,model.enabled === false),t('notice.modelUpdated'))}/>{/key}{/if}
+			{:else if screen === 'models'}<ModelsView {models} listings={modelListings} {accounts} {busy} {navigate} toggleModel={(model) => mutate('model',() => management.setModelEnabled(model.id,model.enabled === false),t('notice.modelUpdated'))} setModels={(ids, enabled) => mutate('models',() => management.setModelsEnabled(ids,enabled),t('notice.modelsUpdated', { count: ids.length }))} refreshModels={(pool) => mutate(`models:${pool ?? '*'}`,() => management.refreshModels(pool))}/>
+			{:else}{#key screen}<DataViews {screen} {summary} {calls} {accounts} clients={clients?.clients ?? []} {navigate}/>{/key}{/if}
 		</main>
 	</div>
 </div>
