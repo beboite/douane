@@ -233,8 +233,6 @@ impl AppState {
         let previous = self.models.read().await.clone();
         let mut read: BTreeSet<String> = BTreeSet::new();
         let mut failed: BTreeSet<String> = BTreeSet::new();
-        // A pool another account read live is fresh despite one failure.
-        let mut answered: BTreeSet<String> = BTreeSet::new();
         let mut models: BTreeMap<String, Model> = BTreeMap::new();
         if let Some(pool) = only {
             for model in previous.iter().filter(|m| !in_pool(m, pool)) {
@@ -319,7 +317,6 @@ impl AppState {
                         None => None,
                     };
                     if let Some(data) = data.as_ref().and_then(|v| v["data"].as_array()) {
-                        answered.insert(pool.to_owned());
                         available = data
                             .iter()
                             .filter_map(|m| {
@@ -372,7 +369,6 @@ impl AppState {
                 match self.antigravity_models(&summary.id).await {
                     Some(live) => {
                         available = live;
-                        answered.insert(pool.to_owned());
                     }
                     None => {
                         if !kept.is_empty() {
@@ -385,7 +381,6 @@ impl AppState {
             if account.provider == SubscriptionProvider::Copilot {
                 match self.copilot_models(&account).await {
                     Some(live) => {
-                        answered.insert(pool.to_owned());
                         available = live
                             .into_iter()
                             .filter(|m| account.models.is_empty() || account.models.contains(&m.id))
@@ -438,7 +433,7 @@ impl AppState {
             None => listings.clear(),
         }
         for pool in read {
-            let stale = failed.contains(&pool) && !answered.contains(&pool);
+            let stale = failed.contains(&pool);
             listings.insert(
                 pool,
                 ModelListing {

@@ -547,6 +547,20 @@ async fn a_failed_copilot_listing_is_marked_and_retried() {
 }
 
 #[tokio::test]
+async fn one_answering_account_does_not_hide_another_ones_failure() {
+    // Plans differ, so one Copilot account's catalog cannot vouch for
+    // another's: the pool stays stale and retried until both answer.
+    let (answering, _) = copilot().await;
+    let failing = serve(Router::new()).await;
+    let gateway = Gateway::new(&[
+        json!({"type":"copilot","access_token":"gho_one","base_url":answering.url}),
+        json!({"type":"copilot","access_token":"gho_two","base_url":failing.url}),
+    ])
+    .await;
+    assert_eq!(gateway.state.stale_pools(), ["copilot"]);
+}
+
+#[tokio::test]
 async fn a_whole_provider_turns_off_in_one_call() {
     let server = serve(Router::new().route(
         "/v1/models",
