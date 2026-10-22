@@ -1625,20 +1625,15 @@ async fn native_websocket_concurrent_lanes_fail_explicitly_without_replay() {
     assert_eq!(fixture.state.ledger.in_flight.load(Ordering::Relaxed), 0);
 }
 
-async fn wall_barrier(mut ready: impl FnMut() -> bool) {
-    let started = std::time::Instant::now();
-    while !ready() {
-        assert!(
-            started.elapsed() < WAIT,
-            "network barrier timed out with the Tokio clock paused"
-        );
-        tokio::task::yield_now().await;
-    }
-}
-
 #[tokio::test]
 async fn native_websocket_heartbeat_expires_silent_downstream_with_healthy_upstream() {
+    // Real time on a short beat: a paused clock left the loopback sockets
+    // unpolled on Windows runners and timed the test out.
     let fixture = Fixture::new(&[("codex", "alpha")], Strategy::FillFirst).await;
+    fixture
+        .state
+        .socket_heartbeat_ms
+        .store(200, Ordering::Relaxed);
     let mut socket = fixture.socket("native-downstream-heartbeat").await;
     send(
         &mut socket,
@@ -1646,24 +1641,6 @@ async fn native_websocket_heartbeat_expires_silent_downstream_with_healthy_upstr
     )
     .await;
     assert_eq!(next(&mut socket).await["type"], "response.completed");
-    tokio::time::pause();
-    // Prevent auto-advance while real network I/O is pending. Barriers observe sent pongs.
-    let runnable = tokio::spawn(async {
-        loop {
-            tokio::task::yield_now().await;
-        }
-    });
-    for tick in 1..=3 {
-        tokio::time::advance(Duration::from_secs(25)).await;
-        wall_barrier(|| fixture.mock.native_pings.load(Ordering::Relaxed) >= tick).await;
-        for _ in 0..100 {
-            tokio::task::yield_now().await;
-        }
-    }
-    tokio::time::advance(Duration::from_secs(25)).await;
-    wall_barrier(|| fixture.mock.closed.load(Ordering::Relaxed) == 1).await;
-    runnable.abort();
-    tokio::time::resume();
     let MaybeTlsStream::Plain(stream) = socket.get_mut() else {
         panic!("local fixture must use a plain socket");
     };
@@ -1693,11 +1670,16 @@ async fn native_websocket_heartbeat_expires_silent_downstream_with_healthy_upstr
     })
     .await
     .unwrap();
+    fixture.closed(1).await;
+    assert!(
+        pings >= 2,
+        "the silent peer was dropped after {pings} pings"
+    );
     assert_eq!(
-        pings, 3,
+        fixture.mock.native_pings.load(Ordering::Relaxed),
+        pings,
         "both peers must be pinged on the same heartbeat cadence"
     );
-    assert_eq!(fixture.mock.native_pings.load(Ordering::Relaxed), 3);
 }
 
 #[tokio::test]

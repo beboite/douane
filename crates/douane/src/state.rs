@@ -113,6 +113,9 @@ pub struct AppState {
     /// One catalog refresh at a time: each one starts from the rows the
     /// last one published.
     model_refresh: tokio::sync::Mutex<()>,
+    /// Milliseconds between native WebSocket pings; a peer silent for 3.6
+    /// of them (90 s at the default 25 s) is dropped. Tests shorten it.
+    pub socket_heartbeat_ms: std::sync::atomic::AtomicU64,
     pub scheduler: Mutex<Scheduler>,
     pub affinity: Mutex<crate::affinity::Affinity>,
     pub(crate) antigravity_replay: Mutex<crate::antigravity_replay::ReplayCache>,
@@ -169,6 +172,7 @@ impl AppState {
             models: RwLock::new(vec![]),
             model_listings: Mutex::new(BTreeMap::new()),
             model_refresh: tokio::sync::Mutex::new(()),
+            socket_heartbeat_ms: std::sync::atomic::AtomicU64::new(25_000),
             scheduler: Mutex::new(Scheduler::default()),
             affinity: Mutex::new(crate::affinity::Affinity::default()),
             antigravity_replay: Mutex::new(crate::antigravity_replay::ReplayCache::default()),
