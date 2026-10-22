@@ -402,6 +402,114 @@ async fn an_endpoint_route_must_not_shadow_a_provider() {
 }
 
 #[tokio::test]
+async fn a_failed_listing_keeps_the_previous_catalog() {
+    // OpenRouter's listing once timed out during a refresh and its whole
+    // pool vanished from /v1/models until douane restarted.
+    let failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let switch = failing.clone();
+    let server = serve(Router::new().route(
+        "/v1/models",
+        get(move || {
+            let failing = switch.load(std::sync::atomic::Ordering::Relaxed);
+            async move {
+                if failing {
+                    StatusCode::BAD_GATEWAY.into_response()
+                } else {
+                    Json(json!({"data":[{"id":"deepseek/deepseek-v4.1-flash"}]})).into_response()
+                }
+            }
+        }),
+    ))
+    .await;
+    let gateway = Gateway::new(&[endpoint("openrouter", &server.url, "key")]).await;
+    let listed = ["openrouter/deepseek/deepseek-v4.1-flash"];
+    assert_eq!(gateway.model_ids().await, listed);
+
+    failing.store(true, std::sync::atomic::Ordering::Relaxed);
+    gateway.state.refresh_models().await;
+    assert_eq!(gateway.model_ids().await, listed);
+    assert!(
+        gateway
+            .state
+            .models_incomplete
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+
+    failing.store(false, std::sync::atomic::Ordering::Relaxed);
+    gateway.state.refresh_models().await;
+    assert_eq!(gateway.model_ids().await, listed);
+    assert!(
+        !gateway
+            .state
+            .models_incomplete
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+}
+
+#[tokio::test]
+async fn an_endpoint_without_a_listing_keeps_its_named_models() {
+    // A request path that works beside a `/models` that never answers.
+    let server = serve(Router::new()).await;
+    let mut account = endpoint("mimo", &server.url, "key");
+    account["models"] = json!(["mimo-v3"]);
+    let gateway = Gateway::new(&[account]).await;
+    assert_eq!(gateway.model_ids().await, ["mimo/mimo-v3"]);
+    gateway.state.refresh_models().await;
+    assert_eq!(gateway.model_ids().await, ["mimo/mimo-v3"]);
+    assert!(
+        !gateway
+            .state
+            .models_incomplete
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+}
+
+#[tokio::test]
+async fn a_narrowed_model_list_applies_while_the_listing_fails() {
+    let failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let switch = failing.clone();
+    let server = serve(Router::new().route(
+        "/v1/models",
+        get(move || {
+            let failing = switch.load(std::sync::atomic::Ordering::Relaxed);
+            async move {
+                if failing {
+                    StatusCode::BAD_GATEWAY.into_response()
+                } else {
+                    Json(json!({"data":[{"id":"a","context_length":64000},{"id":"b"}]}))
+                        .into_response()
+                }
+            }
+        }),
+    ))
+    .await;
+    let gateway = Gateway::new(&[endpoint("openrouter", &server.url, "key")]).await;
+    assert_eq!(gateway.model_ids().await, ["openrouter/a", "openrouter/b"]);
+    failing.store(true, std::sync::atomic::Ordering::Relaxed);
+    let id = gateway.state.accounts.list().await[0].id.clone();
+    gateway
+        .state
+        .accounts
+        .update_endpoint(
+            &id,
+            douane::subscriptions::EndpointPatch {
+                models: Some(vec!["a".into()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    gateway.state.refresh_models().await;
+    assert_eq!(gateway.model_ids().await, ["openrouter/a"]);
+    // The management catalog drops `b` too, and what the last listing said
+    // about `a` survives the outage.
+    let models = gateway.state.models.read().await;
+    let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["openrouter/a"]);
+    assert_eq!(models[0].context_length, Some(64000));
+}
+
+#[tokio::test]
 async fn copilot_lists_enabled_models_and_uses_each_ones_path() {
     let (server, seen) = copilot().await;
     // OpenCode's own auth file is enough to bring the login over.

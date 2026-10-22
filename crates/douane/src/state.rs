@@ -91,6 +91,9 @@ pub struct AppState {
     pub clients: Arc<crate::clients::Clients>,
     pub client: reqwest::Client,
     pub models: RwLock<Vec<Model>>,
+    /// Set when the last catalog refresh could not read an account's live
+    /// listing; the background loop retries until every listing answers.
+    pub models_incomplete: std::sync::atomic::AtomicBool,
     pub scheduler: Mutex<Scheduler>,
     pub affinity: Mutex<crate::affinity::Affinity>,
     pub(crate) antigravity_replay: Mutex<crate::antigravity_replay::ReplayCache>,
@@ -145,6 +148,7 @@ impl AppState {
             clients,
             client,
             models: RwLock::new(vec![]),
+            models_incomplete: std::sync::atomic::AtomicBool::new(false),
             scheduler: Mutex::new(Scheduler::default()),
             affinity: Mutex::new(crate::affinity::Affinity::default()),
             antigravity_replay: Mutex::new(crate::antigravity_replay::ReplayCache::default()),
@@ -188,6 +192,8 @@ impl AppState {
 
     pub async fn refresh_models(&self) {
         let bundled = catalog();
+        let previous = self.models.read().await.clone();
+        let mut incomplete = false;
         let mut models: BTreeMap<String, Model> = BTreeMap::new();
         let disabled = self.config.read().await.disabled_models.clone();
         for summary in self.accounts.list().await {
@@ -235,45 +241,77 @@ impl AppState {
                     } else {
                         format!("{root}/v1/models")
                     };
-                    if let Ok(response) = self
+                    let listing = self
                         .client
                         .get(url)
                         .bearer_auth(&account.access_token)
                         .timeout(std::time::Duration::from_secs(15))
                         .send()
                         .await
-                    {
-                        if response.status().is_success() {
-                            if let Ok(value) = response.json::<Value>().await {
-                                if let Some(data) = value["data"].as_array() {
-                                    available = data
-                                        .iter()
-                                        .filter_map(|m| {
-                                            Some(Model {
-                                                id: m["id"].as_str()?.into(),
-                                                name: m["name"]
-                                                    .as_str()
-                                                    .or_else(|| m["id"].as_str())?
-                                                    .into(),
-                                                provider: account.provider,
-                                                context_length: m["context_length"]
-                                                    .as_u64()
-                                                    .or_else(|| m["context_window"].as_u64()),
-                                                max_output_tokens: None,
-                                                enabled: true,
-                                                upstream_id: String::new(),
-                                                thinking: m.get("thinking").cloned(),
-                                                ..Model::default()
-                                            })
-                                        })
-                                        .filter(|m| {
-                                            account.models.is_empty()
-                                                || account.models.contains(&m.id)
-                                        })
-                                        .collect();
+                        .ok()
+                        .filter(|response| response.status().is_success());
+                    let data = match listing {
+                        Some(response) => response.json::<Value>().await.ok(),
+                        None => None,
+                    };
+                    if let Some(data) = data.as_ref().and_then(|v| v["data"].as_array()) {
+                        available = data
+                            .iter()
+                            .filter_map(|m| {
+                                Some(Model {
+                                    id: m["id"].as_str()?.into(),
+                                    name: m["name"].as_str().or_else(|| m["id"].as_str())?.into(),
+                                    provider: account.provider,
+                                    context_length: m["context_length"]
+                                        .as_u64()
+                                        .or_else(|| m["context_window"].as_u64()),
+                                    max_output_tokens: None,
+                                    enabled: true,
+                                    upstream_id: String::new(),
+                                    thinking: m.get("thinking").cloned(),
+                                    ..Model::default()
+                                })
+                            })
+                            .filter(|m| account.models.is_empty() || account.models.contains(&m.id))
+                            .collect();
+                    } else {
+                        // A listing that times out or errors once must not
+                        // empty the pool until the next restart: keep what
+                        // the last refresh read, within the account's own
+                        // model list. An account that names its models keeps
+                        // them without a listing, so only one that names
+                        // none is retried in the background.
+                        let pool = account.pool();
+                        tracing::warn!(pool = %pool, "model listing unavailable, keeping the previous catalog");
+                        let kept: Vec<Model> = previous
+                            .iter()
+                            .filter(|m| {
+                                m.provider == account.provider
+                                    && m.id
+                                        .strip_prefix(pool)
+                                        .is_some_and(|rest| rest.starts_with('/'))
+                                    && (account.models.is_empty()
+                                        || account.models.contains(&m.upstream_id))
+                            })
+                            .map(|m| Model {
+                                id: m.upstream_id.clone(),
+                                ..m.clone()
+                            })
+                            .collect();
+                        if account.models.is_empty() {
+                            available = kept;
+                        } else {
+                            // Every named model stays, with what the last
+                            // listing said about it when it said something.
+                            for model in &mut available {
+                                if let Some(known) =
+                                    kept.iter().find(|k| k.upstream_id == model.upstream_id)
+                                {
+                                    *model = known.clone();
                                 }
                             }
                         }
+                        incomplete |= account.models.is_empty();
                     }
                 }
             }
@@ -301,6 +339,8 @@ impl AppState {
             }
         }
         *self.models.write().await = models.into_values().collect();
+        self.models_incomplete
+            .store(incomplete, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Copilot's own catalog: the models this account's plan enables, with
