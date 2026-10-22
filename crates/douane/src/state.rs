@@ -277,23 +277,41 @@ impl AppState {
                     } else {
                         // A listing that times out or errors once must not
                         // empty the pool until the next restart: keep what
-                        // the last refresh read, and retry in the background.
-                        incomplete = true;
+                        // the last refresh read, within the account's own
+                        // model list. An account that names its models keeps
+                        // them without a listing, so only one that names
+                        // none is retried in the background.
                         let pool = account.pool();
                         tracing::warn!(pool = %pool, "model listing unavailable, keeping the previous catalog");
-                        available = previous
+                        let kept: Vec<Model> = previous
                             .iter()
                             .filter(|m| {
                                 m.provider == account.provider
                                     && m.id
                                         .strip_prefix(pool)
                                         .is_some_and(|rest| rest.starts_with('/'))
+                                    && (account.models.is_empty()
+                                        || account.models.contains(&m.upstream_id))
                             })
                             .map(|m| Model {
                                 id: m.upstream_id.clone(),
                                 ..m.clone()
                             })
                             .collect();
+                        if account.models.is_empty() {
+                            available = kept;
+                        } else {
+                            // Every named model stays, with what the last
+                            // listing said about it when it said something.
+                            for model in &mut available {
+                                if let Some(known) =
+                                    kept.iter().find(|k| k.upstream_id == model.upstream_id)
+                                {
+                                    *model = known.clone();
+                                }
+                            }
+                        }
+                        incomplete |= account.models.is_empty();
                     }
                 }
             }
