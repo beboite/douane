@@ -487,6 +487,66 @@ async fn a_pool_refresh_rereads_only_that_pool() {
 }
 
 #[tokio::test]
+async fn an_overlapping_refresh_keeps_newer_rows_and_switches() {
+    // A slow pool's refresh must not publish its old copy of another pool
+    // over a newer read, nor turn back on a model switched off meanwhile.
+    let second = Arc::new(Mutex::new(vec!["x"]));
+    let ids = second.clone();
+    let slow = serve(Router::new().route(
+        "/v1/models",
+        get(|| async {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            Json(json!({"data":[{"id":"a"}]}))
+        }),
+    ))
+    .await;
+    let fast = serve(Router::new().route(
+        "/v1/models",
+        get(move || {
+            let data: Vec<Value> = ids
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|id| json!({ "id": id }))
+                .collect();
+            async move { Json(json!({ "data": data })) }
+        }),
+    ))
+    .await;
+    let gateway = Gateway::new(&[
+        endpoint("one", &slow.url, "key"),
+        endpoint("two", &fast.url, "key"),
+    ])
+    .await;
+    assert_eq!(gateway.model_ids().await, ["one/a", "two/x"]);
+
+    second.lock().unwrap().push("y");
+    let state = gateway.state.clone();
+    let slow_refresh = tokio::spawn(async move { state.refresh_models_in(Some("one")).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    gateway
+        .admin(
+            reqwest::Method::PATCH,
+            "/models",
+            Some(json!({"ids":["two/x"],"enabled":false})),
+        )
+        .await;
+    gateway.state.refresh_models_in(Some("two")).await;
+    slow_refresh.await.unwrap();
+    assert_eq!(gateway.model_ids().await, ["one/a", "two/y"]);
+}
+
+#[tokio::test]
+async fn a_failed_copilot_listing_is_marked_and_retried() {
+    let server = serve(Router::new()).await;
+    let gateway = Gateway::new(&[
+        json!({"type":"copilot","access_token":"gho_fixture","base_url":server.url}),
+    ])
+    .await;
+    assert_eq!(gateway.state.stale_pools(), ["copilot"]);
+}
+
+#[tokio::test]
 async fn a_whole_provider_turns_off_in_one_call() {
     let server = serve(Router::new().route(
         "/v1/models",

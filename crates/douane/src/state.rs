@@ -110,6 +110,9 @@ pub struct AppState {
     /// When each pool's catalog was last read, and whether its live listing
     /// failed; the background loop rereads a stale pool until it answers.
     pub model_listings: Mutex<BTreeMap<String, ModelListing>>,
+    /// One catalog refresh at a time: each one starts from the rows the
+    /// last one published.
+    model_refresh: tokio::sync::Mutex<()>,
     pub scheduler: Mutex<Scheduler>,
     pub affinity: Mutex<crate::affinity::Affinity>,
     pub(crate) antigravity_replay: Mutex<crate::antigravity_replay::ReplayCache>,
@@ -165,6 +168,7 @@ impl AppState {
             client,
             models: RwLock::new(vec![]),
             model_listings: Mutex::new(BTreeMap::new()),
+            model_refresh: tokio::sync::Mutex::new(()),
             scheduler: Mutex::new(Scheduler::default()),
             affinity: Mutex::new(crate::affinity::Affinity::default()),
             antigravity_replay: Mutex::new(crate::antigravity_replay::ReplayCache::default()),
@@ -224,17 +228,19 @@ impl AppState {
     /// Rereads the catalog of one pool, or of every pool; the other pools
     /// keep their rows untouched.
     pub async fn refresh_models_in(&self, only: Option<&str>) {
+        let _refresh = self.model_refresh.lock().await;
         let bundled = catalog();
         let previous = self.models.read().await.clone();
         let mut read: BTreeSet<String> = BTreeSet::new();
-        let mut stale: BTreeSet<String> = BTreeSet::new();
+        let mut failed: BTreeSet<String> = BTreeSet::new();
+        // A pool another account read live is fresh despite one failure.
+        let mut answered: BTreeSet<String> = BTreeSet::new();
         let mut models: BTreeMap<String, Model> = BTreeMap::new();
         if let Some(pool) = only {
             for model in previous.iter().filter(|m| !in_pool(m, pool)) {
                 models.insert(model.id.clone(), model.clone());
             }
         }
-        let disabled = self.config.read().await.disabled_models.clone();
         for summary in self.accounts.list().await {
             let Some(account) = self.accounts.get(&summary.id).await else {
                 continue;
@@ -242,7 +248,22 @@ impl AppState {
             if only.is_some_and(|pool| pool != account.pool()) {
                 continue;
             }
-            read.insert(account.pool().to_owned());
+            let pool = account.pool();
+            read.insert(pool.to_owned());
+            // What the last refresh read for this account, within its own
+            // model list, for when a live listing fails.
+            let kept: Vec<Model> = previous
+                .iter()
+                .filter(|m| {
+                    m.provider == account.provider
+                        && in_pool(m, pool)
+                        && (account.models.is_empty() || account.models.contains(&m.upstream_id))
+                })
+                .map(|m| Model {
+                    id: m.upstream_id.clone(),
+                    ..m.clone()
+                })
+                .collect();
             let mut available: Vec<Model> = if account.models.is_empty() {
                 bundled
                     .iter()
@@ -298,6 +319,7 @@ impl AppState {
                         None => None,
                     };
                     if let Some(data) = data.as_ref().and_then(|v| v["data"].as_array()) {
+                        answered.insert(pool.to_owned());
                         available = data
                             .iter()
                             .filter_map(|m| {
@@ -324,23 +346,9 @@ impl AppState {
                         // model list. An account that names its models keeps
                         // them without a listing, so only one that names
                         // none is retried in the background.
-                        let pool = account.pool();
                         tracing::warn!(pool = %pool, "model listing unavailable, keeping the previous catalog");
-                        let kept: Vec<Model> = previous
-                            .iter()
-                            .filter(|m| {
-                                m.provider == account.provider
-                                    && in_pool(m, pool)
-                                    && (account.models.is_empty()
-                                        || account.models.contains(&m.upstream_id))
-                            })
-                            .map(|m| Model {
-                                id: m.upstream_id.clone(),
-                                ..m.clone()
-                            })
-                            .collect();
                         if account.models.is_empty() {
-                            available = kept;
+                            available = kept.clone();
                         } else {
                             // Every named model stays, with what the last
                             // listing said about it when it said something.
@@ -353,35 +361,69 @@ impl AppState {
                             }
                         }
                         if account.models.is_empty() {
-                            stale.insert(pool.to_owned());
+                            failed.insert(pool.to_owned());
                         }
                     }
                 }
             }
+            // A failed live read keeps the previous rows, or the bundled
+            // ones on a first read, and is retried like a failed listing.
             if account.provider == SubscriptionProvider::Antigravity && account.models.is_empty() {
-                if let Some(live) = self.antigravity_models(&summary.id).await {
-                    available = live;
+                match self.antigravity_models(&summary.id).await {
+                    Some(live) => {
+                        available = live;
+                        answered.insert(pool.to_owned());
+                    }
+                    None => {
+                        if !kept.is_empty() {
+                            available = kept.clone();
+                        }
+                        failed.insert(pool.to_owned());
+                    }
                 }
             }
             if account.provider == SubscriptionProvider::Copilot {
-                if let Some(live) = self.copilot_models(&account).await {
-                    available = live
-                        .into_iter()
-                        .filter(|m| account.models.is_empty() || account.models.contains(&m.id))
-                        .filter(|m| !self.copilot_refuses(&account.id, &m.id))
-                        .collect();
+                match self.copilot_models(&account).await {
+                    Some(live) => {
+                        answered.insert(pool.to_owned());
+                        available = live
+                            .into_iter()
+                            .filter(|m| account.models.is_empty() || account.models.contains(&m.id))
+                            .filter(|m| !self.copilot_refuses(&account.id, &m.id))
+                            .collect();
+                    }
+                    None => {
+                        if !kept.is_empty() {
+                            available = kept
+                                .iter()
+                                .filter(|m| !self.copilot_refuses(&account.id, &m.id))
+                                .cloned()
+                                .collect();
+                        }
+                        failed.insert(pool.to_owned());
+                    }
                 }
             }
             for mut model in available {
                 model.upstream_id = model.id.clone();
                 model.route = account.route.clone();
                 model.id = format!("{}/{}", account.pool(), model.upstream_id);
-                model.enabled =
-                    !disabled.contains(&model.id) && !disabled.contains(&model.upstream_id);
                 models.insert(model.id.clone(), model);
             }
         }
-        *self.models.write().await = models.into_values().collect();
+        // A model switched while the listings were read must keep its new
+        // state: read the disabled list once the catalog is locked.
+        let mut published = self.models.write().await;
+        let disabled = self.config.read().await.disabled_models.clone();
+        *published = models
+            .into_values()
+            .map(|mut model| {
+                model.enabled =
+                    !disabled.contains(&model.id) && !disabled.contains(&model.upstream_id);
+                model
+            })
+            .collect();
+        drop(published);
         let now = time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default();
@@ -396,7 +438,7 @@ impl AppState {
             None => listings.clear(),
         }
         for pool in read {
-            let stale = stale.contains(&pool);
+            let stale = failed.contains(&pool) && !answered.contains(&pool);
             listings.insert(
                 pool,
                 ModelListing {
