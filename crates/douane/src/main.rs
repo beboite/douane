@@ -64,6 +64,14 @@ async fn main() -> Result<()> {
             if pass.is_multiple_of(20) {
                 poller.quotas.save().await;
             }
+            // A live model listing that failed is read again every minute.
+            if pass.is_multiple_of(4)
+                && poller
+                    .models_incomplete
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                poller.refresh_models().await;
+            }
             tokio::time::sleep(Duration::from_secs(15)).await;
         }
     });

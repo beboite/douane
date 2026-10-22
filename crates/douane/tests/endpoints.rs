@@ -402,6 +402,51 @@ async fn an_endpoint_route_must_not_shadow_a_provider() {
 }
 
 #[tokio::test]
+async fn a_failed_listing_keeps_the_previous_catalog() {
+    // OpenRouter's listing once timed out during a refresh and its whole
+    // pool vanished from /v1/models until douane restarted.
+    let failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let switch = failing.clone();
+    let server = serve(Router::new().route(
+        "/v1/models",
+        get(move || {
+            let failing = switch.load(std::sync::atomic::Ordering::Relaxed);
+            async move {
+                if failing {
+                    StatusCode::BAD_GATEWAY.into_response()
+                } else {
+                    Json(json!({"data":[{"id":"deepseek/deepseek-v4.1-flash"}]})).into_response()
+                }
+            }
+        }),
+    ))
+    .await;
+    let gateway = Gateway::new(&[endpoint("openrouter", &server.url, "key")]).await;
+    let listed = ["openrouter/deepseek/deepseek-v4.1-flash"];
+    assert_eq!(gateway.model_ids().await, listed);
+
+    failing.store(true, std::sync::atomic::Ordering::Relaxed);
+    gateway.state.refresh_models().await;
+    assert_eq!(gateway.model_ids().await, listed);
+    assert!(
+        gateway
+            .state
+            .models_incomplete
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+
+    failing.store(false, std::sync::atomic::Ordering::Relaxed);
+    gateway.state.refresh_models().await;
+    assert_eq!(gateway.model_ids().await, listed);
+    assert!(
+        !gateway
+            .state
+            .models_incomplete
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+}
+
+#[tokio::test]
 async fn copilot_lists_enabled_models_and_uses_each_ones_path() {
     let (server, seen) = copilot().await;
     // OpenCode's own auth file is enough to bring the login over.
