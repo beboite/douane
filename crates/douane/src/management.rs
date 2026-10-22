@@ -640,11 +640,28 @@ pub async fn refresh_quotas(
     Json(json!({"quotas":state.quotas.list().await}))
 }
 pub async fn models(State(state): State<Arc<AppState>>) -> Json<Value> {
-    Json(json!({"models":*state.models.read().await}))
+    model_listing(&state).await
 }
-pub async fn refresh_models(State(state): State<Arc<AppState>>) -> Json<Value> {
-    state.refresh_models().await;
-    Json(json!({"models":*state.models.read().await}))
+async fn model_listing(state: &AppState) -> Json<Value> {
+    let models = state.models.read().await.clone();
+    let listings = state
+        .model_listings
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    Json(json!({"models":models,"listings":listings}))
+}
+#[derive(Default, Deserialize)]
+pub struct RefreshModels {
+    /// One pool (a provider or a custom endpoint route); every pool without it.
+    pub pool: Option<String>,
+}
+pub async fn refresh_models(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<RefreshModels>,
+) -> Json<Value> {
+    state.refresh_models_in(query.pool.as_deref()).await;
+    model_listing(&state).await
 }
 pub async fn set_model(
     State(state): State<Arc<AppState>>,
@@ -654,29 +671,63 @@ pub async fn set_model(
     let Some(enabled) = body["enabled"].as_bool() else {
         return error(StatusCode::BAD_REQUEST, "enabled must be a boolean");
     };
+    match set_models_enabled(&state, std::slice::from_ref(&id), enabled).await {
+        Some(refusal) => refusal,
+        None => Json(json!({"id":id,"enabled":enabled})).into_response(),
+    }
+}
+#[derive(Deserialize)]
+pub struct ModelsPatch {
+    pub ids: Vec<String>,
+    pub enabled: bool,
+}
+/// Turns several models on or off in one configuration write, such as a
+/// whole provider from the Models page.
+pub async fn set_models(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ModelsPatch>,
+) -> Response {
+    match set_models_enabled(&state, &body.ids, body.enabled).await {
+        Some(refusal) => refusal,
+        None => Json(json!({"ids":body.ids,"enabled":body.enabled})).into_response(),
+    }
+}
+/// Saves the change, or returns the refusal to send.
+async fn set_models_enabled(state: &AppState, ids: &[String], enabled: bool) -> Option<Response> {
     let _write = state.config_write.lock().await;
     let mut config = state.config.read().await.clone();
-    if !state.models.read().await.iter().any(|m| m.id == id) {
-        return error(StatusCode::NOT_FOUND, "model not found");
-    }
-    if enabled {
-        config.disabled_models.remove(&id);
-    } else {
-        config.disabled_models.insert(id.clone());
-    }
-    if let Some(path) = &state.config_path {
-        if config.save(path).await.is_err() {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "cannot save configuration",
-            );
+    {
+        let models = state.models.read().await;
+        if ids.iter().any(|id| !models.iter().any(|m| &m.id == id)) {
+            return Some(error(StatusCode::NOT_FOUND, "model not found"));
         }
     }
+    for id in ids {
+        if enabled {
+            config.disabled_models.remove(id);
+        } else {
+            config.disabled_models.insert(id.clone());
+        }
+    }
+    if let Some(path) = &state.config_path
+        && config.save(path).await.is_err()
+    {
+        return Some(error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cannot save configuration",
+        ));
+    }
     *state.config.write().await = config;
-    for model in state.models.write().await.iter_mut().filter(|m| m.id == id) {
+    for model in state
+        .models
+        .write()
+        .await
+        .iter_mut()
+        .filter(|m| ids.contains(&m.id))
+    {
         model.enabled = enabled;
     }
-    Json(json!({"id":id,"enabled":enabled})).into_response()
+    None
 }
 #[derive(Default, Deserialize)]
 pub struct Params {

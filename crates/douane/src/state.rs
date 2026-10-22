@@ -44,6 +44,22 @@ fn yes() -> bool {
     true
 }
 
+/// The last catalog read of one pool.
+#[derive(Clone, Serialize)]
+pub struct ModelListing {
+    pub refreshed_at: String,
+    /// The live listing failed, so the pool shows the previous catalog.
+    pub stale: bool,
+}
+
+/// Whether `model` belongs to `pool`, whose name prefixes its id.
+fn in_pool(model: &Model, pool: &str) -> bool {
+    model
+        .id
+        .strip_prefix(pool)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// A blank enabled row; constructors name the fields they know.
 impl Default for Model {
     fn default() -> Self {
@@ -91,9 +107,9 @@ pub struct AppState {
     pub clients: Arc<crate::clients::Clients>,
     pub client: reqwest::Client,
     pub models: RwLock<Vec<Model>>,
-    /// Set when the last catalog refresh could not read an account's live
-    /// listing; the background loop retries until every listing answers.
-    pub models_incomplete: std::sync::atomic::AtomicBool,
+    /// When each pool's catalog was last read, and whether its live listing
+    /// failed; the background loop rereads a stale pool until it answers.
+    pub model_listings: Mutex<BTreeMap<String, ModelListing>>,
     pub scheduler: Mutex<Scheduler>,
     pub affinity: Mutex<crate::affinity::Affinity>,
     pub(crate) antigravity_replay: Mutex<crate::antigravity_replay::ReplayCache>,
@@ -148,7 +164,7 @@ impl AppState {
             clients,
             client,
             models: RwLock::new(vec![]),
-            models_incomplete: std::sync::atomic::AtomicBool::new(false),
+            model_listings: Mutex::new(BTreeMap::new()),
             scheduler: Mutex::new(Scheduler::default()),
             affinity: Mutex::new(crate::affinity::Affinity::default()),
             antigravity_replay: Mutex::new(crate::antigravity_replay::ReplayCache::default()),
@@ -191,15 +207,42 @@ impl AppState {
     }
 
     pub async fn refresh_models(&self) {
+        self.refresh_models_in(None).await;
+    }
+
+    /// Pools whose last live listing failed.
+    pub fn stale_pools(&self) -> Vec<String> {
+        self.model_listings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(_, listing)| listing.stale)
+            .map(|(pool, _)| pool.clone())
+            .collect()
+    }
+
+    /// Rereads the catalog of one pool, or of every pool; the other pools
+    /// keep their rows untouched.
+    pub async fn refresh_models_in(&self, only: Option<&str>) {
         let bundled = catalog();
         let previous = self.models.read().await.clone();
-        let mut incomplete = false;
+        let mut read: BTreeSet<String> = BTreeSet::new();
+        let mut stale: BTreeSet<String> = BTreeSet::new();
         let mut models: BTreeMap<String, Model> = BTreeMap::new();
+        if let Some(pool) = only {
+            for model in previous.iter().filter(|m| !in_pool(m, pool)) {
+                models.insert(model.id.clone(), model.clone());
+            }
+        }
         let disabled = self.config.read().await.disabled_models.clone();
         for summary in self.accounts.list().await {
             let Some(account) = self.accounts.get(&summary.id).await else {
                 continue;
             };
+            if only.is_some_and(|pool| pool != account.pool()) {
+                continue;
+            }
+            read.insert(account.pool().to_owned());
             let mut available: Vec<Model> = if account.models.is_empty() {
                 bundled
                     .iter()
@@ -287,9 +330,7 @@ impl AppState {
                             .iter()
                             .filter(|m| {
                                 m.provider == account.provider
-                                    && m.id
-                                        .strip_prefix(pool)
-                                        .is_some_and(|rest| rest.starts_with('/'))
+                                    && in_pool(m, pool)
                                     && (account.models.is_empty()
                                         || account.models.contains(&m.upstream_id))
                             })
@@ -311,7 +352,9 @@ impl AppState {
                                 }
                             }
                         }
-                        incomplete |= account.models.is_empty();
+                        if account.models.is_empty() {
+                            stale.insert(pool.to_owned());
+                        }
                     }
                 }
             }
@@ -339,8 +382,29 @@ impl AppState {
             }
         }
         *self.models.write().await = models.into_values().collect();
-        self.models_incomplete
-            .store(incomplete, std::sync::atomic::Ordering::Relaxed);
+        let now = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default();
+        let mut listings = self
+            .model_listings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match only {
+            Some(pool) => {
+                listings.remove(pool);
+            }
+            None => listings.clear(),
+        }
+        for pool in read {
+            let stale = stale.contains(&pool);
+            listings.insert(
+                pool,
+                ModelListing {
+                    refreshed_at: now.clone(),
+                    stale,
+                },
+            );
+        }
     }
 
     /// Copilot's own catalog: the models this account's plan enables, with

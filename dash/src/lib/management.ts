@@ -22,7 +22,10 @@ export type CreditUsage = { id: string; label: string; used?: number | null; lim
 export type Quota = { account_id: string; windows: QuotaWindow[]; subscription?: Subscription | null; credits?: CreditUsage[]; updated_at?: string | null; error?: string | null; verification_required?: boolean; verification_available?: boolean };
 export type ResetAvailability = { account_id: string; provider: string; status: 'ready' | 'unsupported' | 'unavailable' | 'ineligible' | 'disabled'; available_count: number | null; next_expires_at: string | null; pending_request_id?: string | null; error: string | null };
 export type ResetResult = { request_id: string; outcome: 'reset' | 'nothing_to_reset' | 'no_credit' | 'already_redeemed' };
-export type Model = { id: string; provider: string; name?: string; context_length?: number | null; enabled?: boolean };
+export type Model = { id: string; provider: string; name?: string; context_length?: number | null; enabled?: boolean; route?: string | null };
+/** When a pool's catalog was last read; `stale` when its live listing failed and the previous catalog stays. */
+export type ModelListing = { refreshed_at: string; stale: boolean };
+export type ModelsReport = { models: Model[]; listings?: Record<string, ModelListing> };
 export type Call = { id: string | number; started_at: string; model: string; provider: string; account_id?: string | null; status: number; latency_ms?: number; input_tokens?: number; output_tokens?: number; cache_read_tokens?: number; cache_write_tokens?: number; error?: string | null; client_id?: string | null };
 export type Status = { version: string; uptime_seconds: number; in_flight: number; requests: number; errors: number; accounts: number; enabled_accounts: number; providers: number; input_tokens: number; output_tokens: number; cache_read_tokens?: number; cache_write_tokens?: number; client_api_base_url?: string | null; clients?: number };
 /** The accounts a client key may use; `all` includes accounts connected later. */
@@ -75,7 +78,9 @@ export const management = {
 	providers: () => request<{ providers: Provider[] }>('/providers'),
 	accounts: () => request<{ accounts: Account[] }>('/accounts'),
 	quotas: () => request<{ quotas: Quota[] }>('/quotas'),
-	models: () => request<{ models: Model[] }>('/models'),
+	models: () => request<ModelsReport>('/models'),
+	refreshModels: (pool?: string) => request<ModelsReport>(`/models/refresh${pool ? `?pool=${encodeURIComponent(pool)}` : ''}`, { method: 'POST' }),
+	setModelsEnabled: (ids: string[], enabled: boolean) => request('/models', { method: 'PATCH', body: JSON.stringify({ ids, enabled }) }),
 	calls: () => request<{ calls: Call[] }>('/calls?limit=100'),
 	settings: () => request<Settings>('/settings'),
 	refreshQuotas: (account_id?: string) => request('/quotas/refresh', { method: 'POST', body: JSON.stringify({ account_id }) }),
@@ -131,6 +136,15 @@ export function formatCount(value: number | undefined) { return value == null ? 
 /** A 12-hour English clock reads `1:49 PM`, not `01:49 PM`; French keeps `13:49`. */
 function hour() { return language() === 'en' ? 'numeric' as const : '2-digit' as const; }
 export function formatDate(value?: string | null) { return value ? new Intl.DateTimeFormat(locale(), { day: '2-digit', month: 'short', hour: hour(), minute: '2-digit' }).format(new Date(value)) : '-'; }
+/** How long ago `value` was, `5 min ago`; a date past a day. */
+export function ageLabel(value: string, now = Date.now()) {
+	const seconds = Math.round((new Date(value).getTime() - now) / 1000);
+	const format = new Intl.RelativeTimeFormat(locale(), { numeric: 'auto', style: 'short' });
+	if (seconds > -45) return format.format(0, 'second');
+	if (seconds > -3600) return format.format(Math.round(seconds / 60), 'minute');
+	if (seconds > -86400) return format.format(Math.round(seconds / 3600), 'hour');
+	return formatDate(value);
+}
 export function resetLabel(value?: string | null) {
 	if (!value) return t('date.unknown');
 	const date = new Date(value);

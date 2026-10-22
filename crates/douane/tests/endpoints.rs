@@ -428,22 +428,97 @@ async fn a_failed_listing_keeps_the_previous_catalog() {
     failing.store(true, std::sync::atomic::Ordering::Relaxed);
     gateway.state.refresh_models().await;
     assert_eq!(gateway.model_ids().await, listed);
-    assert!(
-        gateway
-            .state
-            .models_incomplete
-            .load(std::sync::atomic::Ordering::Relaxed)
-    );
+    assert_eq!(gateway.state.stale_pools(), ["openrouter"]);
 
     failing.store(false, std::sync::atomic::Ordering::Relaxed);
     gateway.state.refresh_models().await;
     assert_eq!(gateway.model_ids().await, listed);
-    assert!(
-        !gateway
-            .state
-            .models_incomplete
-            .load(std::sync::atomic::Ordering::Relaxed)
+    assert!(gateway.state.stale_pools().is_empty());
+}
+
+#[tokio::test]
+async fn a_pool_refresh_rereads_only_that_pool() {
+    // The Models page refreshes one provider at a time: the others keep
+    // their rows even when their own listing would now answer differently.
+    let first = Arc::new(Mutex::new(vec!["a"]));
+    let second = Arc::new(Mutex::new(vec!["x"]));
+    let listing = |ids: Arc<Mutex<Vec<&'static str>>>| {
+        Router::new().route(
+            "/v1/models",
+            get(move || {
+                let data: Vec<Value> = ids
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|id| json!({"id":id}))
+                    .collect();
+                async move { Json(json!({ "data": data })) }
+            }),
+        )
+    };
+    let one = serve(listing(first.clone())).await;
+    let two = serve(listing(second.clone())).await;
+    let gateway = Gateway::new(&[
+        endpoint("one", &one.url, "key"),
+        endpoint("two", &two.url, "key"),
+    ])
+    .await;
+    assert_eq!(gateway.model_ids().await, ["one/a", "two/x"]);
+    let before = gateway.admin(reqwest::Method::GET, "/models", None).await;
+    assert!(before["listings"]["one"]["refreshed_at"].is_string());
+    assert_eq!(before["listings"]["two"]["stale"], false);
+
+    first.lock().unwrap().push("b");
+    second.lock().unwrap().push("y");
+    let after = gateway
+        .admin(reqwest::Method::POST, "/models/refresh?pool=one", None)
+        .await;
+    assert_eq!(after["models"].as_array().unwrap().len(), 3);
+    assert_eq!(gateway.model_ids().await, ["one/a", "one/b", "two/x"]);
+    assert!(after["listings"]["two"].is_object());
+
+    gateway
+        .admin(reqwest::Method::POST, "/models/refresh", None)
+        .await;
+    assert_eq!(
+        gateway.model_ids().await,
+        ["one/a", "one/b", "two/x", "two/y"]
     );
+}
+
+#[tokio::test]
+async fn a_whole_provider_turns_off_in_one_call() {
+    let server = serve(Router::new().route(
+        "/v1/models",
+        get(|| async { Json(json!({"data":[{"id":"a"},{"id":"b"},{"id":"c"}]})) }),
+    ))
+    .await;
+    let gateway = Gateway::new(&[endpoint("one", &server.url, "key")]).await;
+    gateway
+        .admin(
+            reqwest::Method::PATCH,
+            "/models",
+            Some(json!({"ids":["one/a","one/b"],"enabled":false})),
+        )
+        .await;
+    assert_eq!(gateway.model_ids().await, ["one/c"]);
+    let unknown = gateway
+        .client
+        .patch(format!("{}/admin/api/models", gateway.server.url))
+        .json(&json!({"ids":["one/c","one/missing"],"enabled":false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), 404);
+    assert_eq!(gateway.model_ids().await, ["one/c"]);
+    gateway
+        .admin(
+            reqwest::Method::PATCH,
+            "/models",
+            Some(json!({"ids":["one/a","one/b"],"enabled":true})),
+        )
+        .await;
+    assert_eq!(gateway.model_ids().await, ["one/a", "one/b", "one/c"]);
 }
 
 #[tokio::test]
@@ -456,12 +531,7 @@ async fn an_endpoint_without_a_listing_keeps_its_named_models() {
     assert_eq!(gateway.model_ids().await, ["mimo/mimo-v3"]);
     gateway.state.refresh_models().await;
     assert_eq!(gateway.model_ids().await, ["mimo/mimo-v3"]);
-    assert!(
-        !gateway
-            .state
-            .models_incomplete
-            .load(std::sync::atomic::Ordering::Relaxed)
-    );
+    assert!(gateway.state.stale_pools().is_empty());
 }
 
 #[tokio::test]

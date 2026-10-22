@@ -201,6 +201,8 @@ douanectl endpoint remove groq
 
 The same fields go through `POST /admin/api/accounts/import` with `{"type":"openai_compatible","route":...,"base_url":...,"api_key":...}`, and `PATCH /admin/api/accounts/{id}` changes `route`, `base_url`, `dialect`, `models` or `api_key`. An account without a route keeps its previous behavior under `openai_compatible/`.
 
+The **Models** page lists models under their provider or route, each one folded until opened. A provider rereads its catalog on its own (`POST /admin/api/models/refresh?pool=openrouter`; no `pool` rereads all), and its switch turns every shown model on or off in one write (`PATCH /admin/api/models` with `{"ids":[...],"enabled":false}`). When a live listing fails, the provider keeps its previous models, is marked as such, and is reread every minute.
+
 ## Routing and quotas
 
 Pick a strategy in **Settings**, globally or per provider. It applies to new conversations:

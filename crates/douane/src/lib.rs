@@ -48,7 +48,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(management::redeem_reset),
         )
         .route("/quotas/refresh", post(management::refresh_quotas))
-        .route("/models", get(management::models))
+        .route(
+            "/models",
+            get(management::models).patch(management::set_models),
+        )
         .route("/models/refresh", post(management::refresh_models))
         .route("/models/{*id}", patch(management::set_model))
         .route("/calls", get(management::calls))
