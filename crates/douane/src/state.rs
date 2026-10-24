@@ -123,14 +123,18 @@ pub struct AppState {
     pub config_write: tokio::sync::Mutex<()>,
     /// Last background quota refresh started for an account near its reserve.
     reserve_refresh: Mutex<BTreeMap<String, std::time::Instant>>,
-    /// Copilot models an account's plan refused although its catalog lists
-    /// them, by account and model, with the time of the refusal.
-    copilot_refused: Mutex<BTreeMap<(String, String), std::time::Instant>>,
+    /// Models an account refused although a catalog lists them, by account
+    /// and model, with the time of the refusal.
+    refused: Mutex<BTreeMap<(String, String), std::time::Instant>>,
+    /// The upstream ids each Copilot or Antigravity account's own live
+    /// listing returned last: one Google or GitHub plan can offer models
+    /// another one of the same pool lacks.
+    listed: Mutex<BTreeMap<String, BTreeSet<String>>>,
 }
 
-/// How long a Copilot refusal hides a model: a plan change shows up the
-/// next day, or at once after a restart.
-const COPILOT_REFUSAL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+/// How long a refusal hides a model from an account: a plan change shows up
+/// the next day, or at once after a restart.
+const REFUSAL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
 impl AppState {
     pub fn new(mut config: Config, config_path: Option<PathBuf>) -> Result<Arc<Self>> {
@@ -179,22 +183,42 @@ impl AppState {
             management_token,
             config_write: tokio::sync::Mutex::new(()),
             reserve_refresh: Mutex::new(BTreeMap::new()),
-            copilot_refused: Mutex::new(BTreeMap::new()),
+            refused: Mutex::new(BTreeMap::new()),
+            listed: Mutex::new(BTreeMap::new()),
         }))
     }
 
-    fn copilot_refuses(&self, account: &str, model: &str) -> bool {
-        self.copilot_refused
+    fn refuses(&self, account: &str, model: &str) -> bool {
+        self.refused
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&(account.to_owned(), model.to_owned()))
-            .is_some_and(|at| at.elapsed() < COPILOT_REFUSAL)
+            .is_some_and(|at| at.elapsed() < REFUSAL)
     }
 
-    /// Copilot's catalog lists models a plan cannot use; the first refusal
-    /// takes the model out of the list until no account refuses it.
-    pub(crate) async fn copilot_refused(&self, account: &str, model: &str) {
-        self.copilot_refused
+    /// Whether `account` can be sent `model`: it did not refuse it lately,
+    /// and its own last live listing, when it has one, names it.
+    fn serves(&self, account: &str, model: &str) -> bool {
+        !self.refuses(account, model)
+            && self
+                .listed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(account)
+                .is_none_or(|ids| ids.contains(model))
+    }
+
+    /// A catalog can list models an account's plan cannot use (Copilot), or
+    /// that only another account of the pool offers (Antigravity); the first
+    /// refusal skips the account for that model, and the model leaves the
+    /// list once no account of the provider serves it.
+    pub(crate) async fn model_refused(
+        &self,
+        provider: SubscriptionProvider,
+        account: &str,
+        model: &str,
+    ) {
+        self.refused
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(
@@ -203,14 +227,15 @@ impl AppState {
             );
         let served = self
             .accounts
-            .eligible_in(SubscriptionProvider::Copilot, None, Some(model))
+            .eligible_in(provider, None, Some(model))
             .await
             .iter()
-            .any(|other| !self.copilot_refuses(&other.id, model));
+            .any(|other| self.serves(&other.id, model));
         if !served {
-            self.models.write().await.retain(|m| {
-                !(m.provider == SubscriptionProvider::Copilot && m.upstream_id == model)
-            });
+            self.models
+                .write()
+                .await
+                .retain(|m| !(m.provider == provider && m.upstream_id == model));
         }
     }
 
@@ -370,9 +395,13 @@ impl AppState {
             // A failed live read keeps the previous rows, or the bundled
             // ones on a first read, and is retried like a failed listing.
             if account.provider == SubscriptionProvider::Antigravity && account.models.is_empty() {
-                match self.antigravity_models(&summary.id).await {
+                match self.antigravity_models(&account).await {
                     Some(live) => {
-                        available = live;
+                        self.remember_listing(&account.id, &live);
+                        available = live
+                            .into_iter()
+                            .filter(|m| !self.refuses(&account.id, &m.id))
+                            .collect();
                     }
                     None => {
                         if !kept.is_empty() {
@@ -385,17 +414,18 @@ impl AppState {
             if account.provider == SubscriptionProvider::Copilot {
                 match self.copilot_models(&account).await {
                     Some(live) => {
+                        self.remember_listing(&account.id, &live);
                         available = live
                             .into_iter()
                             .filter(|m| account.models.is_empty() || account.models.contains(&m.id))
-                            .filter(|m| !self.copilot_refuses(&account.id, &m.id))
+                            .filter(|m| !self.refuses(&account.id, &m.id))
                             .collect();
                     }
                     None => {
                         if !kept.is_empty() {
                             available = kept
                                 .iter()
-                                .filter(|m| !self.copilot_refuses(&account.id, &m.id))
+                                .filter(|m| !self.refuses(&account.id, &m.id))
                                 .cloned()
                                 .collect();
                         }
@@ -473,14 +503,32 @@ impl AppState {
         (!models.is_empty()).then_some(models)
     }
 
+    /// What an account's own live listing named, for routing its requests.
+    fn remember_listing(&self, account: &str, live: &[Model]) {
+        self.listed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                account.to_owned(),
+                live.iter().map(|m| m.id.clone()).collect(),
+            );
+    }
+
     /// Google renames Antigravity models without notice, so the bundled ids
     /// go stale; the account's own `fetchAvailableModels` list is the truth.
-    async fn antigravity_models(&self, id: &str) -> Option<Vec<Model>> {
-        let account = self.oauth.credential(id).await.ok()?;
+    async fn antigravity_models(&self, stored: &AccountCredential) -> Option<Vec<Model>> {
+        let account = self.oauth.credential(&stored.id).await.ok()?;
         let project = account.project_id.as_deref()?;
+        let base = account
+            .base_url
+            .as_deref()
+            .unwrap_or("https://daily-cloudcode-pa.googleapis.com");
         let response = self
             .client
-            .post("https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels")
+            .post(crate::relay::endpoint(
+                base,
+                "/v1internal:fetchAvailableModels",
+            ))
             .bearer_auth(&account.access_token)
             .header("User-Agent", "antigravity/hub/2.9.1")
             .json(&json!({ "project": project }))
@@ -588,6 +636,9 @@ impl AppState {
                 .await
             {
                 if client.is_some_and(|c| !c.access.allows(&a)) {
+                    continue;
+                }
+                if !self.serves(&a.id, model) {
                     continue;
                 }
                 let quota = self.quotas.get(&a.id).await;

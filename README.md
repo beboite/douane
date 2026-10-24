@@ -169,11 +169,19 @@ after restart, expiry, account/model changes or compaction that alters the
 recorded context. Start a new conversation in that case. Acceptance by a live
 Google account remains separate from the local compatibility tests.
 
+Each Antigravity account lists its own models (`fetchAvailableModels`), and
+plans differ: Claude Opus and Sonnet 5.5 are offered to some Google AI Pro
+accounts and not to trial or partner ones. The catalog is the union of every
+account's list, and a request goes only to the accounts whose own list names its
+model. An account that still answers `NOT_FOUND` for a model is skipped for it
+for 24 hours or until a restart, the next account is tried, and the account
+stays usable.
+
 ### GitHub Copilot clients
 
 Copilot signs in with GitHub's device flow through the OpenCode GitHub app, the way OpenCode does; an existing OpenCode login imports as is (its `auth.json`). The model list is Copilot's own catalog: models whose policy is enabled for the account, each sent to the path Copilot lists for it (`/v1/messages` for Claude models, `/responses`, or `/chat/completions`). A client's own format is forwarded untouched when the model accepts it.
 
-Copilot bills a premium request when its user starts a turn. douane marks tool results and other follow-ups as the agent's own (`x-initiator: agent`), as OpenCode does. The catalog can list a model the plan does not serve; the first `model_not_supported` refusal hides that model for 24 hours or until a restart, and the account stays usable.
+Copilot bills a premium request when its user starts a turn. douane marks tool results and other follow-ups as the agent's own (`x-initiator: agent`), as OpenCode does. The catalog can list a model the plan does not serve; the first `model_not_supported` refusal skips that account for the model for 24 hours or until a restart, hides the model once no account serves it, and the account stays usable.
 
 ## Custom endpoints
 
@@ -201,7 +209,7 @@ douanectl endpoint remove groq
 
 The same fields go through `POST /admin/api/accounts/import` with `{"type":"openai_compatible","route":...,"base_url":...,"api_key":...}`, and `PATCH /admin/api/accounts/{id}` changes `route`, `base_url`, `dialect`, `models` or `api_key`. An account without a route keeps its previous behavior under `openai_compatible/`.
 
-The **Models** page lists models under their provider or route, each one folded until opened. A provider rereads its catalog on its own (`POST /admin/api/models/refresh?pool=openrouter`; no `pool` rereads all), and its switch turns every shown model on or off in one write (`PATCH /admin/api/models` with `{"ids":[...],"enabled":false}`). When a live listing fails, the provider keeps its previous models, is marked as such, and is reread every minute.
+The **Models** page lists models under their provider or route, each one folded until opened. A provider rereads its catalog on its own (`POST /admin/api/models/refresh?pool=openrouter`; no `pool` rereads all), and its switch turns every shown model on or off in one write (`PATCH /admin/api/models` with `{"ids":[...],"enabled":false}`). Every catalog is reread each hour, so a model a provider adds or retires shows without a restart. When a live listing fails, the provider keeps its previous models, is marked as such, and is reread every minute.
 
 ## Routing and quotas
 
