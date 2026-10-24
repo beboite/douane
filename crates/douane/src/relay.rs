@@ -681,7 +681,9 @@ pub async fn forward(
                     const UNSERVED: &str =
                         "GitHub Copilot does not serve this model on this account's plan";
                     call.fail(UNSERVED);
-                    state.copilot_refused(&account.id, &model).await;
+                    state
+                        .model_refused(account.provider, &account.id, &model)
+                        .await;
                     last_reason = Some(UNSERVED.into());
                     continue;
                 }
@@ -713,6 +715,20 @@ pub async fn forward(
             } else {
                 (Some(response), None)
             };
+            // An Antigravity plan answers NOT_FOUND for a model it lacks
+            // (the newest Claude on a trial or partner plan) while another
+            // account of the pool may serve it: the account itself is fine.
+            if account.provider == SubscriptionProvider::Antigravity
+                && last_status == StatusCode::NOT_FOUND
+            {
+                const UNSERVED: &str = "this Antigravity account does not serve this model";
+                call.fail(UNSERVED);
+                state
+                    .model_refused(account.provider, &account.id, &model)
+                    .await;
+                last_reason = Some(UNSERVED.into());
+                continue;
+            }
             let summary = match last_status {
                 StatusCode::TOO_MANY_REQUESTS => "upstream quota or rate limit reached",
                 StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {

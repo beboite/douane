@@ -64,8 +64,12 @@ async fn main() -> Result<()> {
             if pass.is_multiple_of(20) {
                 poller.quotas.save().await;
             }
-            // A live model listing that failed is read again every minute.
-            if pass.is_multiple_of(4) {
+            // Every catalog is read again each hour, so a model a provider
+            // adds or retires shows without a restart; a live model listing
+            // that failed is read again every minute.
+            if pass.is_multiple_of(240) {
+                poller.refresh_models().await;
+            } else if pass.is_multiple_of(4) {
                 for pool in poller.stale_pools() {
                     poller.refresh_models_in(Some(&pool)).await;
                 }
